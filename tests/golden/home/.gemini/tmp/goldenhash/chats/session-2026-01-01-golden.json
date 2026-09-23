@@ -1,0 +1,1217 @@
+{
+ "sessionId": "golden",
+ "projectHash": "goldenhash",
+ "startTime": "gamma",
+ "lastUpdated": "eta",
+ "messages": [
+  {
+   "id": "zeta",
+   "timestamp": "delta",
+   "type": "user",
+   "content": "theta alpha beta gamma delta epsilon zeta eta"
+  },
+  {
+   "id": "gamma",
+   "timestamp": "epsilon",
+   "type": "gemini",
+   "content": "theta alpha beta gamma delta epsilon zeta",
+   "thoughts": [
+    {
+     "subject": "epsilon zeta eta",
+     "description": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+     "timestamp": "gamma"
+    }
+   ],
+   "tokens": {
+    "input": 8403,
+    "output": 48,
+    "cached": 0,
+    "thoughts": 23,
+    "tool": 0,
+    "total": 8474
+   },
+   "model": "theta"
+  },
+  {
+   "id": "gamma",
+   "timestamp": "epsilon",
+   "type": "gemini",
+   "content": "alpha beta gamma delta epsilon zeta eta theta alpha beta",
+   "thoughts": [
+    {
+     "subject": "theta alpha beta",
+     "description": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+     "timestamp": "epsilon"
+    },
+    {
+     "subject": "beta gamma delta",
+     "description": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+     "timestamp": "alpha"
+    },
+    {
+     "subject": "gamma delta epsilon",
+     "description": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+     "timestamp": "beta"
+    }
+   ],
+   "tokens": {
+    "input": 9330,
+    "output": 177,
+    "cached": 0,
+    "thoughts": 384,
+    "tool": 0,
+    "total": 9891
+   },
+   "model": "theta"
+  },
+  {
+   "id": "epsilon",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+   "thoughts": [
+    {
+     "subject": "alpha beta gamma",
+     "description": "delta epsilon zeta eta theta alpha beta gamma delta epsilon",
+     "timestamp": "epsilon"
+    },
+    {
+     "subject": "eta theta alpha",
+     "description": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+     "timestamp": "gamma"
+    },
+    {
+     "subject": "alpha beta gamma",
+     "description": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+     "timestamp": "beta"
+    },
+    {
+     "subject": "eta theta alpha",
+     "description": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+     "timestamp": "epsilon"
+    }
+   ],
+   "tokens": {
+    "input": 10129,
+    "output": 210,
+    "cached": 8092,
+    "thoughts": 727,
+    "tool": 0,
+    "total": 11066
+   },
+   "model": "theta"
+  },
+  {
+   "id": "gamma",
+   "timestamp": "epsilon",
+   "type": "gemini",
+   "content": "epsilon zeta eta theta alpha beta gamma delta epsilon zeta",
+   "thoughts": [
+    {
+     "subject": "epsilon zeta eta",
+     "description": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+     "timestamp": "theta"
+    }
+   ],
+   "tokens": {
+    "input": 11305,
+    "output": 1055,
+    "cached": 8110,
+    "thoughts": 33,
+    "tool": 0,
+    "total": 12393
+   },
+   "model": "theta"
+  },
+  {
+   "id": "delta",
+   "timestamp": "gamma",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta alpha beta",
+   "thoughts": [
+    {
+     "subject": "eta theta alpha",
+     "description": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+     "timestamp": "delta"
+    }
+   ],
+   "tokens": {
+    "input": 12435,
+    "output": 54,
+    "cached": 8155,
+    "thoughts": 21,
+    "tool": 0,
+    "total": 12510
+   },
+   "model": "theta"
+  },
+  {
+   "id": "alpha",
+   "timestamp": "gamma",
+   "type": "gemini",
+   "content": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+   "thoughts": [
+    {
+     "subject": "theta alpha beta gamma",
+     "description": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+     "timestamp": "gamma"
+    }
+   ],
+   "tokens": {
+    "input": 12662,
+    "output": 91,
+    "cached": 12233,
+    "thoughts": 64,
+    "tool": 0,
+    "total": 12817
+   },
+   "model": "theta"
+  },
+  {
+   "id": "beta",
+   "timestamp": "beta",
+   "type": "gemini",
+   "content": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+   "thoughts": [
+    {
+     "subject": "eta theta alpha",
+     "description": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+     "timestamp": "beta"
+    }
+   ],
+   "tokens": {
+    "input": 12843,
+    "output": 107,
+    "cached": 12229,
+    "thoughts": 59,
+    "tool": 0,
+    "total": 13009
+   },
+   "model": "theta"
+  },
+  {
+   "id": "eta",
+   "timestamp": "eta",
+   "type": "gemini",
+   "content": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+   "thoughts": [
+    {
+     "subject": "epsilon zeta eta theta",
+     "description": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+     "timestamp": "epsilon"
+    }
+   ],
+   "tokens": {
+    "input": 13933,
+    "output": 65,
+    "cached": 12273,
+    "thoughts": 45,
+    "tool": 0,
+    "total": 14043
+   },
+   "model": "theta"
+  },
+  {
+   "id": "zeta",
+   "timestamp": "delta",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta",
+   "thoughts": [
+    {
+     "subject": "theta alpha beta",
+     "description": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+     "timestamp": "zeta"
+    }
+   ],
+   "tokens": {
+    "input": 14545,
+    "output": 150,
+    "cached": 12301,
+    "thoughts": 55,
+    "tool": 0,
+    "total": 14750
+   },
+   "model": "theta"
+  },
+  {
+   "id": "beta",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "epsilon zeta eta theta",
+   "thoughts": [
+    {
+     "subject": "beta gamma delta",
+     "description": "alpha beta gamma delta epsilon zeta eta theta alpha beta",
+     "timestamp": "eta"
+    }
+   ],
+   "tokens": {
+    "input": 14792,
+    "output": 75,
+    "cached": 12293,
+    "thoughts": 22,
+    "tool": 0,
+    "total": 14889
+   },
+   "model": "theta"
+  },
+  {
+   "id": "epsilon",
+   "timestamp": "zeta",
+   "type": "gemini",
+   "content": "beta gamma delta epsilon zeta eta",
+   "thoughts": [
+    {
+     "subject": "alpha beta",
+     "description": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+     "timestamp": "epsilon"
+    }
+   ],
+   "tokens": {
+    "input": 15089,
+    "output": 56,
+    "cached": 12301,
+    "thoughts": 20,
+    "tool": 0,
+    "total": 15165
+   },
+   "model": "theta"
+  },
+  {
+   "id": "theta",
+   "timestamp": "gamma",
+   "type": "gemini",
+   "content": "alpha beta gamma delta epsilon zeta eta theta alpha beta",
+   "thoughts": [
+    {
+     "subject": "alpha beta gamma",
+     "description": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+     "timestamp": "beta"
+    }
+   ],
+   "tokens": {
+    "input": 15324,
+    "output": 82,
+    "cached": 12300,
+    "thoughts": 37,
+    "tool": 0,
+    "total": 15443
+   },
+   "model": "theta"
+  },
+  {
+   "id": "zeta",
+   "timestamp": "gamma",
+   "type": "gemini",
+   "content": "delta epsilon zeta eta theta alpha beta gamma delta epsilon",
+   "thoughts": [
+    {
+     "subject": "delta epsilon zeta eta theta",
+     "description": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+     "timestamp": "eta"
+    }
+   ],
+   "tokens": {
+    "input": 15594,
+    "output": 72,
+    "cached": 12300,
+    "thoughts": 53,
+    "tool": 0,
+    "total": 15719
+   },
+   "model": "theta"
+  },
+  {
+   "id": "zeta",
+   "timestamp": "zeta",
+   "type": "gemini",
+   "content": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+   "thoughts": [
+    {
+     "subject": "alpha beta gamma",
+     "description": "alpha beta gamma delta epsilon zeta eta theta alpha beta",
+     "timestamp": "zeta"
+    },
+    {
+     "subject": "alpha beta gamma",
+     "description": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+     "timestamp": "delta"
+    }
+   ],
+   "tokens": {
+    "input": 15783,
+    "output": 82,
+    "cached": 12302,
+    "thoughts": 74,
+    "tool": 0,
+    "total": 15939
+   },
+   "model": "theta"
+  },
+  {
+   "id": "beta",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+   "thoughts": [
+    {
+     "subject": "gamma delta epsilon",
+     "description": "beta gamma delta epsilon zeta eta theta alpha beta gamma",
+     "timestamp": "epsilon"
+    },
+    {
+     "subject": "delta epsilon zeta",
+     "description": "beta gamma delta epsilon zeta eta theta alpha beta gamma",
+     "timestamp": "epsilon"
+    }
+   ],
+   "tokens": {
+    "input": 16748,
+    "output": 92,
+    "cached": 12358,
+    "thoughts": 84,
+    "tool": 0,
+    "total": 16924
+   },
+   "model": "theta"
+  },
+  {
+   "id": "eta",
+   "timestamp": "eta",
+   "type": "gemini",
+   "content": "epsilon zeta eta theta alpha beta gamma delta epsilon zeta",
+   "thoughts": [
+    {
+     "subject": "beta gamma delta",
+     "description": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+     "timestamp": "beta"
+    },
+    {
+     "subject": "eta theta alpha",
+     "description": "epsilon zeta eta theta alpha beta gamma delta epsilon zeta",
+     "timestamp": "eta"
+    }
+   ],
+   "tokens": {
+    "input": 17191,
+    "output": 134,
+    "cached": 16484,
+    "thoughts": 100,
+    "tool": 0,
+    "total": 17425
+   },
+   "model": "theta"
+  },
+  {
+   "id": "zeta",
+   "timestamp": "theta",
+   "type": "gemini",
+   "content": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+   "thoughts": [
+    {
+     "subject": "beta gamma delta",
+     "description": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+     "timestamp": "eta"
+    },
+    {
+     "subject": "theta alpha beta",
+     "description": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+     "timestamp": "gamma"
+    }
+   ],
+   "tokens": {
+    "input": 17609,
+    "output": 125,
+    "cached": 16485,
+    "thoughts": 116,
+    "tool": 0,
+    "total": 17850
+   },
+   "model": "theta"
+  },
+  {
+   "id": "zeta",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "alpha beta gamma delta epsilon zeta eta theta alpha beta",
+   "thoughts": [
+    {
+     "subject": "beta gamma delta",
+     "description": "epsilon zeta eta theta alpha beta gamma delta epsilon zeta",
+     "timestamp": "zeta"
+    },
+    {
+     "subject": "epsilon zeta eta",
+     "description": "epsilon zeta eta theta alpha beta gamma delta epsilon zeta",
+     "timestamp": "delta"
+    }
+   ],
+   "tokens": {
+    "input": 19885,
+    "output": 121,
+    "cached": 16531,
+    "thoughts": 128,
+    "tool": 0,
+    "total": 20134
+   },
+   "model": "theta"
+  },
+  {
+   "id": "alpha",
+   "timestamp": "theta",
+   "type": "gemini",
+   "content": "alpha beta gamma delta epsilon",
+   "thoughts": [
+    {
+     "subject": "zeta eta theta",
+     "description": "epsilon zeta eta theta alpha beta gamma delta epsilon zeta",
+     "timestamp": "epsilon"
+    }
+   ],
+   "tokens": {
+    "input": 20276,
+    "output": 69,
+    "cached": 16529,
+    "thoughts": 22,
+    "tool": 0,
+    "total": 20367
+   },
+   "model": "theta"
+  },
+  {
+   "id": "gamma",
+   "timestamp": "epsilon",
+   "type": "gemini",
+   "content": "alpha beta gamma delta epsilon zeta eta theta alpha beta",
+   "thoughts": [
+    {
+     "subject": "beta gamma delta",
+     "description": "alpha beta gamma delta epsilon zeta eta theta alpha beta",
+     "timestamp": "epsilon"
+    },
+    {
+     "subject": "gamma delta epsilon",
+     "description": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+     "timestamp": "eta"
+    }
+   ],
+   "tokens": {
+    "input": 22289,
+    "output": 87,
+    "cached": 16566,
+    "thoughts": 105,
+    "tool": 0,
+    "total": 22481
+   },
+   "model": "theta"
+  },
+  {
+   "id": "epsilon",
+   "timestamp": "beta",
+   "type": "gemini",
+   "content": "eta theta alpha beta gamma delta epsilon zeta",
+   "thoughts": [
+    {
+     "subject": "zeta eta theta",
+     "description": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+     "timestamp": "alpha"
+    }
+   ],
+   "tokens": {
+    "input": 22556,
+    "output": 58,
+    "cached": 20703,
+    "thoughts": 28,
+    "tool": 0,
+    "total": 22642
+   },
+   "model": "theta"
+  },
+  {
+   "id": "alpha",
+   "timestamp": "gamma",
+   "type": "gemini",
+   "content": "beta gamma delta epsilon zeta eta theta alpha beta gamma",
+   "thoughts": [
+    {
+     "subject": "delta epsilon zeta",
+     "description": "beta gamma delta epsilon zeta eta theta alpha beta gamma",
+     "timestamp": "alpha"
+    },
+    {
+     "subject": "gamma delta epsilon",
+     "description": "beta gamma delta epsilon zeta eta theta alpha beta gamma",
+     "timestamp": "epsilon"
+    }
+   ],
+   "tokens": {
+    "input": 23170,
+    "output": 152,
+    "cached": 20715,
+    "thoughts": 79,
+    "tool": 0,
+    "total": 23401
+   },
+   "model": "theta"
+  },
+  {
+   "id": "beta",
+   "timestamp": "theta",
+   "type": "gemini",
+   "content": "alpha beta gamma delta epsilon zeta eta theta alpha beta",
+   "thoughts": [
+    {
+     "subject": "epsilon zeta eta theta",
+     "description": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+     "timestamp": "eta"
+    }
+   ],
+   "tokens": {
+    "input": 23449,
+    "output": 733,
+    "cached": 20713,
+    "thoughts": 45,
+    "tool": 0,
+    "total": 24227
+   },
+   "model": "theta"
+  },
+  {
+   "id": "alpha",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+   "thoughts": [
+    {
+     "subject": "gamma delta epsilon",
+     "description": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+     "timestamp": "alpha"
+    }
+   ],
+   "tokens": {
+    "input": 24274,
+    "output": 138,
+    "cached": 20749,
+    "thoughts": 35,
+    "tool": 0,
+    "total": 24447
+   },
+   "model": "theta"
+  },
+  {
+   "id": "theta",
+   "timestamp": "beta",
+   "type": "gemini",
+   "content": "epsilon zeta eta theta alpha beta gamma",
+   "thoughts": [
+    {
+     "subject": "zeta eta theta",
+     "description": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+     "timestamp": "alpha"
+    }
+   ],
+   "tokens": {
+    "input": 24494,
+    "output": 56,
+    "cached": 20751,
+    "thoughts": 27,
+    "tool": 0,
+    "total": 24577
+   },
+   "model": "theta"
+  },
+  {
+   "id": "gamma",
+   "timestamp": "epsilon",
+   "type": "gemini",
+   "content": "beta gamma delta epsilon zeta eta theta",
+   "thoughts": [
+    {
+     "subject": "alpha beta gamma",
+     "description": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+     "timestamp": "beta"
+    }
+   ],
+   "tokens": {
+    "input": 24630,
+    "output": 276,
+    "cached": 20753,
+    "thoughts": 30,
+    "tool": 0,
+    "total": 24936
+   },
+   "model": "theta"
+  },
+  {
+   "id": "zeta",
+   "timestamp": "gamma",
+   "type": "gemini",
+   "content": "epsilon zeta eta theta alpha beta gamma delta epsilon zeta",
+   "thoughts": [
+    {
+     "subject": "gamma delta epsilon",
+     "description": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+     "timestamp": "gamma"
+    },
+    {
+     "subject": "gamma delta epsilon",
+     "description": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+     "timestamp": "gamma"
+    }
+   ],
+   "tokens": {
+    "input": 24978,
+    "output": 863,
+    "cached": 20763,
+    "thoughts": 135,
+    "tool": 0,
+    "total": 25976
+   },
+   "model": "theta"
+  },
+  {
+   "id": "theta",
+   "timestamp": "delta",
+   "type": "gemini",
+   "content": "delta epsilon zeta eta theta alpha beta gamma delta epsilon",
+   "thoughts": [
+    {
+     "subject": "zeta eta theta",
+     "description": "beta gamma delta epsilon zeta eta theta alpha beta gamma",
+     "timestamp": "zeta"
+    }
+   ],
+   "tokens": {
+    "input": 26022,
+    "output": 88,
+    "cached": 24964,
+    "thoughts": 41,
+    "tool": 0,
+    "total": 26151
+   },
+   "model": "theta"
+  },
+  {
+   "id": "epsilon",
+   "timestamp": "gamma",
+   "type": "gemini",
+   "content": "delta epsilon zeta eta theta alpha",
+   "thoughts": [
+    {
+     "subject": "zeta eta theta",
+     "description": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+     "timestamp": "alpha"
+    }
+   ],
+   "tokens": {
+    "input": 26342,
+    "output": 56,
+    "cached": 24961,
+    "thoughts": 25,
+    "tool": 0,
+    "total": 26423
+   },
+   "model": "theta"
+  },
+  {
+   "id": "beta",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "alpha beta gamma delta epsilon zeta",
+   "thoughts": [
+    {
+     "subject": "theta alpha beta",
+     "description": "alpha beta gamma delta epsilon zeta eta theta alpha beta",
+     "timestamp": "alpha"
+    }
+   ],
+   "tokens": {
+    "input": 26604,
+    "output": 75,
+    "cached": 24963,
+    "thoughts": 21,
+    "tool": 0,
+    "total": 26700
+   },
+   "model": "theta"
+  },
+  {
+   "id": "theta",
+   "timestamp": "eta",
+   "type": "gemini",
+   "content": "epsilon zeta eta theta alpha beta gamma delta epsilon zeta",
+   "thoughts": [
+    {
+     "subject": "eta theta alpha",
+     "description": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+     "timestamp": "beta"
+    },
+    {
+     "subject": "gamma delta epsilon",
+     "description": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+     "timestamp": "eta"
+    }
+   ],
+   "tokens": {
+    "input": 26891,
+    "output": 124,
+    "cached": 24961,
+    "thoughts": 175,
+    "tool": 0,
+    "total": 27190
+   },
+   "model": "theta"
+  },
+  {
+   "id": "delta",
+   "timestamp": "eta",
+   "type": "user",
+   "content": "epsilon zeta eta theta"
+  },
+  {
+   "id": "beta",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta",
+   "thoughts": [
+    {
+     "subject": "alpha beta gamma",
+     "description": "eta theta alpha beta gamma delta epsilon zeta eta theta",
+     "timestamp": "theta"
+    }
+   ],
+   "tokens": {
+    "input": 24474,
+    "output": 64,
+    "cached": 8371,
+    "thoughts": 50,
+    "tool": 0,
+    "total": 24588
+   },
+   "model": "theta"
+  },
+  {
+   "id": "theta",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta",
+   "thoughts": [],
+   "tokens": {
+    "input": 24788,
+    "output": 76,
+    "cached": 20927,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 24864
+   },
+   "model": "theta"
+  },
+  {
+   "id": "beta",
+   "timestamp": "theta",
+   "type": "gemini",
+   "content": "delta epsilon zeta eta theta alpha beta gamma delta epsilon",
+   "thoughts": [],
+   "tokens": {
+    "input": 25020,
+    "output": 76,
+    "cached": 20927,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 25096
+   },
+   "model": "theta"
+  },
+  {
+   "id": "beta",
+   "timestamp": "beta",
+   "type": "gemini",
+   "content": "beta gamma delta epsilon zeta eta theta alpha",
+   "thoughts": [],
+   "tokens": {
+    "input": 25234,
+    "output": 80,
+    "cached": 20927,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 25314
+   },
+   "model": "theta"
+  },
+  {
+   "id": "delta",
+   "timestamp": "delta",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+   "thoughts": [],
+   "tokens": {
+    "input": 25468,
+    "output": 190,
+    "cached": 25114,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 25658
+   },
+   "model": "theta"
+  },
+  {
+   "id": "gamma",
+   "timestamp": "gamma",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+   "thoughts": [],
+   "tokens": {
+    "input": 25701,
+    "output": 74,
+    "cached": 25110,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 25775
+   },
+   "model": "theta"
+  },
+  {
+   "id": "epsilon",
+   "timestamp": "eta",
+   "type": "gemini",
+   "content": "epsilon zeta eta",
+   "thoughts": [],
+   "tokens": {
+    "input": 25853,
+    "output": 66,
+    "cached": 25109,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 25919
+   },
+   "model": "theta"
+  },
+  {
+   "id": "alpha",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "zeta eta theta",
+   "thoughts": [],
+   "tokens": {
+    "input": 26057,
+    "output": 67,
+    "cached": 25108,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 26124
+   },
+   "model": "theta"
+  },
+  {
+   "id": "gamma",
+   "timestamp": "delta",
+   "type": "gemini",
+   "content": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+   "thoughts": [],
+   "tokens": {
+    "input": 26275,
+    "output": 93,
+    "cached": 25111,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 26368
+   },
+   "model": "theta"
+  },
+  {
+   "id": "epsilon",
+   "timestamp": "gamma",
+   "type": "gemini",
+   "content": "delta epsilon zeta eta theta",
+   "thoughts": [],
+   "tokens": {
+    "input": 26446,
+    "output": 49,
+    "cached": 25109,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 26495
+   },
+   "model": "theta"
+  },
+  {
+   "id": "epsilon",
+   "timestamp": "epsilon",
+   "type": "gemini",
+   "content": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+   "thoughts": [],
+   "tokens": {
+    "input": 26573,
+    "output": 64,
+    "cached": 25108,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 26637
+   },
+   "model": "theta"
+  },
+  {
+   "id": "delta",
+   "timestamp": "theta",
+   "type": "user",
+   "content": "beta gamma delta epsilon zeta eta theta alpha beta gamma"
+  },
+  {
+   "id": "alpha",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+   "thoughts": [
+    {
+     "subject": "zeta eta theta",
+     "description": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+     "timestamp": "epsilon"
+    },
+    {
+     "subject": "theta alpha beta",
+     "description": "beta gamma delta epsilon zeta eta theta alpha beta gamma",
+     "timestamp": "gamma"
+    }
+   ],
+   "tokens": {
+    "input": 26604,
+    "output": 89,
+    "cached": 20920,
+    "thoughts": 248,
+    "tool": 0,
+    "total": 26941
+   },
+   "model": "theta"
+  },
+  {
+   "id": "eta",
+   "timestamp": "epsilon",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta alpha",
+   "thoughts": [],
+   "tokens": {
+    "input": 27021,
+    "output": 584,
+    "cached": 25094,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 27605
+   },
+   "model": "theta"
+  },
+  {
+   "id": "alpha",
+   "timestamp": "theta",
+   "type": "gemini",
+   "content": "beta gamma delta epsilon zeta eta theta alpha beta",
+   "thoughts": [],
+   "tokens": {
+    "input": 27657,
+    "output": 65,
+    "cached": 25118,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 27722
+   },
+   "model": "theta"
+  },
+  {
+   "id": "zeta",
+   "timestamp": "zeta",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta alpha beta gamma delta",
+   "thoughts": [],
+   "tokens": {
+    "input": 27908,
+    "output": 1050,
+    "cached": 25118,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 28958
+   },
+   "model": "theta"
+  },
+  {
+   "id": "beta",
+   "timestamp": "epsilon",
+   "type": "gemini",
+   "content": "beta gamma delta epsilon zeta eta theta alpha beta gamma",
+   "thoughts": [],
+   "tokens": {
+    "input": 29000,
+    "output": 64,
+    "cached": 25201,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 29064
+   },
+   "model": "theta"
+  },
+  {
+   "id": "delta",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "beta gamma delta epsilon zeta eta theta alpha beta",
+   "thoughts": [],
+   "tokens": {
+    "input": 29196,
+    "output": 56,
+    "cached": 25200,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 29252
+   },
+   "model": "theta"
+  },
+  {
+   "id": "delta",
+   "timestamp": "delta",
+   "type": "gemini",
+   "content": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+   "thoughts": [],
+   "tokens": {
+    "input": 30157,
+    "output": 271,
+    "cached": 25219,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 30428
+   },
+   "model": "theta"
+  },
+  {
+   "id": "epsilon",
+   "timestamp": "epsilon",
+   "type": "gemini",
+   "content": "epsilon zeta eta theta alpha",
+   "thoughts": [],
+   "tokens": {
+    "input": 30467,
+    "output": 53,
+    "cached": 29424,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 30520
+   },
+   "model": "theta"
+  },
+  {
+   "id": "delta",
+   "timestamp": "zeta",
+   "type": "gemini",
+   "content": "delta epsilon zeta eta theta alpha beta gamma delta epsilon",
+   "thoughts": [],
+   "tokens": {
+    "input": 30841,
+    "output": 71,
+    "cached": 29436,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 30912
+   },
+   "model": "theta"
+  },
+  {
+   "id": "eta",
+   "timestamp": "theta",
+   "type": "gemini",
+   "content": "gamma delta epsilon zeta eta theta",
+   "thoughts": [],
+   "tokens": {
+    "input": 30984,
+    "output": 61,
+    "cached": 29443,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 31045
+   },
+   "model": "theta"
+  },
+  {
+   "id": "epsilon",
+   "timestamp": "alpha",
+   "type": "gemini",
+   "content": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+   "thoughts": [],
+   "tokens": {
+    "input": 31123,
+    "output": 105,
+    "cached": 29449,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 31228
+   },
+   "model": "theta"
+  },
+  {
+   "id": "eta",
+   "timestamp": "delta",
+   "type": "gemini",
+   "content": "epsilon zeta eta theta alpha beta gamma delta",
+   "thoughts": [],
+   "tokens": {
+    "input": 31306,
+    "output": 58,
+    "cached": 29447,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 31364
+   },
+   "model": "theta"
+  },
+  {
+   "id": "theta",
+   "timestamp": "zeta",
+   "type": "user",
+   "content": "theta alpha beta gamma delta"
+  },
+  {
+   "id": "beta",
+   "timestamp": "delta",
+   "type": "gemini",
+   "content": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+   "thoughts": [
+    {
+     "subject": "zeta eta theta",
+     "description": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+     "timestamp": "epsilon"
+    },
+    {
+     "subject": "beta gamma delta epsilon",
+     "description": "alpha beta gamma delta epsilon zeta eta theta alpha beta",
+     "timestamp": "zeta"
+    },
+    {
+     "subject": "delta epsilon zeta",
+     "description": "theta alpha beta gamma delta epsilon zeta eta theta alpha",
+     "timestamp": "epsilon"
+    }
+   ],
+   "tokens": {
+    "input": 31156,
+    "output": 398,
+    "cached": 0,
+    "thoughts": 404,
+    "tool": 0,
+    "total": 31958
+   },
+   "model": "theta"
+  },
+  {
+   "id": "delta",
+   "timestamp": "delta",
+   "type": "gemini",
+   "content": "zeta eta theta alpha beta gamma delta epsilon zeta eta",
+   "thoughts": [],
+   "tokens": {
+    "input": 32003,
+    "output": 28,
+    "cached": 29431,
+    "thoughts": 0,
+    "tool": 0,
+    "total": 32031
+   },
+   "model": "theta"
+  }
+ ]
+}

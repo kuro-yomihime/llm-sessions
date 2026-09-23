@@ -1,0 +1,13 @@
+# The toolchain CI lints and tests with. Pedantic clippy runs with
+# `-D warnings`, so an unpinned toolchain would let each Rust release fail the
+# pipeline with new lints on unchanged code. Bump deliberately, together with
+# the `image:` in .gitlab-ci.yml and `rust-version` in Cargo.toml, and fix
+# what the new lints find.
+#
+# Also the oldest supported toolchain: `rust-version` matches this pin and no
+# older compiler is tested. Not shipped in the crate, so `cargo install
+# llm-sessions` builds with the user's toolchain, provided it is that new.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

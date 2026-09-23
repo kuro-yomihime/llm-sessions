@@ -1,0 +1,2 @@
+{"id": "00000000-0000-4000-8000-000000000001", "timestamp": "2025-06-23T15:26:22.491Z", "instructions": "beta gamma delta epsilon zeta eta theta iota kappa alpha beta gamma"}
+{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "/workspace/file"}]}

@@ -1,0 +1,14 @@
+{
+  "chat:main": {
+    "sessionId": "77777777-7777-4777-8777-777777777777",
+    "label": "Directory summary",
+    "channel": "terminal",
+    "chatType": "single",
+    "model": "glm-5",
+    "inputTokens": 480,
+    "outputTokens": 96,
+    "totalTokens": 576,
+    "compactionCount": 0,
+    "updatedAt": 1771408811000
+  }
+}

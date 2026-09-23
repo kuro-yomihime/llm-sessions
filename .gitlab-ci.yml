@@ -1,0 +1,76 @@
+# Linux only, by decision: the liveness layer reads /proc, so there is nothing
+# to gain from a build matrix.
+
+# Matches rust-toolchain.toml, so jobs start with the pinned toolchain instead
+# of downloading it. If the two drift, `rustup toolchain install` below still
+# installs whatever the file names; it is only slower.
+image: rust:1.96.0
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  CARGO_TERM_COLOR: always
+
+cache:
+  key:
+    files:
+      - Cargo.lock
+  paths:
+    - .cargo/registry
+    - .cargo/git
+    - target
+
+default:
+  before_script:
+    # Installs the toolchain and components rust-toolchain.toml names (or
+    # RUSTUP_TOOLCHAIN, where a job overrides it); a no-op when present.
+    - rustup toolchain install
+    - rustc --version && cargo --version
+
+stages:
+  - check
+  - test
+  - publish
+
+fmt:
+  stage: check
+  script:
+    - cargo fmt --all --check
+
+clippy:
+  stage: check
+  script:
+    - cargo clippy --all-targets -- -D warnings
+
+# Broken intra-doc links are dead references in the architecture notes.
+doc:
+  stage: check
+  variables:
+    RUSTDOCFLAGS: "-D warnings"
+  script:
+    - cargo doc --no-deps --document-private-items --locked
+
+test:
+  stage: test
+  script:
+    # The golden corpus builds SQLite fixtures, so the runner needs a writable
+    # temporary directory; nothing else is required.
+    - cargo test --all-targets
+
+# Non-blocking: a new RustSec advisory can land against an unchanged lockfile,
+# and that should surface as a warning rather than fail unrelated merges.
+audit:
+  stage: check
+  allow_failure: true
+  script:
+    - cargo install cargo-audit --locked
+    - cargo audit
+
+publish:
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_TAG
+  environment:
+    name: publish
+    url: https://crates.io/crates/llm-sessions
+  script:
+    - cargo publish --locked

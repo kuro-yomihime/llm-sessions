@@ -1,0 +1,6 @@
+/target
+
+# Written by a manual run pointed at the golden corpus (`HOME=tests/golden/home`);
+# the tests copy that corpus to a tempdir, so a hit here is always a stray run.
+/tests/golden/home/.cache/
+/tests/golden/home/.local/state/

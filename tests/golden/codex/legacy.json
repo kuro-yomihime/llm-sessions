@@ -1,0 +1,1 @@
+{"session":{"timestamp":"2026-01-02T03:04:05Z","id":"fixture-id","instructions":"redacted"},"items":[{"role":"user","content":[{"type":"input_text","text":"redacted"}],"type":"message"},{"id":"fixture-id","type":"message","role":"system","content":[{"type":"input_text","text":"redacted"}]}]}

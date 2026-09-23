@@ -1,0 +1,86 @@
+[package]
+name = "llm-sessions"
+version = "0.1.0"
+description = "TUI explorer for LLM coding-agent sessions."
+license = "MIT"
+authors = ["Wiktor W. <wykwit@disroot.org>"]
+repository = "https://gitlab.com/wykwit/llm-sessions/"
+readme = "README.md"
+keywords = ["llm", "agent", "sessions", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+edition = "2024"
+# The only toolchain built and tested: the one pinned in rust-toolchain.toml.
+# Older compilers are refused up front rather than failing mid-build.
+rust-version = "1.96"
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "README.md",
+    "src/**/*.rs",
+    "tests/**",
+    "!tests/golden/home/.cache/**",
+    "!tests/golden/home/.local/state/**",
+]
+
+[lib]
+name = "llm_sessions"
+path = "src/lib.rs"
+
+[[bin]]
+# Must match the name in `--help`, the generated completions and man page, and
+# the command `source/remote.rs` invokes over ssh.
+name = "llm-sessions"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+clap_mangen = "0.2"
+crossterm = "0.29"
+ratatui = { version = "0.30", features = ["crossterm"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# `local-offset` is what lets display convert UTC records to the reader's own
+# clock; it pulls no crate the tree does not already build.
+time = { version = "0.3", features = [
+    "formatting",
+    "parsing",
+    "macros",
+    "serde-well-known",
+    "local-offset",
+] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# `cargo clippy -- -D warnings` in CI turns every warning here into a failure.
+# Pedantic is on; the allowances below are lints whose findings in this crate
+# were judged noise, not a backlog.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# The library exists to serve its own binary; `#[must_use]` on every getter
+# and per-function `# Errors` sections would document nothing a caller needs.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Byte counts and costs are shown to people; f64 precision past 2^52 is moot.
+cast_precision_loss = "allow"
+# Length and flag counts are judged in review, not by a threshold.
+too_many_lines = "allow"
+struct_excessive_bools = "allow"
+similar_names = "allow"
+# Every map here uses the default hasher; generic `S: BuildHasher` parameters
+# would spread type noise through every signature for no caller.
+implicit_hasher = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = "3"
