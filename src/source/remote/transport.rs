@@ -18,14 +18,27 @@ const REMOTE_FILES_PER_SOURCE: usize = 200;
 /// Bytes read from each remote transcript, matching OMP's own head read: the
 /// header record plus its optional title slot.
 const REMOTE_HEAD_BYTES: usize = 8 * 1024;
+/// Run over SSH on stdin, where a non-login shell may have a restricted PATH.
+const PROBE_SCRIPT: &str = "echo \"home:$HOME\"
+if path=$(command -v llm-sessions); then
+    printf 'llm-sessions:%s\n' \"$path\"
+elif [ -x \"$HOME/.local/bin/llm-sessions\" ]; then
+    printf 'llm-sessions:%s\n' \"$HOME/.local/bin/llm-sessions\"
+elif [ -x \"$HOME/.cargo/bin/llm-sessions\" ]; then
+    printf 'llm-sessions:%s\n' \"$HOME/.cargo/bin/llm-sessions\"
+fi
+command -v sqlite3 >/dev/null && echo sqlite3:yes
+# A missing sqlite3 must not fail the probe: the script's exit status
+# becomes ssh's exit status.
+exit 0
+";
 
 /// What probing a host learned, once per process.
 #[derive(Clone, Debug)]
 pub(super) struct Probe {
     pub(super) home: PathBuf,
-    /// How to invoke a remote `llm-sessions`, when one exists. The path matters:
-    /// sshd's default PATH has no user-writable entries, so a binary in
-    /// `~/.local/bin` is invisible to `command -v` over ssh.
+    /// sshd's default PATH may omit user-writable directories, including
+    /// `~/.local/bin` and `~/.cargo/bin`.
     pub(super) llm_sessions: Option<String>,
     pub(super) sqlite3: bool,
 }
@@ -41,17 +54,10 @@ impl Host {
                 // The probe travels on stdin like the listing script: ssh
                 // hands argv to the remote login shell for re-parsing, and
                 // this script's quoting would not survive that round trip.
-                let raw = self
-                    .ssh_script(
-                        "echo \"home:$HOME\"\n\
-                         { command -v llm-sessions || [ -x \"$HOME/.local/bin/llm-sessions\" ] \\\n\
-                           && printf 'llm-sessions:%s\\n' \"$(command -v llm-sessions || echo \"$HOME/.local/bin/llm-sessions\")\"; }\n\
-                         command -v sqlite3 >/dev/null && echo sqlite3:yes\n",
-                    )
-                    .map_err(|e| match e {
-                        Error::Remote { message, .. } => message,
-                        other => other.to_string(),
-                    })?;
+                let raw = self.ssh_script(PROBE_SCRIPT).map_err(|e| match e {
+                    Error::Remote { message, .. } => message,
+                    other => other.to_string(),
+                })?;
                 let mut reported = None;
                 let mut llm_sessions = None;
                 let mut sqlite3 = false;
@@ -219,6 +225,65 @@ mod tests {
             ".codex/sessions"
         );
         assert_eq!(literal_prefix("*.jsonl"), "");
+    }
+
+    #[test]
+    fn probe_finds_cargo_installed_binary_outside_ssh_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_bin = dir.path().join(".cargo/bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let binary = cargo_bin.join("llm-sessions");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .env("HOME", dir.path())
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(PROBE_SCRIPT.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .any(|line| { line == format!("llm-sessions:{}", binary.display()) })
+        );
+    }
+
+    #[test]
+    fn probe_script_succeeds_without_sqlite3() {
+        // A host without sqlite3 used to fail the whole probe: the script's
+        // last command short-circuited to a non-zero exit, which ssh
+        // propagates, and stderr is empty so the error read as
+        // "ssh exited non-zero".
+        let dir = tempfile::tempdir().unwrap(); // empty PATH: no sqlite3
+
+        let mut child = Command::new("/bin/sh")
+            .arg("-s")
+            .env("HOME", dir.path())
+            .env("PATH", dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(PROBE_SCRIPT.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
     }
 
     #[test]
