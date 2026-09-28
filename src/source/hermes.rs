@@ -224,10 +224,32 @@ impl Source for Hermes {
         Ok(ArchiveOutcome::Native)
     }
 
-    /// unverified — confirm first: no `hermes` binary exists on this machine,
-    /// so the flag spelling comes from the store layout, not from `--help`.
+    /// Checked against `hermes --help` of Hermes Agent v0.21.1 (2026.9.7),
+    /// installed at `~/.hermes/hermes-agent`: `--resume SESSION`.
     fn resume_command(&self, id: &str) -> Option<Vec<String>> {
         Some(vec!["hermes".into(), "--resume".into(), id.into()])
+    }
+
+    /// `chat --quiet --resume <id> --query=<msg>`, checked against the
+    /// v0.21.1 source. `--quiet` (`-Q`) answers and exits instead of seeding
+    /// an interactive session. Resuming loads the stored transcript as the
+    /// conversation history (`cli_agent_setup_mixin.py`, following the
+    /// compression chain to the session that holds the messages), and the
+    /// quiet path runs `run_conversation(user_message, conversation_history)`
+    /// (`cli.py`, `_run_quiet_single_query`): the message is appended to that
+    /// conversation, not forked. A new row appears only if Hermes compresses
+    /// context mid-turn, which continues the session in a child just as an
+    /// interactive turn would. The `--query=` spelling keeps argparse from
+    /// reading a message that starts with `-` as a flag.
+    fn insert_command(&self, id: &str, message: &str) -> Option<Vec<String>> {
+        Some(vec![
+            "hermes".into(),
+            "chat".into(),
+            "--quiet".into(),
+            "--resume".into(),
+            id.into(),
+            format!("--query={message}"),
+        ])
     }
 
     fn remote_layout(&self) -> RemoteLayout {

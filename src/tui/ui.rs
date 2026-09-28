@@ -47,6 +47,7 @@ const HELP: &[(&str, &str)] = &[
     ("t / o / c", "Toggle thinking / tool output / changed files"),
     ("f", "Follow new transcript content"),
     ("r", "Quit and print the resume command"),
+    ("i", "Insert: send one message to the selected session"),
     ("m <letter>", "Bookmark the selected session, view and pane"),
     ("' <letter> or ` <letter>", "Jump back to a bookmark"),
     ("J", "Jump to the selected session's tmux pane"),
@@ -842,6 +843,17 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "Enter search · Esc cancel".to_owned(),
             None,
         ),
+        // The end of the message is where typing happens, so a long one
+        // loses its head, not the cursor.
+        Prompt::Insert { target, text } => {
+            let head = format!("Message to {}: ", target.0);
+            let room = width.saturating_sub(Span::raw(head.as_str()).width() + 1);
+            (
+                Span::styled(format!("{head}{}_", tail_cells(text, room)), cyan),
+                "Enter send · Esc cancel".to_owned(),
+                None,
+            )
+        }
         Prompt::Bookmark { jump } => (
             Span::styled(
                 format!(
@@ -921,6 +933,28 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The last `width` cells of `s`, with `…` standing in for what was cut.
+fn tail_cells(s: &str, width: usize) -> String {
+    let span = Span::raw(s);
+    if span.width() <= width {
+        return s.to_owned();
+    }
+    let graphemes: Vec<_> = span.styled_graphemes(Style::default()).collect();
+    let mut used = 1;
+    let mut start = graphemes.len();
+    while start > 0 {
+        let cells = Span::raw(graphemes[start - 1].symbol).width();
+        if used + cells > width {
+            break;
+        }
+        used += cells;
+        start -= 1;
+    }
+    std::iter::once("…")
+        .chain(graphemes[start..].iter().map(|g| g.symbol))
+        .collect()
 }
 
 /// The letters that already answer, so nobody has to guess which of the

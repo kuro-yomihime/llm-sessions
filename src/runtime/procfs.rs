@@ -148,6 +148,77 @@ impl Proc {
             .map_err(|error| format!("cannot parse flags in {}: {error}", path.display()))?;
         Ok(flags & 0b11 != 0)
     }
+
+    /// Every TCP socket in the network namespace, IPv4 and IPv6, from
+    /// `net/tcp{,6}`. The tables are namespace-wide, so one read serves every
+    /// pid; a descriptor's `socket:[inode]` target joins a row to its owner.
+    pub fn tcp(&self) -> io::Result<Vec<TcpSocket>> {
+        let mut sockets = Vec::new();
+        for table in ["tcp", "tcp6"] {
+            match fs::read_to_string(self.root.join("net").join(table)) {
+                Ok(text) => sockets.extend(text.lines().skip(1).filter_map(parse_tcp_row)),
+                // A kernel without IPv6 has no `tcp6`; that is not an error.
+                Err(error) if table == "tcp6" && error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(sockets)
+    }
+}
+
+/// One `net/tcp` row, reduced to what joining clients to servers needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpSocket {
+    pub local_port: u16,
+    pub remote_port: u16,
+    /// The peer is `127.0.0.0/8`, `::1`, or IPv4-mapped loopback.
+    pub remote_loopback: bool,
+    /// Kernel state: `0x01` established, `0x0A` listening.
+    pub state: u8,
+    pub inode: u64,
+}
+
+impl TcpSocket {
+    pub const ESTABLISHED: u8 = 0x01;
+    pub const LISTEN: u8 = 0x0A;
+}
+
+/// `sl local rem st tx:rx tr:when retrnsmt uid timeout inode …`, addresses
+/// as `HEX_ADDR:HEX_PORT` with the address in host byte order per 32-bit
+/// word — so an IPv4 loopback address ends in `7F`.
+fn parse_tcp_row(line: &str) -> Option<TcpSocket> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let endpoint = |field: &str| {
+        let (address, port) = field.split_once(':')?;
+        let loopback = match address.len() {
+            8 => address.ends_with("7F"),
+            32 => {
+                address == "00000000000000000000000001000000"
+                    || (address.starts_with("0000000000000000FFFF0000") && address.ends_with("7F"))
+            }
+            _ => return None,
+        };
+        Some((loopback, u16::from_str_radix(port, 16).ok()?))
+    };
+    let (_, local_port) = endpoint(fields.get(1)?)?;
+    let (remote_loopback, remote_port) = endpoint(fields.get(2)?)?;
+    Some(TcpSocket {
+        local_port,
+        remote_port,
+        remote_loopback,
+        state: u8::from_str_radix(fields.get(3)?, 16).ok()?,
+        inode: fields.get(9)?.parse().ok()?,
+    })
+}
+
+/// The inode of a `socket:[inode]` descriptor target.
+pub fn socket_inode(target: &std::path::Path) -> Option<u64> {
+    target
+        .to_str()?
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -187,5 +258,43 @@ mod tests {
 
         fs::write(&stat, format!("{prefix} {} 1\n", u64::MAX)).unwrap();
         assert!(proc.stat(17).is_none());
+    }
+
+    #[test]
+    fn tcp_rows_parse_loopback_peers_in_both_families() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("net")).unwrap();
+        let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+        fs::write(
+            dir.path().join("net/tcp"),
+            format!(
+                "{header}   0: 0100007F:C0D6 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 11 1 0\n   1: 0100007F:D6D8 0100007F:C0D6 01 00000000:00000000 00:00000000 00000000  1000        0 12 1 0\n   2: 0553A8C0:CD0E 145A41AC:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 13 1 0\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("net/tcp6"),
+            format!(
+                "{header}   0: 00000000000000000000000001000000:9C40 00000000000000000000000001000000:1F90 01 00000000:00000000 00:00000000 00000000  1000        0 14 1 0\n"
+            ),
+        )
+        .unwrap();
+        let sockets = Proc::at(dir.path()).tcp().unwrap();
+        let summary: Vec<_> = sockets
+            .iter()
+            .map(|s| (s.inode, s.state, s.remote_loopback, s.remote_port))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (11, TcpSocket::LISTEN, false, 0),
+                (12, TcpSocket::ESTABLISHED, true, 0xC0D6),
+                (13, TcpSocket::ESTABLISHED, false, 443),
+                (14, TcpSocket::ESTABLISHED, true, 0x1F90),
+            ]
+        );
+        assert_eq!(sockets[0].local_port, 0xC0D6);
+        assert_eq!(socket_inode(std::path::Path::new("socket:[12]")), Some(12));
+        assert_eq!(socket_inode(std::path::Path::new("/tmp/x")), None);
     }
 }

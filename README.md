@@ -2,8 +2,7 @@
 
 > Workspace-first explorer for local LLM coding-agent sessions.
 
-Every coding agent buries its history in its own format. `llm-sessions`
-reads them all and answers one question: **what happened in _this project_?**
+Reads every coding agent's history and answers one question: **what happened in _this project_?**
 
 ```
 $ llm-sessions workspaces
@@ -12,9 +11,8 @@ $ llm-sessions workspaces
  101  ~/code/llm-usage-monitor codex opencode
 ```
 
-Run it with no arguments to browse workspaces → sessions → transcripts,
-every agent merged into one list. The layout follows the terminal: one pane
-under 100 columns, two under 140, three beyond.
+Run with no arguments to browse workspaces → sessions → transcripts, all
+agents merged into one list.
 
 ## Install
 
@@ -22,17 +20,16 @@ under 100 columns, two under 140, three beyond.
 cargo install llm-sessions   # or `cargo install --path .` from a checkout
 ```
 
-Requires Rust 1.96 or newer — the toolchain CI pins in
-`rust-toolchain.toml`; older compilers are refused up front. Linux only,
-deliberately: liveness reads `/proc`, and nothing else is tested.
-`alias llms=llm-sessions` if you want it shorter.
+Requires Rust 1.96+ (pinned in `rust-toolchain.toml`). Linux only: liveness
+reads `/proc`.
 
 ## TUI basics
 
 - Arrows or `j` `k` move, `Enter` opens, `Esc` goes back, `Tab` switches panes.
-- `/` filters by title, path, or agent; `s` full-text search (needs
-  `llm-sessions index`); `x` clears.
-- `Ctrl-W o` fullscreen reader; `?` lists every key.
+- `/` filters, `s` full-text search (needs `llm-sessions index`), `x` clears.
+- `i` insert mode: send one message to the selected session's agent via its
+  headless CLI.
+- `?` lists every key.
 
 ## Sources
 
@@ -41,7 +38,7 @@ deliberately: liveness reads `/proc`, and nothing else is tested.
 | OMP | `~/.omp/agent/sessions/<bucket>/*.jsonl` | overlay |
 | Claude Code | `~/.claude/projects/<dir>/*.jsonl` | overlay |
 | Codex | `~/.codex/sessions/**/rollout-*.jsonl` + `state_5.sqlite` | native |
-| OpenCode (v1 and v2) | `~/.local/share/opencode/opencode.db` (`session` and `session_v2` tables) | native |
+| OpenCode (v1, v2) | `~/.local/share/opencode/opencode.db` | native |
 | Copilot CLI | `~/.copilot/session-store.db` + `session-state/` | overlay |
 | Kilo | `~/.local/share/kilo/kilo.db` | native |
 | Goose | `~/.local/share/goose/sessions/*.jsonl` + `projects.json` | overlay |
@@ -50,9 +47,8 @@ deliberately: liveness reads `/proc`, and nothing else is tested.
 | Hermes | `~/.hermes/state.db` | native |
 | OpenClaw | `~/.openclaw/agents/*/sessions/*.jsonl` + `sessions.json` | overlay |
 
-Missing agents are skipped silently; a failing source degrades to a
-status-bar warning, never an empty list. Not supported: Cursor **GUI**
-stores, Antigravity, Devin.
+Missing agents are skipped; a failing source degrades to a status-bar
+warning. Not supported: Cursor GUI stores, Antigravity, Devin.
 
 ## Remote hosts
 
@@ -60,23 +56,19 @@ Configure in `$XDG_CONFIG_HOME/llm-sessions/hosts.json`:
 
 ```json
 { "hosts": [
-  { "name": "nx-1", "ssh": "nx-1.example.net", "home": "/var/lib/hermes", "sources": ["hermes"] },
-  { "name": "nx-2", "ssh": "dev@nx-2.example.net" }
+  { "name": "nx-1", "ssh": "nx-1.example.net", "home": "/var/lib/hermes", "sources": ["hermes"] }
 ] }
 ```
 
 Remote sessions appear beside local ones (`--host` filter, `host:` in
-queries, host view `5`). With `llm-sessions` installed on the host, its
-JSON output is used — full fidelity, liveness included; otherwise a
-generated `sh` script lists stores over a single SSH connection (`mode`:
-`"auto"`, `"llm-sessions"`, or `"shell"`). No store ever crosses the wire.
-Connections use `BatchMode=yes`, so passphrase-protected hosts fail fast
-instead of hanging.
+queries, host view `5`). With `llm-sessions` installed on the host its JSON
+output is used; otherwise a generated `sh` script lists stores over one SSH
+connection (`mode`: `"auto"`, `"llm-sessions"`, or `"shell"`). Connections
+use `BatchMode=yes`, so passphrase-protected hosts fail fast.
 
 ```sh
-llm-sessions hosts                                            # list + probe every host
+llm-sessions hosts                                            # list + probe
 llm-sessions hosts add nx-1 nx-1.example.net --source hermes  # repeatable --source
-llm-sessions hosts add nx-2 dev@nx-2.example.net --home /var/lib/hermes --mode shell
 llm-sessions hosts remove nx-1
 ```
 
@@ -84,11 +76,9 @@ llm-sessions hosts remove nx-1
 
 ```sh
 llm-sessions                     # interactive explorer
-llm-sessions list                # newest 50 sessions
-llm-sessions list --workspace ~/code/thing --source omp --archived --live
+llm-sessions list                # newest 50 sessions (--json, -q '<query>', --format, -0)
 llm-sessions workspaces          # project totals, live first
-llm-sessions show <id>           # transcript; --thinking --tools for folded details
-llm-sessions show <id> --format md -o out.md   # Markdown or HTML report
+llm-sessions show <id>           # transcript; --thinking --tools, --format md -o out.md
 llm-sessions index               # build/update the optional text index
 llm-sessions search <words>      # full-text search
 llm-sessions digest --since 24h  # recent activity by project
@@ -97,14 +87,12 @@ llm-sessions usage --by workspace --since 7d   # also: model, agent, day
 llm-sessions archive <id>        # --undo restores
 llm-sessions sources             # detected stores and scan costs
 llm-sessions doctor              # diagnostics; never applies fixes
-llm-sessions index --stats | --vacuum | --max-body N --max-bytes N
 llm-sessions completions bash
 llm-sessions man
 ```
 
-Scripting: `list --json --limit 0` (0 = unlimited), `list -q '<query>'`,
-`list --format '{id}' -0` (NUL-separated ids). `--read-only` refuses
-archiving, indexing, tmux focus changes, and saving bookmarks.
+`--read-only` refuses archiving, indexing, tmux focus changes, and saving
+bookmarks.
 
 ## Keys
 
@@ -114,7 +102,7 @@ archiving, indexing, tmux focus changes, and saving bookmarks.
 | `Enter` | open next pane; on a transcript link, read the subagent |
 | `→` `l` / `←` `h` `Esc` | focus pane right / left |
 | `]` `[` / `1`…`6` | cycle / jump to views: workspace, agent, branch, fleet, host, timeline |
-| `/` `s` `x` `Ctrl-R` | filter / full-text search / clear / rescan |
+| `/` `s` `x` `Ctrl-R` | filter / search / clear / rescan |
 | `f` | follow: tail the session live |
 | `J` | jump tmux focus to the selected live session |
 | `z a` `z c` `z o` / `z M` `z R` | fold one session's descendants / all folds |
@@ -123,27 +111,40 @@ archiving, indexing, tmux focus changes, and saving bookmarks.
 | `t` `o` `c` | unfold thinking / tool output / changed files |
 | `Ctrl-W o` `F11` | fullscreen reader (`Ctrl-W ←` `→` resize, `=` reset) |
 | `r` | quit, printing the resume command |
+| `i` | insert: send one message to the selected session |
 | `m` `'` `` ` `` | set / jump to bookmarks |
 | `?` `F1` | help |
 | `q` / `Q` `Ctrl-C` | back / quit |
 
-`r` prints a shell-quoted resume command to stdout — inspect it, then paste
-it into your shell. Don't run it via `$(llm-sessions)`: command substitution
-doesn't interpret the quoting.
+`r` prints a shell-quoted resume command — paste it into your shell; don't
+run it via `$(llm-sessions)`, which won't interpret the quoting.
+
+`i` runs the agent's one-shot command in the session's directory off the UI
+thread (killed after 30 min; the message is one argv element, never shell
+text). Each conversation keeps one writer:
+
+- **OMP, Hermes** resume only an idle session
+  (`omp --print --resume <id> -- <msg>`,
+  `hermes chat --quiet --resume <id> --query=<msg>`); a session with any
+  process attached is refused — use `J` to jump to its pane.
+- **OpenCode** with a live client sends to the one loopback server that
+  client is connected to (read from its sockets in `/proc`); no server or
+  several is refused. An idle session gets plain `opencode run --session <id>`.
+
+Subagents, remote rows, and `--read-only` are refused too.
 
 ## Liveness
 
 | | Meaning |
 |---|---|
 | `●` | **exact** — a process holds the session file open (`/proc/<pid>/fd`) |
-| `○` | **inferred** — right agent, cwd rolls up to the workspace; pid shown with `?` when ambiguous |
-| `·` | written in the last few minutes, nothing attached |
+| `○` | **inferred** — right agent, cwd rolls up to the workspace |
+| `·` | written recently, nothing attached |
 | ` ` | stale |
 
-Live rows also show the tmux pane and working/waiting state (from CPU-time
-deltas). `J` moves tmux focus there; `Enter` opens the transcript instead.
-Every check degrades gracefully without `/proc` or tmux. A process holding
-a subagent transcript open marks its parent live too.
+Live rows also show the tmux pane and working/waiting state. `J` moves tmux
+focus there; `Enter` opens the transcript. A process holding a subagent
+transcript open marks its parent live too.
 
 ## Query language
 
@@ -155,64 +156,43 @@ id:01a0  after:7d  before:today  cost:>1
 live:yes  archived:only  body:naming  bare words = free text
 ```
 
-`body:` needs `llm-sessions index`; `archived:` overrides the `a` toggle.
-`cost:` compares within a nano-dollar, so a summed float like
-`0.30000000000000004` matches `cost:0.3`. Unknown keys are treated as free
-text — a typo narrows results, never fails.
+`body:` needs the index; `archived:` overrides the `a` toggle. Unknown keys
+are treated as free text — a typo narrows results, never fails.
 
 ## Design notes
 
-- **No index for browsing.** A full cross-agent scan of ~2,000 sessions
-  takes ~80 ms, so the TUI simply rescans every 2 s. The FTS5 index exists
-  only for body search and spend caching.
+- **No index for browsing.** A full cross-agent scan takes ~80 ms, so the
+  TUI rescans every 2 s. The FTS5 index exists only for body search and
+  spend caching.
 - **Workspaces roll up.** cwds canonicalize to their repository; linked
   worktrees map to the main one. Ranking is liveness first, then recency
-  with a 7-day half-life — raw counts would let `/tmp` win.
+  with a 7-day half-life.
 - **Derived names are honest.** Missing or duplicated titles get a label
-  from the first user prompt, rendered in italic so it can't pass for an
-  agent-written title.
+  from the first user prompt, rendered in italic.
 - **Subagents and forks are trees.** Children nest under their parent;
   `Enter` on a delegating tool call follows into the child's transcript.
-- **Changed files are answerable.** The transcript opens with a foldable
-  changed-file list; the status line shows `N files +A −D`.
-- **Times are shown on your clock.** Stores record UTC and `--json` still
-  emits it; every timestamp a person reads is converted to the machine's
-  offset. Today's sessions show a time, this week's a weekday, older ones
-  a date.
-- **Paths are never decoded.** They come from recorded fields (`cwd`,
-  `session.directory`, …); where none exists, the decoded guess is
-  marked `~`.
+- **Times are shown on your clock.** Stores record UTC (`--json` emits it);
+  displayed timestamps use the machine's offset.
+- **Paths are never decoded.** They come from recorded fields; where none
+  exists, the decoded guess is marked `~`.
 - **Unknown records survive.** Unrecognized record types become folded
   raw-JSON blocks; a session never fails to open.
-- **Agent stores are read-only.** The only writes are archiving (one
-  `UPDATE` where the agent models it natively, an overlay db otherwise)
-  and `llm-sessions`'s own databases. Credential files are never opened.
+- **Agent stores are read-only.** The only writes are archiving (native
+  where the agent models it, an overlay db otherwise) and `llm-sessions`'s
+  own databases. Credential files are never opened.
 
 ### Source layout
 
-- `src/catalog/` — scan, query grammar and visibility policy, labels,
-  workspace identity.
-- `src/source/` — agent adapters, shared schema decoding, and `remote/`
-  (`transport.rs` runs SSH, `parse.rs` decodes listings).
-- `src/storage/` — index (`UsageCache` is the one tier-1-vs-cached usage
-  rule), archive overlay, bookmarks, SQLite access.
-- `src/runtime/` — process facts (`procfs`), liveness, tmux, resume
-  commands, diagnostics.
-- `src/output/` — `reader/` (`wrap.rs` wrapping, `table.rs` tables),
-  exports, list rows, digests, usage reports.
-- `src/tui/` — `app/` (`mod.rs` state and dispatch, `effects.rs` side
-  effects), `view.rs` grouping, `ui.rs` layout and drawing, `keymap.rs`,
-  `session.rs` terminal loop.
-- `src/cli/` — argument definitions plus one file per command group.
+- `src/catalog/` — scan, query grammar, labels, workspace identity.
+- `src/source/` — agent adapters, schema decoding, `remote/` SSH transport.
+- `src/storage/` — index, archive overlay, bookmarks, SQLite access.
+- `src/runtime/` — process facts, liveness, tmux, resume, diagnostics.
+- `src/output/` — reader, exports, list rows, digests, usage reports.
+- `src/tui/` — `app/` state and effects, `view.rs`, `ui.rs`, `keymap.rs`.
+- `src/cli/` — argument definitions, one file per command group.
 
-The root holds the library facade, binary entry point, shared model,
-errors, and clock. Frontends share catalog filtering; output rendering
-doesn't depend on TUI state. Layout measures the same transcript rectangle
-that drawing uses.
-
-Development: the toolchain is pinned (1.96.0); CI runs fmt, pedantic
-clippy, rustdoc with `-D warnings`, tests, and a non-blocking
-`cargo audit`.
+Development: toolchain pinned (1.96.0); CI runs fmt, pedantic clippy,
+rustdoc with `-D warnings`, tests, and a non-blocking `cargo audit`.
 
 ## Storage `llm-sessions` owns
 
@@ -222,9 +202,8 @@ clippy, rustdoc with `-D warnings`, tests, and a non-blocking
 | `$XDG_CACHE_HOME/llm-sessions/index.db` | FTS5 body index, spend cache; delete any time |
 
 Both are disposable. The index is large (~690 MB per ~5 GB of bodies) and
-only written by `llm-sessions index`; `--since`/`--max-bytes` bound what it
-keeps, `--max-body` truncates oversized tool output, `--vacuum` reclaims
-pages.
+only written by `llm-sessions index`; `--since`/`--max-bytes` bound it,
+`--max-body` truncates oversized tool output, `--vacuum` reclaims pages.
 
 ## License
 

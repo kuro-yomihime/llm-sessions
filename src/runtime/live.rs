@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::model::{Liveness, SessionSummary, SourceId};
-use crate::runtime::procfs::Proc;
+use crate::runtime::procfs::{Proc, TcpSocket, socket_inode};
 use crate::runtime::tmux::{self, Pane};
 
 /// A tier-2 claim is only credible against a session the agent could plausibly
@@ -66,6 +66,10 @@ pub struct Process {
     pub pid: u32,
     pub agent: SourceId,
     pub cwd: Option<PathBuf>,
+    /// Loopback ports of listening servers this process holds a connection
+    /// to — how insert mode finds the server an `OpenCode` client talks to,
+    /// from the kernel rather than from flags whose meaning drifts.
+    pub servers: Vec<u16>,
     /// Session transcripts this process currently holds open.
     pub open_sessions: Vec<PathBuf>,
     pub pane: Option<Pane>,
@@ -111,12 +115,26 @@ impl Fleet {
 
         let elapsed = self.sampled_at.map(|at| at.elapsed());
         let mut processes = Vec::new();
+        // One namespace-wide read joins every process's sockets. Unreadable
+        // tables mean no server is known, which insert mode refuses on.
+        let tcp = proc.tcp().unwrap_or_default();
+        let listening: HashSet<u16> = tcp
+            .iter()
+            .filter(|socket| socket.state == TcpSocket::LISTEN)
+            .map(|socket| socket.local_port)
+            .collect();
         // Unknown process inventory cannot support a live claim; fall back
         // to recency rather than treating an unreadable tree as process facts.
         for pid in proc.pids().unwrap_or_default() {
             let Some(agent) = agent_of(proc, pid) else {
                 continue;
             };
+            let descriptors: Vec<PathBuf> = proc
+                .descriptors(pid)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(_, target)| target)
+                .collect();
             let ticks = proc.stat(pid).map_or(0, |stat| stat.ticks);
             let activity = match (elapsed, self.previous.get(&pid)) {
                 (Some(elapsed), Some(&before)) if elapsed.as_secs_f64() > 0.0 => {
@@ -133,7 +151,8 @@ impl Fleet {
                 pid,
                 agent,
                 cwd: proc.cwd(pid),
-                open_sessions: open_files(proc, pid),
+                servers: servers_of(&descriptors, &tcp, &listening),
+                open_sessions: open_files(descriptors),
                 pane: pane_for(proc, pid, &pane_by_pid).cloned(),
                 activity,
                 ticks,
@@ -276,7 +295,16 @@ fn agent_of(proc: &Proc, pid: u32) -> Option<SourceId> {
     {
         return None;
     }
-    let name = Path::new(argv.first()?).file_name()?.to_str()?;
+    let file_name = |arg: &String| Path::new(arg).file_name()?.to_str().map(str::to_owned);
+    // A script's process is its interpreter: Hermes' launcher execs
+    // `venv/bin/python …/hermes-agent/hermes chat`, so the agent is the
+    // script, not `python`.
+    let argv = match argv.first().and_then(file_name) {
+        Some(interpreter) if interpreter.starts_with("python") => &argv[1..],
+        _ => &argv[..],
+    };
+    let name = file_name(argv.first()?)?;
+    let name = name.as_str();
     match name {
         "omp" => Some(SourceId::Omp),
         "claude" => Some(SourceId::Claude),
@@ -288,8 +316,8 @@ fn agent_of(proc: &Proc, pid: u32) -> Option<SourceId> {
         "goose" => Some(SourceId::Goose),
         "cursor-agent" => Some(SourceId::Cursor),
         "gemini" => Some(SourceId::Gemini),
-        // Neither binary exists on this machine, so local liveness for these
-        // two is untested; the shape is identical to the other eight.
+        // Hermes is detected through its Python launcher (see above); no
+        // `openclaw` binary exists on this machine, so its liveness is untested.
         "hermes" => Some(SourceId::Hermes),
         "openclaw" => Some(SourceId::OpenClaw),
         _ => None,
@@ -299,16 +327,32 @@ fn agent_of(proc: &Proc, pid: u32) -> Option<SourceId> {
 /// Regular files the process holds open. Only transcripts matter, and the
 /// caller matches them against known session paths, so anything else is noise
 /// worth dropping here.
-fn open_files(proc: &Proc, pid: u32) -> Vec<PathBuf> {
-    proc.descriptors(pid)
-        .unwrap_or_default()
+fn open_files(descriptors: Vec<PathBuf>) -> Vec<PathBuf> {
+    descriptors
         .into_iter()
-        .filter_map(|(_, target)| target)
         .filter(|path| {
             path.extension()
                 .is_some_and(|ext| ext == "jsonl" || ext == "json")
         })
         .collect()
+}
+
+/// Listening loopback ports the process's own sockets are connected to.
+fn servers_of(descriptors: &[PathBuf], tcp: &[TcpSocket], listening: &HashSet<u16>) -> Vec<u16> {
+    let inodes: HashSet<u64> = descriptors.iter().filter_map(|t| socket_inode(t)).collect();
+    let mut ports: Vec<u16> = tcp
+        .iter()
+        .filter(|socket| {
+            socket.state == TcpSocket::ESTABLISHED
+                && socket.remote_loopback
+                && inodes.contains(&socket.inode)
+                && listening.contains(&socket.remote_port)
+        })
+        .map(|socket| socket.remote_port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// Walk the ancestry until it reaches a pane's shell.
@@ -381,6 +425,7 @@ mod tests {
             pid,
             agent,
             cwd: Some(PathBuf::from(cwd)),
+            servers: Vec::new(),
             open_sessions: open.iter().map(PathBuf::from).collect(),
             pane: None,
             activity: Activity::Unknown,
@@ -581,6 +626,23 @@ mod tests {
         fleet.refresh_from(&Proc::at(&proc_dir));
         let pids: Vec<u32> = fleet.processes().iter().map(|p| p.pid).collect();
         assert_eq!(pids, [51]);
+    }
+
+    /// Hermes runs as `python …/hermes chat`. Keyed on `argv[0]` alone, a
+    /// running Hermes looked stale — and insert mode resumed behind it.
+    #[test]
+    fn an_agent_run_by_its_interpreter_is_still_that_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = dir.path().join("60");
+        std::fs::create_dir_all(pid_dir.join("fd")).unwrap();
+        std::fs::write(
+            pid_dir.join("cmdline"),
+            b"/home/u/.hermes/hermes-agent/venv/bin/python\0/home/u/.hermes/hermes-agent/hermes\0chat\0",
+        )
+        .unwrap();
+        let mut fleet = Fleet::default();
+        fleet.refresh_from(&Proc::at(dir.path()));
+        assert_eq!(fleet.get(60).map(|p| p.agent), Some(SourceId::Hermes));
     }
 
     /// `std` exposes no `getppid` and the crate takes no new dependencies, so

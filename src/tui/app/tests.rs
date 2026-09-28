@@ -1210,3 +1210,191 @@ fn a_remote_row_is_read_through_its_host_not_the_local_filesystem() {
     assert!(status.contains("nx-1"), "{status}");
     assert!(app.transcript().is_none());
 }
+
+/// An agent whose "CLI" writes where the message went, and the message, to
+/// a file. With `live`, it can also reach a running instance.
+struct Recorder {
+    out: PathBuf,
+    live: bool,
+}
+
+impl Recorder {
+    fn record(&self, target: &str, message: &str) -> Vec<String> {
+        [
+            "sh",
+            "-c",
+            r#"printf '%s|%s' "$1" "$2" > "$3""#,
+            "sh",
+            target,
+            message,
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain([self.out.display().to_string()])
+        .collect()
+    }
+}
+
+impl Source for Recorder {
+    fn id(&self) -> SourceId {
+        SourceId::Omp
+    }
+    fn roots(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+    fn list(&self) -> crate::error::Result<Vec<SessionSummary>> {
+        Ok(vec![recent(SourceId::Omp, "a", "", 1)])
+    }
+    fn open(&self, _locator: &Locator) -> crate::error::Result<Transcript> {
+        Ok(Transcript::new("a", SourceId::Omp))
+    }
+    fn insert_command(&self, id: &str, message: &str) -> Option<Vec<String>> {
+        Some(self.record(&format!("resume {id}"), message))
+    }
+    fn live_insert_command(&self, id: &str, message: &str, servers: &[u16]) -> Option<Vec<String>> {
+        self.live
+            .then(|| self.record(&format!("{id} via {servers:?}"), message))
+    }
+}
+
+fn recorder_app(out: &Path, live: bool, session: SessionSummary, fleet: Fleet) -> App {
+    App::new(
+        Path::new("/home/u"),
+        vec![Box::new(Recorder {
+            out: out.to_path_buf(),
+            live,
+        })],
+        vec![session],
+        Vec::new(),
+        None,
+        None,
+        fleet,
+    )
+}
+
+/// A fleet holding one agent process, read from a fake `/proc`; with
+/// `server`, the process holds a connection to a loopback server listening
+/// on that port.
+fn fleet_with(pid: u32, argv: &str, server: Option<u16>) -> Fleet {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_dir = dir.path().join(pid.to_string());
+    std::fs::create_dir_all(pid_dir.join("fd")).unwrap();
+    std::fs::write(pid_dir.join("cmdline"), argv.replace(' ', "\0")).unwrap();
+    if let Some(port) = server {
+        std::fs::create_dir(dir.path().join("net")).unwrap();
+        let row = |sl, local: &str, remote: &str, state, inode| {
+            format!("{sl}: {local} {remote} {state} 0:0 0:0 0 1000 0 {inode} 1 0\n")
+        };
+        std::fs::write(
+            dir.path().join("net/tcp"),
+            format!(
+                "header\n{}{}",
+                row(
+                    0,
+                    &format!("0100007F:{port:04X}"),
+                    "00000000:0000",
+                    "0A",
+                    76
+                ),
+                row(
+                    1,
+                    "0100007F:D6D8",
+                    &format!("0100007F:{port:04X}"),
+                    "01",
+                    77
+                ),
+            ),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("socket:[77]", pid_dir.join("fd/3")).unwrap();
+    }
+    let mut fleet = Fleet::default();
+    fleet.refresh_from(&crate::runtime::procfs::Proc::at(dir.path()));
+    assert!(fleet.get(pid).is_some(), "{argv} is not an agent");
+    fleet
+}
+
+fn send_and_wait(app: &mut App, message: &str) {
+    use crossterm::event::KeyCode;
+    press(app, KeyCode::Char('i'));
+    for c in message.chars() {
+        press(app, KeyCode::Char(c));
+    }
+    assert!(!app.should_quit(), "typed letters are text, not keys");
+    press(app, KeyCode::Enter);
+    assert_eq!(app.prompt(), &Prompt::None);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !app.status().is_some_and(|s| s.contains("delivered")) {
+        assert!(Instant::now() < deadline, "status: {:?}", app.status());
+        std::thread::sleep(Duration::from_millis(10));
+        app.tick();
+    }
+}
+
+fn take(out: &Path) -> String {
+    let written = std::fs::read_to_string(out).unwrap();
+    std::fs::remove_file(out).unwrap();
+    written
+}
+
+/// The typed text reaches the agent as one verbatim argument — no shell
+/// ever sees it — and the outcome comes back on the status line.
+#[test]
+fn insert_mode_hands_the_message_to_the_agent_verbatim() {
+    let out = std::env::temp_dir().join(format!("llm-sessions-insert-{}", std::process::id()));
+    let session = recent(SourceId::Omp, "a", "", 1);
+    let mut app = recorder_app(&out, true, session, Fleet::default());
+    let message = "-q it's $(not run) Q";
+    send_and_wait(&mut app, message);
+    assert_eq!(take(&out), format!("resume a|{message}"));
+}
+
+/// A session some process may be running is never resumed behind its back:
+/// the message goes through the process that owns it.
+#[test]
+fn insert_mode_reaches_a_running_session_through_its_owner() {
+    let out = std::env::temp_dir().join(format!("llm-sessions-insert-live-{}", std::process::id()));
+    let mut session = recent(SourceId::Omp, "a", "", 1);
+    session.liveness = Liveness::Probably { pid: 42 };
+    let fleet = fleet_with(42, "omp --model x", Some(49374));
+    let mut app = recorder_app(&out, true, session, fleet);
+    send_and_wait(&mut app, "hi");
+    assert_eq!(take(&out), "a via [49374]|hi");
+}
+
+#[test]
+fn insert_mode_refuses_sessions_it_must_not_write_behind() {
+    let out = std::env::temp_dir().join("llm-sessions-insert-never-written");
+    let stale = || recent(SourceId::Omp, "a", "", 1);
+    let (mut open, mut maybe, mut remote) = (stale(), stale(), stale());
+    open.liveness = Liveness::Live { pid: 42 };
+    maybe.liveness = Liveness::Probably { pid: 42 };
+    remote.host = Some("nx-1".into());
+    for (session, read_only, why) in [
+        (open, false, "is open in pid 42"),
+        // An inferred owner may hold it in memory just the same.
+        (maybe, false, "may be open in pid 42"),
+        (remote, false, "local sessions only"),
+        (stale(), true, "--read-only"),
+    ] {
+        // This agent has no way into a running instance.
+        let mut app = recorder_app(&out, false, session, fleet_with(42, "omp", None));
+        app.set_read_only(read_only);
+        app.handle(Action::StartInsert);
+        assert_eq!(app.prompt(), &Prompt::None);
+        assert!(
+            app.status().is_some_and(|s| s.contains(why)),
+            "{:?}",
+            app.status()
+        );
+    }
+    assert!(!out.exists());
+    // No adapter command: the agent is named rather than silently ignored.
+    let mut app = app_with(vec![recent(SourceId::Codex, "a", "", 1)]);
+    app.handle(Action::StartInsert);
+    assert!(
+        app.status().is_some_and(|s| s.contains("codex")),
+        "{:?}",
+        app.status()
+    );
+}

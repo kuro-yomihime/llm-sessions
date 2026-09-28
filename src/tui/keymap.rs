@@ -25,7 +25,7 @@ pub fn action_for_key(key: KeyEvent, prompt: &Prompt) -> Option<Action> {
     }
 
     match prompt {
-        Prompt::Filter(_) | Prompt::Search(_) => match key.code {
+        Prompt::Filter(_) | Prompt::Search(_) | Prompt::Insert { .. } => match key.code {
             KeyCode::Esc => Some(Action::Cancel),
             KeyCode::Enter => Some(Action::Confirm),
             KeyCode::Backspace => Some(Action::Backspace),
@@ -125,6 +125,7 @@ fn base(code: KeyCode) -> Option<Action> {
         KeyCode::Char('c') => Some(Action::ToggleFiles),
         KeyCode::F(11) => Some(Action::ToggleZen),
         KeyCode::Char('r') => Some(Action::Resume),
+        KeyCode::Char('i') => Some(Action::StartInsert),
         KeyCode::Char('?') | KeyCode::F(1) => Some(Action::ToggleHelp),
         KeyCode::Char(c) => Some(Action::Char(c)),
         _ => None,

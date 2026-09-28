@@ -65,6 +65,30 @@ impl Source for OpenCode {
         Some(vec!["opencode".into(), "--session".into(), id.into()])
     }
 
+    /// Nothing is running the session, so `opencode run` may own it for one
+    /// message: it answers and exits. `--` ends its flags, so a message
+    /// starting with `-` stays a message.
+    fn insert_command(&self, id: &str, message: &str) -> Option<Vec<String>> {
+        Some(run_command(id, message, None))
+    }
+
+    /// A running client is reached through the one server it is connected
+    /// to — the shared `opencode serve --service` for a v2 client, the
+    /// in-process server for a v1 TUI. The server comes from the client's
+    /// sockets, not its flags: flag spellings differ between versions, and a
+    /// guessed server would be a second writer. No server, or several to
+    /// choose from, is refused.
+    fn live_insert_command(&self, id: &str, message: &str, servers: &[u16]) -> Option<Vec<String>> {
+        let [port] = servers else {
+            return None;
+        };
+        Some(run_command(
+            id,
+            message,
+            Some(&format!("http://127.0.0.1:{port}")),
+        ))
+    }
+
     /// One remote `sqlite3` query answers tier 1, so there is nothing to glob.
     fn remote_layout(&self) -> RemoteLayout {
         RemoteLayout {
@@ -74,5 +98,49 @@ impl Source for OpenCode {
                 opencode_schema::REMOTE_LIST_SQL,
             )),
         }
+    }
+}
+
+/// `opencode run --session <id> [--server <url>] -- <message>`, the
+/// spelling of `opencode run --help` in 2.0.18.
+fn run_command(id: &str, message: &str, server: Option<&str>) -> Vec<String> {
+    let mut command = vec![
+        "opencode".to_owned(),
+        "run".to_owned(),
+        "--session".to_owned(),
+        id.to_owned(),
+    ];
+    if let Some(server) = server {
+        command.extend(["--server".to_owned(), server.to_owned()]);
+    }
+    command.extend(["--".to_owned(), message.to_owned()]);
+    command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The message must reach the server the running client is connected
+    /// to; any other would be a second writer on the same session.
+    #[test]
+    fn a_live_client_is_reached_only_through_its_one_server() {
+        let opencode = OpenCode::new(Path::new("/home/u"));
+        let send = |servers: &[u16]| opencode.live_insert_command("ses_1", "hi", servers);
+        assert_eq!(
+            send(&[49374]).unwrap(),
+            [
+                "opencode",
+                "run",
+                "--session",
+                "ses_1",
+                "--server",
+                "http://127.0.0.1:49374",
+                "--",
+                "hi"
+            ]
+        );
+        assert_eq!(send(&[]), None, "no known server");
+        assert_eq!(send(&[49374, 8080]), None, "ambiguous");
     }
 }

@@ -104,6 +104,19 @@ impl Source for Omp {
         Some(vec!["omp".into(), "--resume".into(), id.into()])
     }
 
+    /// `-p` answers and exits; `--` keeps a message that starts with `-`
+    /// from reading as a flag (checked against omp 18.2).
+    fn insert_command(&self, id: &str, message: &str) -> Option<Vec<String>> {
+        Some(vec![
+            "omp".into(),
+            "--print".into(),
+            "--resume".into(),
+            id.into(),
+            "--".into(),
+            message.into(),
+        ])
+    }
+
     /// The shell transport finds session files in the bucket directories, and
     /// subagent artifacts in the directory that sits beside each session file.
     fn remote_layout(&self) -> RemoteLayout {

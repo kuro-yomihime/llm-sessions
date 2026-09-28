@@ -1,8 +1,9 @@
 //! Hand-off, not launching.
 //!
-//! `llm-sessions` never spawns or supervises an agent. It prints the command that
+//! Resuming never spawns or supervises an agent. It prints the command that
 //! resumes the selected session on stdout while the TUI renders on stderr.
-//! Inspect the shell-quoted output before pasting it into a shell.
+//! Inspect the shell-quoted output before pasting it into a shell. (Insert
+//! mode, in `runtime::insert`, is the one place an agent is started.)
 
 /// POSIX-shell quoting for a command the user can inspect and paste.
 pub fn shell_quote(argument: &str) -> String {

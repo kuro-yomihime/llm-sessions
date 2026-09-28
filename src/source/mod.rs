@@ -52,6 +52,29 @@ pub trait Source: Send + Sync {
         None
     }
 
+    /// Headless command that appends `message` to this session as one user
+    /// turn, lets the agent answer, and exits. Used only when no process is
+    /// attached to the session: resuming one an agent holds in memory would
+    /// fork its history. The message is one argv element, never shell text.
+    /// `None` means insert mode does not support this agent.
+    fn insert_command(&self, _id: &str, _message: &str) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Command that hands `message` to the running process that holds or
+    /// may hold this session, so that process stays its only writer.
+    /// `servers` are the loopback ports of listening servers that process is
+    /// connected to, read from the kernel. `None` means it cannot be reached
+    /// from here and the message is refused.
+    fn live_insert_command(
+        &self,
+        _id: &str,
+        _message: &str,
+        _servers: &[u16],
+    ) -> Option<Vec<String>> {
+        None
+    }
+
     /// Store locations relative to a home directory, for a host this process
     /// cannot read directly. The default is "not listable without a remote
     /// `llm-sessions`", which the remote layer reports rather than guessing.

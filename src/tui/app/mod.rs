@@ -59,6 +59,11 @@ pub enum Prompt {
         groups: usize,
         archive: bool,
     },
+    /// Insert mode: one message for `target`'s agent, sent on Enter.
+    Insert {
+        target: (SourceId, String),
+        text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +116,8 @@ pub enum Action {
     /// `'` — go back to one.
     StartJump,
     Resume,
+    /// `i` — type one message for the selected session's agent.
+    StartInsert,
     StartFilter,
     StartSearch,
     ClearFilter,
@@ -206,6 +213,8 @@ pub struct App {
     read_only: bool,
     quit: bool,
     resume: Option<Vec<String>>,
+    /// Insert-mode messages whose agent has not exited yet.
+    deliveries: Vec<crate::runtime::insert::Delivery>,
 }
 
 impl App {
@@ -301,6 +310,7 @@ impl App {
             read_only: false,
             quit: false,
             resume: None,
+            deliveries: Vec::new(),
         };
         app.apply_cached_usage();
         app.regroup();
@@ -515,6 +525,7 @@ impl App {
         // collecting it is free, and a finished refresh — or transcript —
         // should show up immediately rather than up to `REFRESH_INTERVAL`
         // late.
+        self.collect_deliveries();
         self.collect_remote_transcript();
         if self.remote.poll(false) {
             self.rescan();
@@ -579,6 +590,7 @@ impl App {
         // A held key starves `tick`; a transcript that has already arrived
         // must not wait for the keyboard to go quiet.
         self.collect_remote_transcript();
+        self.collect_deliveries();
         // Quit is global, including unfinished edits and destructive prompts.
         if action == Action::Quit {
             self.quit = true;
@@ -614,6 +626,7 @@ impl App {
             Prompt::Fold => return self.fold_command(action),
             Prompt::Bookmark { jump } => return self.bookmarking(action, jump),
             Prompt::ConfirmArchive { archive, .. } => return self.confirming(action, archive),
+            Prompt::Insert { target, text } => return self.composing(action, target, text),
             Prompt::None => {}
         }
 
@@ -651,7 +664,8 @@ impl App {
                 | Action::ToggleGroupMark
                 | Action::MarkAll
                 | Action::ArchiveMarked
-                | Action::UnarchiveMarked => self.zen = false,
+                | Action::UnarchiveMarked
+                | Action::StartInsert => self.zen = false,
                 _ => {}
             }
         }
@@ -755,6 +769,7 @@ impl App {
             Action::StartBookmark => self.prompt = Prompt::Bookmark { jump: false },
             Action::StartJump => self.prompt = Prompt::Bookmark { jump: true },
             Action::Resume => self.request_resume(),
+            Action::StartInsert => self.start_insert(),
             Action::StartFilter => self.prompt = Prompt::Filter(self.filter.clone()),
             Action::StartSearch => self.prompt = Prompt::Search(String::new()),
             Action::ClearFilter => {
@@ -958,6 +973,25 @@ impl App {
                     self.filter = text;
                     self.regroup();
                 }
+            }
+            _ => {}
+        }
+    }
+
+    fn composing(&mut self, action: Action, target: (SourceId, String), mut text: String) {
+        match action {
+            Action::Char(c) => {
+                text.push(c);
+                self.prompt = Prompt::Insert { target, text };
+            }
+            Action::Backspace => {
+                text.pop();
+                self.prompt = Prompt::Insert { target, text };
+            }
+            Action::Cancel => self.prompt = Prompt::None,
+            Action::Confirm => {
+                self.prompt = Prompt::None;
+                self.send_insert(&target, &text);
             }
             _ => {}
         }
