@@ -586,6 +586,7 @@ fn remote_listing_sql_round_trips_every_sql_source() {
     assert_eq!(
         checked,
         [
+            llm_sessions::SourceId::Copilot,
             llm_sessions::SourceId::OpenCode,
             llm_sessions::SourceId::Kilo,
             llm_sessions::SourceId::Hermes,

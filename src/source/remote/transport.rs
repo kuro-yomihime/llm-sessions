@@ -192,21 +192,52 @@ pub(super) fn files_script(home: &str, agent: &str, globs: &[&str]) -> String {
 /// title cannot break the record framing. `queries` run in order until one
 /// succeeds. Buffer each attempt separately: even if a query emits some rows
 /// and then fails, its partial JSON must not contaminate the next result.
+///
+/// A host without the database emits nothing: no data is not a problem.
 pub(super) fn sql_script(home: &str, agent: &str, db: &str, queries: &[&str]) -> String {
     let db = crate::runtime::resume::shell_quote(&format!("{home}/{db}"));
     let attempts = queries
         .iter()
         .map(|query| {
             format!(
-                "payload=$(sqlite3 -readonly -json {db} {} 2>/dev/null)",
+                "payload=$({SQLITE3} {db} {} 2>/dev/null)",
                 crate::runtime::resume::shell_quote(query)
             )
         })
         .collect::<Vec<_>>()
         .join(" || ");
     format!(
-        "payload=''; if ! {{ {attempts}; }}; then payload=''; fi; printf 'S\\t{agent}\\t'; printf '%s' \"$payload\" | base64 | tr -d '\\n'; printf '\\n'\n"
+        "if [ -e {db} ]; then payload=''; if ! {{ {attempts}; }}; then payload=''; fi; printf 'S\\t{agent}\\t'; printf '%s' \"$payload\" | base64 | tr -d '\\n'; printf '\\n'; fi\n"
     )
+}
+
+/// `sqlite3` read-only, as JSON, waiting out a writer's lock briefly rather
+/// than failing a scan on a live WAL database.
+const SQLITE3: &str = "sqlite3 -readonly -json -cmd '.timeout 2000'";
+
+/// For a source whose store needs `sqlite3` the host lacks: say so only when
+/// the store exists. A host the agent never ran on stays silent.
+pub(super) fn missing_sqlite3_script(home: &str, agent: &str, db: &str) -> String {
+    let db = crate::runtime::resume::shell_quote(&format!("{home}/{db}"));
+    format!("if [ -e {db} ]; then printf 'M\\t{agent}\\n'; fi\n")
+}
+
+/// Read one session's rows on the host: each named SELECT becomes one
+/// `R\t<name>\t<base64 json>` record, so only that session crosses the
+/// wire, never the database. A missing database emits nothing.
+pub(super) fn open_sql_script(db: &str, queries: &[(&str, String)]) -> String {
+    let db = crate::runtime::resume::shell_quote(db);
+    let mut script = format!("if [ -e {db} ]; then\n");
+    for (name, query) in queries {
+        // Writing into a `String` cannot fail.
+        let _ = writeln!(
+            script,
+            "payload=$({SQLITE3} {db} {} 2>/dev/null) || payload=''; printf 'R\\t{name}\\t'; printf '%s' \"$payload\" | base64 | tr -d '\\n'; printf '\\n'",
+            crate::runtime::resume::shell_quote(query)
+        );
+    }
+    script.push_str("fi\n");
+    script
 }
 
 #[cfg(test)]
@@ -292,11 +323,13 @@ mod tests {
         let fake_sqlite = dir.path().join("sqlite3");
         std::fs::write(
             &fake_sqlite,
-            "#!/bin/sh\ncase \"$4\" in *first*) printf '[{partial'; exit 1;; esac\nprintf '[{\"id\":\"second\"}]'\n",
+            "#!/bin/sh\ncase \"$*\" in *first*) printf '[{partial'; exit 1;; esac\nprintf '[{\"id\":\"second\"}]'\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake_sqlite, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let script = sql_script("/home/me", "opencode", "store.db", &["first", "second"]);
+        std::fs::write(dir.path().join("store.db"), "").unwrap();
+        let home = dir.path().to_string_lossy().into_owned();
+        let script = sql_script(&home, "opencode", "store.db", &["first", "second"]);
         let output = Command::new("sh")
             .arg("-c")
             .arg(script)
@@ -318,7 +351,7 @@ mod tests {
             br#"[{"id":"second"}]"#
         );
 
-        let script = sql_script("/home/me", "opencode", "store.db", &["first"]);
+        let script = sql_script(&home, "opencode", "store.db", &["first"]);
         let output = Command::new("sh")
             .arg("-c")
             .arg(script)
@@ -334,5 +367,79 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "S\topencode\t\n");
+    }
+
+    fn run_sh(script: &str, path: Option<&str>) -> String {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn an_absent_store_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_string_lossy();
+        let missing = missing_sqlite3_script(&home, "copilot", ".copilot/session-store.db");
+        assert_eq!(run_sh(&missing, None), "");
+        let listing = sql_script(&home, "copilot", ".copilot/session-store.db", &["SELECT 1"]);
+        assert_eq!(run_sh(&listing, None), "");
+
+        std::fs::create_dir_all(dir.path().join(".copilot")).unwrap();
+        std::fs::write(dir.path().join(".copilot/session-store.db"), "").unwrap();
+        assert_eq!(run_sh(&missing, None), "M\tcopilot\n");
+    }
+
+    #[test]
+    fn open_sql_script_quotes_path_and_query() {
+        let script = open_sql_script(
+            "/home/o'neil/.copilot/session-store.db",
+            &[("session", "SELECT 1 WHERE id = 'x'".into())],
+        );
+        assert!(
+            script.contains("'/home/o'\\''neil/.copilot/session-store.db'"),
+            "{script}"
+        );
+        assert!(script.contains("id = '\\''x'\\''"), "{script}");
+        assert!(script.contains("-readonly -json"), "{script}");
+        assert!(script.contains("printf 'R\\tsession\\t'"), "{script}");
+    }
+
+    #[test]
+    fn open_sql_script_frames_each_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store.db");
+        std::fs::write(&db, "").unwrap();
+        let fake_sqlite = dir.path().join("sqlite3");
+        // The query is the last argument; echo it back so quoting is proven.
+        std::fs::write(
+            &fake_sqlite,
+            "#!/bin/sh\nfor last; do :; done\ncase \"$last\" in *fail*) exit 1;; esac\nprintf '[{\"q\":\"%s\"}]' \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_sqlite, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = open_sql_script(
+            &db.to_string_lossy(),
+            &[
+                ("session", "SELECT 'it''s'".into()),
+                ("turns", "fail".into()),
+            ],
+        );
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let raw = run_sh(&script, Some(&path));
+        let rows = crate::source::remote::parse::parse_open_rows(&raw);
+        assert_eq!(
+            rows["session"],
+            vec![serde_json::json!({"q": "SELECT 'it''s'"})]
+        );
+        assert!(rows["turns"].is_empty(), "a failed query is no rows");
     }
 }

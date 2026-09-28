@@ -58,6 +58,27 @@ pub trait Source: Send + Sync {
     fn remote_layout(&self) -> RemoteLayout {
         RemoteLayout::default()
     }
+
+    /// Named SELECTs that read one session's rows on a remote host, for a
+    /// [`Locator::Row`] the shell transport listed. Empty: this source cannot
+    /// be read remotely without `llm-sessions` on the host.
+    fn remote_open_sql(&self, _id: &str) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+
+    /// Rebuild a transcript from the rows [`Source::remote_open_sql`]
+    /// fetched, keyed by query name, reusing the local reconstruction.
+    fn open_remote_rows(
+        &self,
+        _db: &Path,
+        _id: &str,
+        _rows: &std::collections::HashMap<String, Vec<serde_json::Value>>,
+    ) -> Result<Transcript> {
+        Err(Error::Unsupported {
+            agent: self.id(),
+            what: "reading remote database rows",
+        })
+    }
 }
 
 /// What the shell transport needs: `find`-style globs for file stores,

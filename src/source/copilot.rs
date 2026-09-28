@@ -6,15 +6,16 @@
 //! parent, or archive columns. A session-state `workspace.yaml` may supply
 //! `cwd` when the database row does not; the observed file contains `cwd: /tmp`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{OptionalExtension, params};
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::error::{Error, Result, sql};
 use crate::model::{Block, Locator, Role, SessionSummary, SourceId, Transcript, Turn};
-use crate::source::{Source, clean_title, parse_rfc3339, read_head, row_locator};
+use crate::source::{RemoteLayout, Source, clean_title, parse_rfc3339, read_head, row_locator};
 use crate::storage::sqlite;
 
 const WORKSPACE_BYTES: usize = 8 * 1024;
@@ -22,6 +23,9 @@ const SESSION_QUERY: &str = "\
 SELECT id, cwd, summary, created_at, updated_at
 FROM sessions
 ORDER BY updated_at DESC";
+const TURN_COLUMNS: &str = "turn_index, user_message, assistant_response, timestamp";
+const EVENT_COLUMNS: &str = "turn_index, event_type, tool_call_id, command, output, \
+                             exit_code, event_key, event_value";
 
 #[derive(Debug)]
 pub struct Copilot {
@@ -102,6 +106,84 @@ impl Source for Copilot {
         // Verified from `copilot --help`: `--resume[=value]` accepts a session id.
         Some(vec!["copilot".into(), "--resume".into(), id.into()])
     }
+
+    /// The listing query runs on the host through `sqlite3 -json`; only its
+    /// rows cross the wire, never the database.
+    fn remote_layout(&self) -> RemoteLayout {
+        RemoteLayout {
+            files: &[],
+            sql: Some((".copilot/session-store.db", &[SESSION_QUERY])),
+        }
+    }
+
+    fn remote_open_sql(&self, id: &str) -> Vec<(&'static str, String)> {
+        let id = sql_literal(id);
+        vec![
+            (
+                "session",
+                format!("SELECT summary FROM sessions WHERE id = {id}"),
+            ),
+            (
+                "turns",
+                format!(
+                    "SELECT {TURN_COLUMNS} FROM turns WHERE session_id = {id} ORDER BY turn_index"
+                ),
+            ),
+            (
+                "events",
+                format!(
+                    "SELECT {EVENT_COLUMNS} FROM forge_trajectory_events \
+                     WHERE session_id = {id} ORDER BY turn_index, id"
+                ),
+            ),
+        ]
+    }
+
+    fn open_remote_rows(
+        &self,
+        db: &Path,
+        id: &str,
+        rows: &HashMap<String, Vec<Value>>,
+    ) -> Result<Transcript> {
+        let decode = |name: &str| rows.get(name).cloned().unwrap_or_default();
+        let session = decode("session");
+        let Some(first) = session.first() else {
+            return Err(Error::MissingRow {
+                db: db.to_path_buf(),
+                id: id.to_owned(),
+            });
+        };
+        let summary = first
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let turns = decode("turns")
+            .into_iter()
+            .map(serde_json::from_value::<TurnRow>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::Json)?;
+        let mut events: BTreeMap<i64, Vec<Event>> = BTreeMap::new();
+        for value in decode("events") {
+            let row: EventRow = serde_json::from_value(value).map_err(Error::Json)?;
+            events
+                .entry(row.turn_index.unwrap_or(-1))
+                .or_default()
+                .push(row.event);
+        }
+        Ok(build_transcript(
+            id,
+            self.id(),
+            summary.as_deref(),
+            turns,
+            events,
+        ))
+    }
+}
+
+/// A SQL string literal. The id is a row key from the listing, but it still
+/// travels inside a shell script, so it is escaped rather than trusted.
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn workspace_cwd(state_root: &Path, id: &str) -> Result<Option<String>> {
@@ -132,30 +214,68 @@ fn open_database(db: &Path, source: SourceId, id: &str) -> Result<Transcript> {
             db: db.to_path_buf(),
             id: id.to_owned(),
         })?;
-    let mut transcript = Transcript::new(id, source);
-    transcript.title = summary.as_deref().and_then(clean_title);
-
     let events = events_by_turn(&connection, db, id)?;
     let mut statement = connection
-        .prepare(
-            "SELECT turn_index, user_message, assistant_response, timestamp
-             FROM turns WHERE session_id = ?1 ORDER BY turn_index",
-        )
+        .prepare(&format!(
+            "SELECT {TURN_COLUMNS} FROM turns WHERE session_id = ?1 ORDER BY turn_index"
+        ))
         .map_err(sql(db))?;
     let turns = statement
         .query_map(params![id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
+            Ok(TurnRow {
+                turn_index: row.get(0)?,
+                user_message: row.get(1)?,
+                assistant_response: row.get(2)?,
+                timestamp: row.get(3)?,
+            })
         })
+        .map_err(sql(db))?
+        .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql(db))?;
+    Ok(build_transcript(
+        id,
+        source,
+        summary.as_deref(),
+        turns,
+        events,
+    ))
+}
 
-    let mut events = events;
+/// One `turns` row, read locally through rusqlite or remotely from
+/// `sqlite3 -json`; both paths meet in [`build_transcript`].
+#[derive(Debug, Deserialize)]
+struct TurnRow {
+    turn_index: i64,
+    user_message: Option<String>,
+    assistant_response: Option<String>,
+    timestamp: Option<String>,
+}
+
+/// One `forge_trajectory_events` row as `sqlite3 -json` names its columns.
+#[derive(Debug, Deserialize)]
+struct EventRow {
+    turn_index: Option<i64>,
+    #[serde(flatten)]
+    event: Event,
+}
+
+fn build_transcript(
+    id: &str,
+    source: SourceId,
+    summary: Option<&str>,
+    turns: Vec<TurnRow>,
+    mut events: BTreeMap<i64, Vec<Event>>,
+) -> Transcript {
+    let mut transcript = Transcript::new(id, source);
+    transcript.title = summary.and_then(clean_title);
+
     for turn in turns {
-        let (index, user_message, assistant_response, timestamp) = turn.map_err(sql(db))?;
+        let TurnRow {
+            turn_index: index,
+            user_message,
+            assistant_response,
+            timestamp,
+        } = turn;
         let timestamp = timestamp.as_deref().and_then(parse_rfc3339);
         if let Some(message) = user_message.filter(|message| !message.trim().is_empty()) {
             let mut turn = Turn::new(Role::User);
@@ -186,17 +306,20 @@ fn open_database(db: &Path, source: SourceId, id: &str) -> Result<Transcript> {
         }
         transcript.push(turn);
     }
-    Ok(transcript)
+    transcript
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
 struct Event {
+    #[serde(rename = "event_type")]
     kind: String,
     tool_call_id: Option<String>,
     command: Option<String>,
     output: Option<String>,
     exit_code: Option<i64>,
+    #[serde(rename = "event_key")]
     key: Option<String>,
+    #[serde(rename = "event_value")]
     value: Option<String>,
 }
 
@@ -206,13 +329,10 @@ fn events_by_turn(
     id: &str,
 ) -> Result<BTreeMap<i64, Vec<Event>>> {
     let mut statement = connection
-        .prepare(
-            "SELECT turn_index, event_type, tool_call_id, command, output,
-                    exit_code, event_key, event_value
-             FROM forge_trajectory_events
-             WHERE session_id = ?1
-             ORDER BY turn_index, id",
-        )
+        .prepare(&format!(
+            "SELECT {EVENT_COLUMNS} FROM forge_trajectory_events
+             WHERE session_id = ?1 ORDER BY turn_index, id"
+        ))
         .map_err(sql(db))?;
     let rows = statement
         .query_map(params![id], |row| {
@@ -334,5 +454,68 @@ mod tests {
             transcript.turns[1].blocks[2],
             Block::ToolResult { ok: true, ref output, .. } if output == "/from-state"
         ));
+    }
+
+    #[test]
+    fn declares_the_sql_lane_for_remote_hosts() {
+        let (_home, source) = fixture();
+        let layout = source.remote_layout();
+        assert!(layout.files.is_empty());
+        let (db, queries) = layout.sql.expect("copilot lists over sqlite3");
+        assert_eq!(db, ".copilot/session-store.db");
+        assert_eq!(queries, &[SESSION_QUERY]);
+    }
+
+    #[test]
+    fn remote_open_sql_escapes_the_id() {
+        let (_home, source) = fixture();
+        let queries = source.remote_open_sql("a'b");
+        let names: Vec<_> = queries.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["session", "turns", "events"]);
+        assert!(queries.iter().all(|(_, query)| query.contains("'a''b'")));
+    }
+
+    /// Rows as `sqlite3 -json` would send them rebuild the same transcript
+    /// the local rusqlite path produces.
+    #[test]
+    fn remote_rows_match_the_local_transcript() {
+        let (_home, source) = fixture();
+        let locator = Locator::Row {
+            db: source.db.clone(),
+            id: "s".into(),
+        };
+        let local = source.open(&locator).expect("open fixture");
+        let rows: HashMap<String, Vec<Value>> = [
+            ("session", json!([{"summary": " Title "}])),
+            (
+                "turns",
+                json!([{"turn_index": 0, "user_message": "question",
+                        "assistant_response": "answer",
+                        "timestamp": "2026-01-02T03:04:07Z"}]),
+            ),
+            (
+                "events",
+                json!([{"turn_index": 0, "event_type": "shell", "tool_call_id": "call-1",
+                        "command": "pwd", "output": "/from-state", "exit_code": 0,
+                        "event_key": null, "event_value": null}]),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), serde_json::from_value(value).unwrap()))
+        .collect();
+        let remote = source
+            .open_remote_rows(&source.db, "s", &rows)
+            .expect("remote rows");
+        assert_eq!(
+            serde_json::to_value(&remote).unwrap(),
+            serde_json::to_value(&local).unwrap()
+        );
+    }
+
+    #[test]
+    fn remote_rows_without_a_session_are_a_missing_row() {
+        let (_home, source) = fixture();
+        let result = source.open_remote_rows(&source.db, "gone", &HashMap::new());
+        assert!(matches!(result, Err(Error::MissingRow { .. })));
     }
 }

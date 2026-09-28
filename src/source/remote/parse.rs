@@ -108,6 +108,26 @@ pub fn parse_shell_listing(
     sessions
 }
 
+/// The records of a remote open: `R\t<name>\t<base64 sqlite3 json>`, one
+/// per named query. An empty payload (no rows, or a failed query) is an
+/// empty list; unframed lines are ignored as in the listing.
+pub(super) fn parse_open_rows(raw: &str) -> HashMap<String, Vec<Value>> {
+    let mut rows = HashMap::new();
+    for line in raw.lines() {
+        let mut fields = line.split('\t');
+        let (Some("R"), Some(name), Some(encoded)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let parsed = decode_base64(encoded)
+            .filter(|decoded| !decoded.is_empty())
+            .and_then(|decoded| serde_json::from_slice::<Vec<Value>>(&decoded).ok())
+            .unwrap_or_default();
+        rows.insert(name.to_owned(), parsed);
+    }
+    rows
+}
+
 /// One row of a remote store's eleven-column listing.
 fn summary_from_sql(
     source: SourceId,
@@ -116,7 +136,11 @@ fn summary_from_sql(
     row: &Value,
 ) -> Option<SessionSummary> {
     let id = row.get("id")?.as_str()?.to_owned();
-    let updated = number(row.get("updated_epoch")).and_then(from_unix_float)?;
+    // Most stores report an epoch; Copilot's `sessions` table keeps RFC 3339
+    // text in `updated_at`/`created_at` and calls its title `summary`.
+    let updated = number(row.get("updated_epoch"))
+        .and_then(from_unix_float)
+        .or_else(|| rfc3339(row.get("updated_at")))?;
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -139,9 +163,10 @@ fn summary_from_sql(
         recorded_cwd: text(row.get("cwd")).map(PathBuf::from),
         trust: PathTrust::Recorded,
         title: text(row.get("title"))
+            .or_else(|| text(row.get("summary")))
             .as_deref()
             .and_then(source::clean_title),
-        created: None,
+        created: rfc3339(row.get("created_at")),
         updated,
         model: text(row.get("model")),
         branch: text(row.get("branch")),
@@ -253,6 +278,10 @@ fn scan_string(bytes: &[u8], key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn rfc3339(value: Option<&Value>) -> Option<OffsetDateTime> {
+    value?.as_str().and_then(source::parse_rfc3339)
 }
 
 fn text(value: Option<&Value>) -> Option<String> {
@@ -392,5 +421,37 @@ mod tests {
         );
         assert_eq!(row.usage, None, "no counted tokens is not zero tokens");
         assert_eq!(row.updated.unix_timestamp(), EPOCH);
+    }
+
+    #[test]
+    fn a_copilot_json_row_uses_rfc3339_and_summary() {
+        let json = r#"[{"id":"0688","cwd":"/tmp","summary":" Fix it ",
+            "created_at":"2023-11-14T22:13:10Z","updated_at":"2023-11-14T22:13:20Z"}]"#;
+        let dbs: HashMap<SourceId, PathBuf> = [(
+            SourceId::Copilot,
+            PathBuf::from("/home/x/.copilot/session-store.db"),
+        )]
+        .into_iter()
+        .collect();
+        let raw = format!("S\tcopilot\t{}", encode_base64(json.as_bytes()));
+        let rows = parse_shell_listing(&raw, "ar-2", &dbs);
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.source, SourceId::Copilot);
+        assert_eq!(row.title.as_deref(), Some("Fix it"));
+        assert_eq!(row.recorded_cwd.as_deref(), Some(Path::new("/tmp")));
+        assert_eq!(row.updated.unix_timestamp(), EPOCH);
+        assert_eq!(
+            row.created.map(OffsetDateTime::unix_timestamp),
+            Some(EPOCH - 10)
+        );
+        assert_eq!(
+            row.locator,
+            Locator::Row {
+                db: PathBuf::from("/home/x/.copilot/session-store.db"),
+                id: "0688".into(),
+            }
+        );
     }
 }
