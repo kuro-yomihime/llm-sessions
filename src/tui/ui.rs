@@ -18,60 +18,87 @@ use crate::runtime::live::Activity;
 use crate::tui::app::{App, Prompt};
 use crate::tui::view::{Grouping, Pane, Row};
 
-/// Width of the help panel's key column, wide enough for every chord that
-/// fits on one line beside its description.
+/// Width of the help panel's key column, wide enough for every key and its
+/// aliases beside the description.
 const KEY_COLUMN: usize = 20;
 
+/// One action per row: a key, or a key with its aliases, then what it does.
+/// An empty key starts a section.
 const HELP: &[(&str, &str)] = &[
     ("", "Browse"),
-    ("j / k / arrows", "Move through the current list"),
+    ("j, ↓", "Move down"),
+    ("k, ↑", "Move up"),
+    ("PgDn, Ctrl-F", "Next page"),
+    ("PgUp, Ctrl-B", "Previous page"),
+    ("g, Home", "Top"),
+    ("G, End", "Bottom"),
     ("Enter", "Open a session or follow a transcript link"),
-    ("Tab / Shift-Tab", "Next / previous pane"),
-    ("Right / l", "Focus right"),
-    ("Esc / Left / h", "Focus left"),
-    ("PgUp / PgDn / Ctrl-B / Ctrl-F", "Previous / next page"),
-    ("g / G", "Top / bottom"),
-    (
-        "z a / z c / z o",
-        "Toggle / close / open the selected session",
-    ),
-    ("z M / z R", "Close / open every session fold"),
+    ("Tab", "Next pane"),
+    ("Shift-Tab", "Previous pane"),
+    ("l, →", "Focus right"),
+    ("h, ←, Esc, q", "Focus left"),
+    ("", "Filter and search"),
     ("/", "Filter titles, paths and agents"),
     ("s", "Search transcript text; run llm-sessions index first"),
-    ("x / Ctrl-L", "Clear filters and search"),
-    ("", "Read and resume"),
-    (
-        "Ctrl-W o / F11",
-        "Fullscreen reader; the same chord or Esc returns to the panes",
-    ),
-    ("t / o / c", "Toggle thinking / tool output / changed files"),
-    ("f", "Follow new transcript content"),
-    ("r", "Quit and print the resume command"),
-    ("i", "Insert: send one message to the selected session"),
-    ("m <letter>", "Bookmark the selected session, view and pane"),
-    ("' <letter> or ` <letter>", "Jump back to a bookmark"),
-    ("J", "Jump to the selected session's tmux pane"),
-    ("", "Views and archive"),
-    (
-        "] / [",
-        "Next / previous view: workspace, agent, branch, fleet, host, timeline",
-    ),
-    (
-        "1 … 6",
-        "Jump to a view: 1 workspace, 2 agent, 3 branch, 4 fleet, 5 host, 6 timeline",
-    ),
+    ("x, Ctrl-L", "Clear filters and search"),
     ("e", "Show only sessions with a process attached"),
     ("a", "Show or hide archived sessions"),
-    ("Space / v", "Select one / every visible session"),
+    ("", "Views"),
+    ("]", "Next view"),
+    ("[", "Previous view"),
+    ("1", "Workspace view"),
+    ("2", "Agent view"),
+    ("3", "Branch view"),
+    ("4", "Fleet view"),
+    ("5", "Host view"),
+    ("6", "Timeline view"),
+    ("", "Session folds"),
+    ("z a", "Toggle the selected session's descendants"),
+    ("z c", "Close the selected session's descendants"),
+    ("z o", "Open the selected session's descendants"),
+    ("z M", "Close every session fold"),
+    ("z R", "Open every session fold"),
+    ("", "Read"),
+    ("t", "Toggle thinking"),
+    ("o", "Toggle tool output"),
+    ("c", "Toggle changed files"),
+    ("f", "Follow new transcript content"),
+    (
+        "F11, Ctrl-W o",
+        "Fullscreen reader; again or Esc returns to the panes",
+    ),
+    ("", "Copy"),
+    (
+        "y y",
+        "Copy the assistant reply at the cursor; from the lists, the latest",
+    ),
+    ("y A", "Copy the whole transcript, folded as shown"),
+    ("y r", "Copy the selected session's resume command"),
+    ("", "Act on sessions"),
+    ("r", "Quit and print the resume command"),
+    ("i", "Insert: send one message to the selected session"),
+    ("J", "Jump to the selected session's tmux pane"),
+    ("Space", "Select or unselect the session under the cursor"),
+    ("v", "Select every visible session"),
     ("V", "Select the entire group"),
-    ("d / u", "Archive / restore marked sessions; asks first"),
-    ("Ctrl-R", "Rescan now; otherwise refreshes automatically"),
+    ("d", "Archive marked sessions; asks first"),
+    ("u", "Restore marked sessions; asks first"),
+    ("", "Bookmarks"),
+    ("m <letter>", "Bookmark the selected session, view and pane"),
+    ("' <letter>", "Jump back to a bookmark"),
+    ("` <letter>", "Jump back to a bookmark"),
+    ("", "Window"),
     (
         "Ctrl-W",
-        "Window commands: arrows resize, o keeps only the reader, = resets",
+        "Resize mode: the keys below repeat until Enter or Esc",
     ),
-    ("? / F1", "Open or close help; Esc also closes"),
-    ("Q / Ctrl-C", "Quit; q steps back instead, like Esc"),
+    ("Ctrl-W l, Ctrl-W →", "Widen the focused pane"),
+    ("Ctrl-W h, Ctrl-W ←", "Narrow the focused pane"),
+    ("Ctrl-W =", "Reset pane widths"),
+    ("", "General"),
+    ("Ctrl-R", "Rescan now; otherwise refreshes automatically"),
+    ("?, F1", "Open or close help; Esc also closes"),
+    ("Q, Ctrl-C", "Quit"),
     ("", "Session activity"),
     ("● exact", "A process holds the session file open"),
     ("○ inferred", "A process matches the agent and directory"),
@@ -329,7 +356,7 @@ fn pane_keys(pane: Pane, focused: bool, width: u16, reserved: usize) -> Option<S
     let chips: &[&str] = match pane {
         Pane::Groups => &["Enter sessions", "/ filter", "] [ view"],
         Pane::Sessions => &["Enter read", "/ filter", "z fold", "r resume"],
-        Pane::Transcript => &["C-w o zen", "t thinking", "o tools", "f follow"],
+        Pane::Transcript => &["C-w o zen", "t thinking", "o tools", "f follow", "y yank"],
     };
     // A border that cannot hold the first key holds none: half a chord is
     // worse than the room it costs.
@@ -619,17 +646,31 @@ fn draw_zen(frame: &mut Frame<'_>, column: Rect, body: Rect, app: &App) {
         draw_reader(frame, body, app, true);
     }
 
+    // Yank is a reading-mode command, so its prompt and its result have to
+    // be visible here; the footer is the only line zen keeps.
     let (thinking, tools) = app.folding();
-    frame.render_widget(
-        Paragraph::new(flush_right(
-            &position(app),
-            Style::default().fg(Color::Indexed(244)),
-            &format!(
-                "C-w o exit · t {} · o {} · f follow · ? help",
+    let (hint, hint_style) = match (app.prompt(), app.status()) {
+        (Prompt::Yank, _) => (
+            "yank: y reply at cursor · A whole transcript · r resume command · Esc cancel"
+                .to_owned(),
+            Style::default().fg(Color::Cyan),
+        ),
+        (_, Some(status)) => (status.to_owned(), Style::default().fg(Color::Yellow)),
+        _ => (
+            format!(
+                "C-w o exit · t {} · o {} · f follow · y yank · ? help",
                 if thinking { "thinking" } else { "fold" },
                 if tools { "tools" } else { "fold" },
             ),
             Style::default().fg(Color::Indexed(244)),
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(flush_right(
+            &position(app),
+            Style::default().fg(Color::Indexed(244)),
+            &hint,
+            hint_style,
             width,
         )),
         rows[3],
@@ -872,6 +913,11 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Prompt::Fold => (
             Span::styled("Fold command: z", cyan),
             "a toggle · c close · o open · M close all · R open all · Esc cancel".to_owned(),
+            None,
+        ),
+        Prompt::Yank => (
+            Span::styled("Yank: y", cyan),
+            "y reply · A whole transcript · r resume command · Esc cancel".to_owned(),
             None,
         ),
         Prompt::Resize => {
@@ -1300,5 +1346,39 @@ mod tests {
         assert_eq!(truncate_cells("session", 4), "ses…");
         assert_eq!(truncate_cells("session", 1), "…");
         assert_eq!(truncate_cells("session", 0), "");
+    }
+
+    /// One action per row: at the popup's normal width every key sits
+    /// beside its description on a single line, never stacked above it.
+    #[test]
+    fn every_help_row_is_one_line_at_popup_width() {
+        let lines = help_lines(86, &[]);
+        for &(key, description) in HELP.iter().filter(|(key, _)| !key.is_empty()) {
+            assert!(
+                Span::raw(key).width() < KEY_COLUMN - 1,
+                "key requires its own row: {key}"
+            );
+            assert!(
+                KEY_COLUMN + Span::raw(description).width() <= 86,
+                "description wraps: {key}"
+            );
+            let row = lines
+                .iter()
+                .find(|line| {
+                    line.spans
+                        .first()
+                        .is_some_and(|span| span.content.trim_end() == key)
+                })
+                .unwrap_or_else(|| panic!("missing key row: {key}"));
+            assert_eq!(
+                row.spans[1].content, description,
+                "description is not beside {key}"
+            );
+            assert!(row.width() <= 86, "rendered row exceeds popup width: {key}");
+        }
+        let rows = HELP.iter().filter(|(key, _)| !key.is_empty()).count();
+        let sections = HELP.len() - rows;
+        // Each section is a heading plus a blank separator, except the first.
+        assert_eq!(lines.len(), rows + sections * 2 - 1);
     }
 }

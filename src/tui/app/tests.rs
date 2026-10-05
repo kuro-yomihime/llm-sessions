@@ -203,6 +203,296 @@ fn reflowed_paragraph_can_scroll_to_its_last_word() {
     }));
 }
 
+thread_local! {
+    static YANKED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    static COPY_SENDER: std::cell::RefCell<Option<std::sync::mpsc::Sender<crate::runtime::clipboard::CopyResult>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn pending_yank(_: String) -> crate::Result<crate::runtime::clipboard::PendingCopy> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    COPY_SENDER.with(|slot| *slot.borrow_mut() = Some(sender));
+    Ok(receiver)
+}
+
+fn finish_yank(result: crate::runtime::clipboard::CopyResult) {
+    COPY_SENDER.with(|slot| slot.borrow_mut().take().unwrap().send(result).unwrap());
+}
+
+#[test]
+fn pending_copy_does_not_block_navigation_or_quitting() {
+    let mut app = yank_fixture();
+    app.clipboard = pending_yank;
+    app.handle(Action::YankReply);
+    assert_eq!(app.status(), Some("copying last reply (3 lines)…"));
+    app.handle(Action::YankReply);
+    assert_eq!(app.status(), Some("clipboard copy already in progress"));
+    // Reject repeat whole-copy requests before inspecting/rendering content.
+    app.transcript = None;
+    app.handle(Action::YankTranscript);
+    assert_eq!(app.status(), Some("clipboard copy already in progress"));
+    let focus = app.focus;
+    app.handle(Action::FocusNext);
+    assert_ne!(app.focus, focus);
+    app.handle(Action::Quit);
+    assert!(app.should_quit());
+    finish_yank(Ok("test"));
+    app.collect_clipboard();
+    assert_eq!(app.status(), Some("yanked last reply (3 lines) via test"));
+    assert!(app.clipboard_pending.is_none());
+}
+
+#[test]
+fn copy_completion_reports_errors_and_allows_retry() {
+    let mut app = yank_fixture();
+    app.clipboard = pending_yank;
+    app.handle(Action::YankReply);
+    finish_yank(Err(crate::error::Error::Clipboard {
+        message: "helper timed out".into(),
+    }));
+    app.tick();
+    assert_eq!(app.status(), Some("clipboard: helper timed out"));
+    app.handle(Action::YankReply);
+    COPY_SENDER.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    app.collect_clipboard();
+    assert_eq!(app.status(), Some("clipboard: copy worker stopped"));
+    app.clipboard = record_yank;
+    app.handle(Action::YankReply);
+    assert_eq!(take_yanked(), vec!["first part\n\nsecond part"]);
+}
+
+#[allow(clippy::unnecessary_wraps)] // must match `App::clipboard`'s signature
+fn record_yank(text: String) -> crate::Result<crate::runtime::clipboard::PendingCopy> {
+    YANKED.with(|y| y.borrow_mut().push(text));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    sender.send(Ok("test")).unwrap();
+    Ok(receiver)
+}
+
+fn take_yanked() -> Vec<String> {
+    YANKED.with(|y| std::mem::take(&mut *y.borrow_mut()))
+}
+
+fn yank_fixture() -> App {
+    let mut app = app_with(vec![recent(SourceId::Omp, "a", "/w", 1)]);
+    app.clipboard = record_yank;
+    let mut transcript = Transcript::new("a", SourceId::Omp);
+    let mut older = Turn::new(Role::Assistant);
+    older.blocks.push(Block::text("older answer"));
+    transcript.push(older);
+    let mut user = Turn::new(Role::User);
+    user.blocks.push(Block::text("question"));
+    transcript.push(user);
+    let mut reply = Turn::new(Role::Assistant);
+    reply.blocks.push(Block::Thinking {
+        text: "secret musing".into(),
+    });
+    reply.blocks.push(Block::text("first part"));
+    reply.blocks.push(Block::text("second part"));
+    transcript.push(reply);
+    // A trailing tool-only turn is not "the last reply".
+    let mut tool = Turn::new(Role::Assistant);
+    tool.blocks.push(Block::ToolCall {
+        name: "bash".into(),
+        input: serde_json::json!({"command": "ls"}),
+    });
+    transcript.push(tool);
+    app.transcript = Some(transcript);
+    app
+}
+
+#[test]
+fn yy_copies_the_last_assistant_text_without_thinking_or_tools() {
+    use crossterm::event::KeyCode;
+    let mut app = yank_fixture();
+    press(&mut app, KeyCode::Char('y'));
+    assert_eq!(app.prompt(), &Prompt::Yank);
+    press(&mut app, KeyCode::Char('y'));
+    assert_eq!(app.prompt(), &Prompt::None);
+    assert_eq!(take_yanked(), vec!["first part\n\nsecond part".to_owned()]);
+}
+
+#[test]
+fn y_shift_a_copies_the_transcript_with_the_readers_folds() {
+    use crossterm::event::KeyCode;
+    let mut app = yank_fixture();
+    press(&mut app, KeyCode::Char('y'));
+    press(&mut app, KeyCode::Char('A'));
+    let folded = take_yanked().pop().unwrap();
+    assert!(folded.contains("question") && folded.contains("second part"));
+    assert!(!folded.contains("secret musing"));
+
+    press(&mut app, KeyCode::Char('t'));
+    press(&mut app, KeyCode::Char('y'));
+    press(&mut app, KeyCode::Char('A'));
+    assert!(take_yanked().pop().unwrap().contains("secret musing"));
+}
+
+#[test]
+fn yr_copies_the_resume_line_without_quitting() {
+    use crossterm::event::KeyCode;
+    let home = Path::new("/home/u");
+    let mut app = App::new(
+        home,
+        vec![Box::new(crate::source::omp::Omp::new(home))],
+        vec![recent(SourceId::Omp, "it's", "/w", 1)],
+        Vec::new(),
+        None,
+        None,
+        Fleet::default(),
+    );
+    app.clipboard = record_yank;
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('y'));
+    press(&mut app, KeyCode::Char('r'));
+    // The same quoted line `r` prints: pasteable into a shell as-is.
+    assert_eq!(take_yanked(), vec![r"omp --resume 'it'\''s'".to_owned()]);
+    assert!(!app.should_quit());
+}
+
+#[test]
+fn yy_in_the_reader_copies_the_reply_under_the_cursor() {
+    use crossterm::event::KeyCode;
+    let mut app = yank_fixture();
+    app.focus = Pane::Transcript;
+    app.set_viewport(50);
+    app.set_transcript_width(80);
+    app.rerender();
+    let line_of = |app: &App, needle: &str| {
+        app.rendered()
+            .iter()
+            .position(|line| line.text.contains(needle))
+            .unwrap()
+    };
+
+    app.cursor = line_of(&app, "older answer");
+    press(&mut app, KeyCode::Char('y'));
+    press(&mut app, KeyCode::Char('y'));
+    assert_eq!(take_yanked(), vec!["older answer".to_owned()]);
+
+    // On the follow-up question, the reply above it is the one meant.
+    app.cursor = line_of(&app, "question");
+    press(&mut app, KeyCode::Char('y'));
+    press(&mut app, KeyCode::Char('y'));
+    assert_eq!(take_yanked(), vec!["older answer".to_owned()]);
+
+    // On the trailing tool call, the reply that issued it.
+    app.cursor = app.rendered().len() - 1;
+    press(&mut app, KeyCode::Char('y'));
+    press(&mut app, KeyCode::Char('y'));
+    assert_eq!(take_yanked(), vec!["first part\n\nsecond part".to_owned()]);
+}
+
+#[test]
+fn yank_cancels_on_other_keys_and_says_when_nothing_is_open() {
+    use crossterm::event::KeyCode;
+    let mut app = yank_fixture();
+    press(&mut app, KeyCode::Char('y'));
+    press(&mut app, KeyCode::Char('j'));
+    assert_eq!(app.prompt(), &Prompt::None);
+    assert!(take_yanked().is_empty());
+
+    app.transcript = None;
+    press(&mut app, KeyCode::Char('y'));
+    press(&mut app, KeyCode::Char('y'));
+    assert!(take_yanked().is_empty());
+    assert_eq!(app.status(), Some("no transcript open to yank"));
+}
+
+#[test]
+fn yank_reports_clipboard_failure() {
+    let mut app = app_with(vec![recent(SourceId::Omp, "a", "/w", 1)]);
+    app.transcript = yank_fixture().transcript;
+    app.handle(Action::YankReply);
+    assert_eq!(app.status(), Some("clipboard: no clipboard in tests"));
+    assert!(take_yanked().is_empty());
+}
+
+#[test]
+fn yy_on_between_turn_spacers_and_dividers_finds_the_reply_above() {
+    let mut app = yank_fixture();
+    app.focus = Pane::Transcript;
+    app.rerender();
+    let question = app
+        .rendered
+        .iter()
+        .position(|line| line.text == "question")
+        .unwrap();
+    let gaps: Vec<_> = app.rendered[..question]
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| *index > 0 && line.turn.is_none())
+        .map(|(index, _)| index)
+        .collect();
+    assert!(!gaps.is_empty());
+    for cursor in gaps {
+        app.cursor = cursor;
+        app.handle(Action::YankReply);
+        assert_eq!(take_yanked(), vec!["older answer"]);
+    }
+    app.rendered.insert(
+        0,
+        crate::output::reader::RenderedLine::new(LineKind::Meta, Rail::Bare, "preamble"),
+    );
+    app.cursor = 0;
+    app.handle(Action::YankReply);
+    assert!(take_yanked().is_empty());
+    assert_eq!(
+        app.status(),
+        Some("no assistant reply at or above the cursor")
+    );
+}
+
+#[test]
+fn whole_yank_respects_file_visibility_and_subagent_links() {
+    let mut app = yank_fixture();
+    let mut child = recent(SourceId::Omp, "child", "/w", 1);
+    child.subagent = true;
+    child.parent = Some("a".into());
+    child.title = Some("worker".into());
+    app.sessions.push(child);
+    let transcript = app.transcript.as_mut().unwrap();
+    let mut turn = Turn::new(Role::Assistant);
+    turn.blocks.push(Block::Patch {
+        summary: "patch".into(),
+        files: vec![crate::model::FileChange {
+            path: "only-in-file-list.rs".into(),
+            added: 1,
+            deleted: 0,
+        }],
+    });
+    turn.blocks.push(Block::ToolCall {
+        name: "task".into(),
+        input: serde_json::json!({"tasks": [{"id": "worker"}]}),
+    });
+    transcript.push(turn);
+    app.show_files = true;
+    app.handle(Action::YankTranscript);
+    let shown = take_yanked().pop().unwrap();
+    assert_eq!(shown.matches("only-in-file-list.rs").count(), 2);
+    assert!(shown.contains("↳ worker  Enter opens"));
+    app.show_files = false;
+    app.handle(Action::YankTranscript);
+    let folded = take_yanked().pop().unwrap();
+    // `c` folds the preamble list, not the patch's own recorded file rows.
+    assert_eq!(folded.matches("only-in-file-list.rs").count(), 1);
+    assert!(folded.contains("1 file changed"));
+    assert!(folded.contains("↳ worker  Enter opens"));
+}
+
+#[test]
+fn resume_refusals_are_displayed_without_quitting_or_copying() {
+    let mut app = yank_fixture(); // no registered sources
+    for action in [Action::Resume, Action::YankResume] {
+        app.handle(action);
+        assert_eq!(app.status(), Some("omp has no resume command"));
+        assert!(!app.should_quit());
+        assert!(take_yanked().is_empty());
+    }
+}
+
 #[test]
 fn rescan_restores_the_selected_transcript_after_rows_reorder() {
     let dir = tempfile::tempdir().unwrap();

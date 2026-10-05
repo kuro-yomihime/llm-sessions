@@ -136,6 +136,9 @@ pub struct RenderedLine {
     /// A session this line points at — a subagent transcript behind a `task`
     /// call. `Enter` on the line follows it.
     pub link: Option<(SourceId, String)>,
+    /// Index into `Transcript::turns` of the turn this line belongs to;
+    /// `None` for preamble, dividers and spacers between turns.
+    pub turn: Option<usize>,
     /// One row, always: a chip is truncated at the right edge rather than
     /// reflowed, because three rows of JSON is not a summary.
     pub clip: bool,
@@ -152,6 +155,7 @@ impl RenderedLine {
             accents: Vec::new(),
             meta: None,
             link: None,
+            turn: None,
             first: true,
             clip: false,
         }
@@ -295,7 +299,7 @@ pub fn render(
 
     let mut day = None;
     let mut first_turn = true;
-    for turn in &transcript.turns {
+    for (index, turn) in transcript.turns.iter().enumerate() {
         // An envelope with no content is bookkeeping, not conversation.
         if turn.blocks.is_empty() {
             continue;
@@ -327,11 +331,15 @@ pub fn render(
         } else {
             Rail::Pad
         };
+        let start = out.len();
         if speaks {
             out.push(turn_header(turn, rail, offset));
         }
         for block in &turn.blocks {
             push_block(&mut out, block, rail, fold_thinking, fold_tools, subagents);
+        }
+        for line in &mut out[start..] {
+            line.turn = Some(index);
         }
     }
     if transcript.unknown_records > 0 {

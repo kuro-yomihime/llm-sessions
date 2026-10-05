@@ -462,6 +462,33 @@ impl Transcript {
         out
     }
 
+    /// Text blocks of the nearest assistant turn at or before `turn` that has
+    /// any, joined by blank lines: the reply a person would copy, without
+    /// tool calls or thinking. Reading a tool result or the next question
+    /// still means the reply just above it.
+    pub fn reply_at(&self, turn: usize) -> Option<String> {
+        self.turns
+            .iter()
+            .take(turn.saturating_add(1))
+            .rev()
+            .filter(|candidate| candidate.role == Role::Assistant)
+            .find_map(|candidate| {
+                let parts: Vec<&str> = candidate
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join("\n\n"))
+            })
+    }
+
+    pub fn last_reply(&self) -> Option<String> {
+        self.reply_at(usize::MAX)
+    }
+
     /// Total recorded usage, or `None` when no turn carried any.
     ///
     /// `None` and `Some(zero)` mean different things: the first is "this agent
@@ -570,6 +597,20 @@ pub enum ArchiveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_preserves_indentation_and_markdown_breaks() {
+        let mut transcript = Transcript::new("a", SourceId::Omp);
+        let mut turn = Turn::new(Role::Assistant);
+        turn.blocks.push(Block::text("    first\n    second"));
+        turn.blocks.push(Block::text(" \n\t "));
+        turn.blocks.push(Block::text("line with a break  \nnext  "));
+        transcript.push(turn);
+        assert_eq!(
+            transcript.last_reply().as_deref(),
+            Some("    first\n    second\n\nline with a break  \nnext  ")
+        );
+    }
 
     #[test]
     fn registry_round_trips() {

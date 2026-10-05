@@ -47,6 +47,8 @@ pub enum Prompt {
     Resize,
     /// One-key Vim fold command entered with `z`.
     Fold,
+    /// One-key Vim yank command entered with `y`.
+    Yank,
     /// Sticky one-key bookmark mode: `m<letter>` saves, `'<letter>` jumps.
     /// `jump` says which.
     Bookmark {
@@ -105,6 +107,15 @@ pub enum Action {
     /// `zM` / `zR` — close or open every session fold.
     CloseAllFolds,
     OpenAllFolds,
+    /// `y` — wait for one Vim-style yank command.
+    StartYank,
+    /// `yy` — copy the assistant reply at the reader's cursor, or the
+    /// latest one when the reader is not focused.
+    YankReply,
+    /// `yA` — copy the open transcript as the reader shows it.
+    YankTranscript,
+    /// `yr` — copy the selected session's resume command.
+    YankResume,
     /// Give the reader the whole terminal.
     ToggleZen,
     Refresh,
@@ -215,6 +226,9 @@ pub struct App {
     resume: Option<Vec<String>>,
     /// Insert-mode messages whose agent has not exited yet.
     deliveries: Vec<crate::runtime::insert::Delivery>,
+    /// Where `y` sends text; tests substitute one that records it.
+    clipboard: fn(String) -> crate::Result<crate::runtime::clipboard::PendingCopy>,
+    clipboard_pending: Option<(crate::runtime::clipboard::PendingCopy, String)>,
 }
 
 impl App {
@@ -311,6 +325,16 @@ impl App {
             quit: false,
             resume: None,
             deliveries: Vec::new(),
+            // Tests must never reach the developer's real clipboard.
+            #[cfg(not(test))]
+            clipboard: crate::runtime::clipboard::start,
+            #[cfg(test)]
+            clipboard: |_| {
+                Err(crate::error::Error::Clipboard {
+                    message: "no clipboard in tests".into(),
+                })
+            },
+            clipboard_pending: None,
         };
         app.apply_cached_usage();
         app.regroup();
@@ -521,6 +545,7 @@ impl App {
     /// Rescanning on a timer is what keeps liveness, titles and ordering
     /// honest; follow mode is the same idea applied to one open transcript.
     pub fn tick(&mut self) {
+        self.collect_clipboard();
         // The remote cache is polled every wake-up, not on the local timer:
         // collecting it is free, and a finished refresh — or transcript —
         // should show up immediately rather than up to `REFRESH_INTERVAL`
@@ -591,6 +616,7 @@ impl App {
         // must not wait for the keyboard to go quiet.
         self.collect_remote_transcript();
         self.collect_deliveries();
+        self.collect_clipboard();
         // Quit is global, including unfinished edits and destructive prompts.
         if action == Action::Quit {
             self.quit = true;
@@ -624,6 +650,15 @@ impl App {
             Prompt::Search(text) => return self.editing(action, text, true),
             Prompt::Resize => return self.resizing(action),
             Prompt::Fold => return self.fold_command(action),
+            Prompt::Yank => {
+                self.prompt = Prompt::None;
+                return match action {
+                    Action::YankReply => self.yank(false),
+                    Action::YankTranscript => self.yank(true),
+                    Action::YankResume => self.yank_resume(),
+                    _ => {}
+                };
+            }
             Prompt::Bookmark { jump } => return self.bookmarking(action, jump),
             Prompt::ConfirmArchive { archive, .. } => return self.confirming(action, archive),
             Prompt::Insert { target, text } => return self.composing(action, target, text),
@@ -766,6 +801,10 @@ impl App {
                     self.prompt = Prompt::Fold;
                 }
             }
+            Action::StartYank => self.prompt = Prompt::Yank,
+            Action::YankReply => self.yank(false),
+            Action::YankTranscript => self.yank(true),
+            Action::YankResume => self.yank_resume(),
             Action::StartBookmark => self.prompt = Prompt::Bookmark { jump: false },
             Action::StartJump => self.prompt = Prompt::Bookmark { jump: true },
             Action::Resume => self.request_resume(),

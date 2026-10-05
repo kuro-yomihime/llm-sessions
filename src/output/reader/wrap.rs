@@ -124,6 +124,7 @@ pub(crate) fn wrap_rendered(lines: Vec<RenderedLine>, width: usize) -> Vec<Rende
                 accents,
                 meta: None,
                 link: line.link.clone(),
+                turn: line.turn,
                 clip: false,
                 first,
             });

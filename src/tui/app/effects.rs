@@ -64,42 +64,58 @@ impl App {
     }
 
     pub(super) fn request_resume(&mut self) {
-        let Some(session) = self.selected_session() else {
-            return;
-        };
-        let source_id = session.source;
-        let id = session.id.clone();
-        // A remote session resumes through its host: the argv is the same one
-        // the local agent understands, wrapped in an inspectable `ssh -t`.
-        if let Some(host) = session.host.clone() {
-            let command = crate::source::find(&self.sources, source_id)
-                .and_then(|s| s.resume_command(&id))
-                .map(|inner| {
-                    let mut command = vec!["ssh".into(), "-t".into()];
-                    command.push(
-                        self.remote
-                            .host(&host)
-                            .map_or_else(|| host.clone(), |config| config.ssh.clone()),
-                    );
-                    command.extend(inner);
-                    command
-                });
-            match command {
-                Some(command) => {
-                    self.resume = Some(command);
-                    self.quit = true;
-                }
-                None => self.status = Some(format!("{source_id} has no resume command")),
-            }
-            return;
-        }
-        match crate::source::find(&self.sources, source_id).and_then(|s| s.resume_command(&id)) {
-            Some(command) => {
+        match self.resume_argv() {
+            Ok(command) => {
                 self.resume = Some(command);
                 self.quit = true;
             }
-            None => self.status = Some(format!("{source_id} has no resume command")),
+            Err(message) => self.status = Some(message),
         }
+    }
+
+    /// `yr`: the same shell-quoted line `r` prints, without quitting.
+    pub(super) fn yank_resume(&mut self) {
+        if self.copy_in_progress() {
+            return;
+        }
+        let command = match self.resume_argv() {
+            Ok(command) => command,
+            Err(message) => {
+                self.status = Some(message);
+                return;
+            }
+        };
+        let line = crate::runtime::resume::shell_line(&command);
+        self.start_copy(line, "resume command".into());
+    }
+
+    /// Resolve resume argv without changing UI state; callers display refusals.
+    fn resume_argv(&self) -> Result<Vec<String>, String> {
+        let session = self
+            .selected_session()
+            .ok_or_else(|| "no session selected to resume".to_owned())?;
+        let source_id = session.source;
+        let id = session.id.clone();
+        let host = session.host.clone();
+        let inner =
+            crate::source::find(&self.sources, source_id).and_then(|s| s.resume_command(&id));
+        let command = match (host, inner) {
+            // A remote session resumes through its host: the argv is the same
+            // one the local agent understands, wrapped in an inspectable `ssh -t`.
+            (Some(host), Some(inner)) => {
+                let mut command = vec!["ssh".into(), "-t".into()];
+                command.push(
+                    self.remote
+                        .host(&host)
+                        .map_or_else(|| host.clone(), |config| config.ssh.clone()),
+                );
+                command.extend(inner);
+                Some(command)
+            }
+            (None, inner) => inner,
+            (Some(_), None) => None,
+        };
+        command.ok_or_else(|| format!("{source_id} has no resume command"))
     }
 }
 
@@ -250,6 +266,104 @@ impl App {
             Ok(()) => format!("focused tmux {}", pane.address),
             Err(e) => e,
         });
+    }
+}
+
+impl App {
+    /// `yy` / `yA`: copy the reply under the reader's cursor (the last one
+    /// while the reader is not focused), or the whole transcript as the
+    /// reader shows it now, folds included.
+    pub(super) fn yank(&mut self, whole: bool) {
+        if self.copy_in_progress() {
+            return;
+        }
+        let Some(transcript) = &self.transcript else {
+            self.status = Some("no transcript open to yank".into());
+            return;
+        };
+        let (text, what) = if whole {
+            (
+                crate::output::export::plain_lines(
+                    transcript,
+                    &self.home,
+                    crate::output::reader::render(
+                        transcript,
+                        self.fold_thinking,
+                        self.fold_tools,
+                        self.show_files,
+                        &self.subagents_of_selected(),
+                        self.offset,
+                    ),
+                ),
+                "transcript",
+            )
+        } else {
+            // The cursor only means something while the reader has focus;
+            // from the lists, the reply people want is the latest.
+            let reading = self.zen || self.focus == crate::tui::view::Pane::Transcript;
+            let reply = if reading {
+                self.rendered
+                    .iter()
+                    .take(self.cursor.saturating_add(1))
+                    .rev()
+                    .find_map(|line| line.turn)
+                    .and_then(|turn| transcript.reply_at(turn))
+            } else {
+                transcript.last_reply()
+            };
+            let Some(reply) = reply else {
+                self.status = Some(
+                    if reading {
+                        "no assistant reply at or above the cursor"
+                    } else {
+                        "no assistant reply to yank"
+                    }
+                    .into(),
+                );
+                return;
+            };
+            (reply, if reading { "reply" } else { "last reply" })
+        };
+        let description = format!("{what} ({})", plural(text.lines().count(), "line"));
+        self.start_copy(text, description);
+    }
+
+    fn start_copy(&mut self, text: String, description: String) {
+        if self.copy_in_progress() {
+            return;
+        }
+        match (self.clipboard)(text) {
+            Ok(pending) => {
+                self.status = Some(format!("copying {description}…"));
+                self.clipboard_pending = Some((pending, description));
+                self.collect_clipboard();
+            }
+            Err(error) => self.status = Some(error.to_string()),
+        }
+    }
+
+    fn copy_in_progress(&mut self) -> bool {
+        if self.clipboard_pending.is_some() {
+            self.status = Some("clipboard copy already in progress".into());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn collect_clipboard(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some((pending, description)) = &self.clipboard_pending else {
+            return;
+        };
+        let status = match pending.try_recv() {
+            Ok(Ok(helper)) => format!("yanked {description} via {helper}"),
+            Ok(Err(error)) => error.to_string(),
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => "clipboard: copy worker stopped".into(),
+        };
+        self.clipboard_pending = None;
+        self.status = Some(status);
     }
 }
 

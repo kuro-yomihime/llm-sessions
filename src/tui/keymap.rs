@@ -47,6 +47,13 @@ pub fn action_for_key(key: KeyEvent, prompt: &Prompt) -> Option<Action> {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char(_) => Some(Action::Cancel),
             _ => None,
         },
+        Prompt::Yank => match key.code {
+            KeyCode::Char('y') => Some(Action::YankReply),
+            KeyCode::Char('A') => Some(Action::YankTranscript),
+            KeyCode::Char('r') => Some(Action::YankResume),
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(_) => Some(Action::Cancel),
+            _ => None,
+        },
         Prompt::Resize => match key.code {
             KeyCode::Right | KeyCode::Char('l') => Some(Action::Widen),
             KeyCode::Left | KeyCode::Char('h') => Some(Action::Narrow),
@@ -110,6 +117,9 @@ fn base(code: KeyCode) -> Option<Action> {
         KeyCode::Char('V') => Some(Action::ToggleGroupMark),
         KeyCode::Char('f') => Some(Action::ToggleFollow),
         KeyCode::Char('z') => Some(Action::StartFold),
+        // Vim's yank operator: `yy` the reply at the cursor, `yA` the whole
+        // transcript, `yr` the resume command.
+        KeyCode::Char('y') => Some(Action::StartYank),
         // Vim-mark grammar: `m<letter>` sets, `'<letter>` jumps. Both are
         // prefixes, so the letters underneath stay free for their actions.
         KeyCode::Char('m') => Some(Action::StartBookmark),
@@ -194,6 +204,19 @@ mod tests {
         assert_eq!(fold('o'), Some(Action::OpenFold));
         assert_eq!(fold('M'), Some(Action::CloseAllFolds));
         assert_eq!(fold('R'), Some(Action::OpenAllFolds));
+        let yank = |c| {
+            action_for_key(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &Prompt::Yank,
+            )
+        };
+        assert_eq!(press('y'), Some(Action::StartYank));
+        assert_eq!(yank('y'), Some(Action::YankReply));
+        assert_eq!(yank('A'), Some(Action::YankTranscript));
+        assert_eq!(yank('r'), Some(Action::YankResume));
+        // `ya` reads as vim's "yank around"; it must not copy anything.
+        assert_eq!(yank('a'), Some(Action::Cancel));
+        assert_eq!(yank('j'), Some(Action::Cancel));
     }
 
     /// Old spellings stay accepted for one release of muscle memory. When
