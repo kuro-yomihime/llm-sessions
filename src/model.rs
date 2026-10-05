@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -280,6 +280,15 @@ impl SessionSummary {
 
     pub fn display_title(&self) -> &str {
         self.title.as_deref().unwrap_or("—")
+    }
+
+    /// The file holding the session: its transcript, or the database a row
+    /// lives in. On the session's host, for remote rows.
+    pub fn store_path(&self) -> &Path {
+        match &self.locator {
+            Locator::File { path } => path,
+            Locator::Row { db, .. } => db,
+        }
     }
 }
 

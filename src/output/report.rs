@@ -7,7 +7,6 @@
 use std::path::Path;
 
 use crate::catalog::workspace;
-use crate::model::Locator;
 use crate::model::{Liveness, PathTrust, SessionSummary};
 use crate::output::reader::truncate;
 use crate::runtime::live::{Activity, Fleet};
@@ -60,10 +59,7 @@ pub fn expand(template: &str, row: &SessionSummary, home: &Path, fleet: &Fleet) 
                 .unwrap_or_default(),
             "files" => row.change.map(|c| c.files.to_string()).unwrap_or_default(),
             "updated" => row.updated.unix_timestamp().to_string(),
-            "path" => match &row.locator {
-                Locator::File { path } => path.display().to_string(),
-                Locator::Row { db, .. } => db.display().to_string(),
-            },
+            "path" => row.store_path().display().to_string(),
             "n" => "\n".to_string(),
             "t" => "\t".to_string(),
             _ => String::new(),
