@@ -109,6 +109,7 @@ bookmarks.
 | `a` `e` | toggle archived / only live sessions |
 | `Space` `v` `V` / `d` `u` | select one / all visible / group; archive / restore (asks first) |
 | `t` `o` `c` | unfold thinking / tool output / changed files |
+| `y y` / `y A` / `y r` | yank the assistant reply under the reader's cursor (the latest one from the lists) / the whole transcript (as folded on screen) / the resume command to the clipboard |
 | `Ctrl-W o` `F11` | fullscreen reader (`Ctrl-W ←` `→` resize, `=` reset) |
 | `r` | quit, printing the resume command |
 | `i` | insert: send one message to the selected session |
@@ -118,6 +119,12 @@ bookmarks.
 
 `r` prints a shell-quoted resume command — paste it into your shell; don't
 run it via `$(llm-sessions)`, which won't interpret the quoting.
+
+Clipboard copying requires an installed helper: `wl-copy` (Wayland),
+`xclip` or `xsel` (X11), `pbcopy` (macOS), or `clip.exe` (WSL).
+Wayland/X11 helpers also require access to the display (`WAYLAND_DISPLAY` /
+`DISPLAY`); headless or SSH sessions may have no usable clipboard.
+Copying runs in the background; progress and failures appear in the status bar.
 
 `i` runs the agent's one-shot command in the session's directory off the UI
 thread (killed after 30 min; the message is one argv element, never shell
