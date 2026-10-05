@@ -1,28 +1,25 @@
 //! Subcommands that act on sessions named by id: `show` and `archive`.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use llm_sessions::catalog::workspace;
 use llm_sessions::error::Error;
 use llm_sessions::model::ArchiveOutcome;
 use llm_sessions::output::export::{self, Format};
-use llm_sessions::output::reader::{LineKind, fit, render};
 use llm_sessions::source::{self, remote};
 use llm_sessions::{Result, SessionSummary, Transcript};
 
 use super::args::{ArchiveArgs, ShowArgs, ShowFormat};
 use super::{Liveliness, Loaded, emit, scan_all};
 
-pub(super) fn show(home: &Path, args: &ShowArgs) -> Result<()> {
+/// Resolve `id` and open its transcript, with tier-1 title and workspace.
+fn load(home: &Path, id: &str) -> Result<(Transcript, SessionSummary)> {
     let Loaded {
         sources,
         hosts,
         scan,
         ..
     } = scan_all(home, Liveliness::Skip);
-    let session = resolve_one(&scan.sessions, &args.id)?;
+    let session = resolve_one(&scan.sessions, id)?;
     let mut transcript = open_session(home, &sources, &hosts, session)?;
     // Tier 1 already resolved title and workspace authoritatively (Codex
     // titles live in `state_5.sqlite`, not in the rollout; the scan also
@@ -32,6 +29,11 @@ pub(super) fn show(home: &Path, args: &ShowArgs) -> Result<()> {
         .workspace
         .clone()
         .or_else(|| transcript.workspace.take());
+    Ok((transcript, session.clone()))
+}
+
+pub(super) fn show(home: &Path, args: &ShowArgs) -> Result<()> {
+    let (transcript, session) = load(home, &args.id)?;
 
     if let Some(format) = args.format
         && !matches!(format, ShowFormat::Text)
@@ -41,7 +43,7 @@ pub(super) fn show(home: &Path, args: &ShowArgs) -> Result<()> {
             _ => Format::Html,
         };
         return deliver(
-            &export::render(&transcript, Some(session), format),
+            &export::render(&transcript, Some(&session), format),
             args.out.as_deref(),
         );
     }
@@ -53,50 +55,16 @@ pub(super) fn show(home: &Path, args: &ShowArgs) -> Result<()> {
         );
     }
 
-    let mut text = format!(
-        "{} · {} · {}\n\n",
-        transcript.source,
-        transcript.title.as_deref().unwrap_or("—"),
-        transcript
-            .workspace
-            .as_ref()
-            .map_or_else(|| "?".to_string(), |p| workspace::display(p, home)),
-    );
-    // The reader's gutter and flush-right detail are part of the line, not
-    // decoration the TUI adds: plain text keeps both, separated by spaces.
-    // The dump has no column of its own, so tables take their natural width
-    // and prose is left for the terminal to wrap.
-    for line in fit(
-        render(
+    deliver(
+        &export::plain(
             &transcript,
+            home,
             !args.thinking,
             !args.tools,
-            true,
-            &HashMap::new(),
             llm_sessions::clock::offset(),
         ),
-        usize::MAX,
-    ) {
-        if line.kind == LineKind::Rule {
-            match line.text.as_str() {
-                "" => text.push_str(&"─".repeat(60)),
-                label => {
-                    let _ = write!(text, "──── {label} ────");
-                }
-            }
-            text.push('\n');
-            continue;
-        }
-        let body = match &line.meta {
-            Some(meta) if line.text.is_empty() => meta.clone(),
-            Some(meta) => format!("{}  {meta}", line.text),
-            None => line.text.clone(),
-        };
-        text.push_str(line.rail.glyph(line.first));
-        text.push_str(body.trim_end());
-        text.push('\n');
-    }
-    deliver(&text, args.out.as_deref())
+        args.out.as_deref(),
+    )
 }
 
 /// Print the rendered output, or write it to `-o` and say so on stderr.

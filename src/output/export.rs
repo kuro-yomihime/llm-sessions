@@ -1,8 +1,14 @@
 //! Deterministic transcript renderers for reports and file sharing.
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
+use time::UtcOffset;
+
+use crate::catalog::workspace;
 use crate::model::{Block, FileChange, SessionSummary, Transcript, Usage};
+use crate::output::reader::{LineKind, RenderedLine, fit, render as render_lines};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -19,6 +25,68 @@ pub fn render(transcript: &Transcript, session: Option<&SessionSummary>, format:
         Format::Markdown => render_markdown(transcript, session),
         Format::Html => render_html(transcript, session),
     }
+}
+
+/// The reader's lines as terminal text: what `show` prints and the TUI
+/// yanks. Folds apply exactly as they do on screen.
+pub fn plain(
+    transcript: &Transcript,
+    home: &Path,
+    fold_thinking: bool,
+    fold_tools: bool,
+    offset: UtcOffset,
+) -> String {
+    plain_lines(
+        transcript,
+        home,
+        render_lines(
+            transcript,
+            fold_thinking,
+            fold_tools,
+            true,
+            &HashMap::new(),
+            offset,
+        ),
+    )
+}
+
+/// Export reader lines with the caller's folds, file visibility and links.
+/// Lines retain their natural width rather than the viewport's wrapping.
+pub fn plain_lines(transcript: &Transcript, home: &Path, lines: Vec<RenderedLine>) -> String {
+    let mut text = format!(
+        "{} · {} · {}\n\n",
+        transcript.source,
+        transcript.title.as_deref().unwrap_or("—"),
+        transcript
+            .workspace
+            .as_ref()
+            .map_or_else(|| "?".to_string(), |p| workspace::display(p, home)),
+    );
+    // The reader's gutter and flush-right detail are part of the line, not
+    // decoration the TUI adds: plain text keeps both, separated by spaces.
+    // The dump has no column of its own, so tables take their natural width
+    // and prose is left for the terminal to wrap.
+    for line in fit(lines, usize::MAX) {
+        if line.kind == LineKind::Rule {
+            match line.text.as_str() {
+                "" => text.push_str(&"─".repeat(60)),
+                label => {
+                    let _ = write!(text, "──── {label} ────");
+                }
+            }
+            text.push('\n');
+            continue;
+        }
+        let body = match &line.meta {
+            Some(meta) if line.text.is_empty() => meta.clone(),
+            Some(meta) => format!("{}  {meta}", line.text),
+            None => line.text.clone(),
+        };
+        text.push_str(line.rail.glyph(line.first));
+        text.push_str(body.trim_end());
+        text.push('\n');
+    }
+    text
 }
 
 fn render_markdown(transcript: &Transcript, session: Option<&SessionSummary>) -> String {
