@@ -1,5 +1,6 @@
 //! Process facts, liveness, terminal multiplexers, and health checks.
 
+pub mod clipboard;
 pub mod doctor;
 pub mod insert;
 pub mod live;

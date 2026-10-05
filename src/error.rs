@@ -38,6 +38,9 @@ pub enum Error {
 
     #[error("no home directory")]
     NoHome,
+
+    #[error("clipboard: {message}")]
+    Clipboard { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
