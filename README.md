@@ -109,7 +109,7 @@ bookmarks.
 | `a` `e` | toggle archived / only live sessions |
 | `Space` `v` `V` / `d` `u` | select one / all visible / group; archive / restore (asks first) |
 | `t` `o` `c` | unfold thinking / tool output / changed files |
-| `y y` / `y A` / `y r` | yank the assistant reply under the reader's cursor (the latest one from the lists) / the whole transcript (as folded on screen) / the resume command to the clipboard |
+| `y y` / `y A` / `y r` / `y i` / `y p` | yank the assistant reply under the reader's cursor (the latest one from the lists) / the whole transcript (as folded on screen) / the resume command / the session id / its transcript file or database path to the clipboard |
 | `Ctrl-W o` `F11` | fullscreen reader (`Ctrl-W ←` `→` resize, `=` reset) |
 | `r` | quit, printing the resume command |
 | `i` | insert: send one message to the selected session |

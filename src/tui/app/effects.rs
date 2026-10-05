@@ -89,6 +89,23 @@ impl App {
         self.start_copy(line, "resume command".into());
     }
 
+    /// `yi` / `yp`: the selected session's id, or the file it is stored in.
+    pub(super) fn yank_session_field(&mut self, path: bool) {
+        if self.copy_in_progress() {
+            return;
+        }
+        let Some(session) = self.selected_session() else {
+            self.status = Some("no session selected".into());
+            return;
+        };
+        let (text, what) = if path {
+            (session.store_path().display().to_string(), "path")
+        } else {
+            (session.id.clone(), "session id")
+        };
+        self.start_copy(text, what.into());
+    }
+
     /// Resolve resume argv without changing UI state; callers display refusals.
     fn resume_argv(&self) -> Result<Vec<String>, String> {
         let session = self

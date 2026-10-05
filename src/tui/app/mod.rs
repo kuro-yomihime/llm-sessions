@@ -116,6 +116,10 @@ pub enum Action {
     YankTranscript,
     /// `yr` — copy the selected session's resume command.
     YankResume,
+    /// `yi` — copy the selected session's id.
+    YankId,
+    /// `yp` — copy the selected session's transcript file or database path.
+    YankPath,
     /// Give the reader the whole terminal.
     ToggleZen,
     Refresh,
@@ -656,6 +660,8 @@ impl App {
                     Action::YankReply => self.yank(false),
                     Action::YankTranscript => self.yank(true),
                     Action::YankResume => self.yank_resume(),
+                    Action::YankId => self.yank_session_field(false),
+                    Action::YankPath => self.yank_session_field(true),
                     _ => {}
                 };
             }
@@ -805,6 +811,8 @@ impl App {
             Action::YankReply => self.yank(false),
             Action::YankTranscript => self.yank(true),
             Action::YankResume => self.yank_resume(),
+            Action::YankId => self.yank_session_field(false),
+            Action::YankPath => self.yank_session_field(true),
             Action::StartBookmark => self.prompt = Prompt::Bookmark { jump: false },
             Action::StartJump => self.prompt = Prompt::Bookmark { jump: true },
             Action::Resume => self.request_resume(),

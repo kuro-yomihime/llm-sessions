@@ -74,6 +74,8 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("y A", "Copy the whole transcript, folded as shown"),
     ("y r", "Copy the selected session's resume command"),
+    ("y i", "Copy the selected session's id"),
+    ("y p", "Copy the selected session's transcript file path"),
     ("", "Act on sessions"),
     ("r", "Quit and print the resume command"),
     ("i", "Insert: send one message to the selected session"),
@@ -651,7 +653,7 @@ fn draw_zen(frame: &mut Frame<'_>, column: Rect, body: Rect, app: &App) {
     let (thinking, tools) = app.folding();
     let (hint, hint_style) = match (app.prompt(), app.status()) {
         (Prompt::Yank, _) => (
-            "yank: y reply at cursor · A whole transcript · r resume command · Esc cancel"
+            "yank: y reply at cursor · A whole transcript · r resume command · i id · p path · Esc cancel"
                 .to_owned(),
             Style::default().fg(Color::Cyan),
         ),
@@ -917,7 +919,8 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Prompt::Yank => (
             Span::styled("Yank: y", cyan),
-            "y reply · A whole transcript · r resume command · Esc cancel".to_owned(),
+            "y reply · A whole transcript · r resume command · i id · p path · Esc cancel"
+                .to_owned(),
             None,
         ),
         Prompt::Resize => {

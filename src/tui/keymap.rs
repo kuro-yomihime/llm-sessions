@@ -51,6 +51,8 @@ pub fn action_for_key(key: KeyEvent, prompt: &Prompt) -> Option<Action> {
             KeyCode::Char('y') => Some(Action::YankReply),
             KeyCode::Char('A') => Some(Action::YankTranscript),
             KeyCode::Char('r') => Some(Action::YankResume),
+            KeyCode::Char('i') => Some(Action::YankId),
+            KeyCode::Char('p') => Some(Action::YankPath),
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char(_) => Some(Action::Cancel),
             _ => None,
         },
@@ -118,7 +120,7 @@ fn base(code: KeyCode) -> Option<Action> {
         KeyCode::Char('f') => Some(Action::ToggleFollow),
         KeyCode::Char('z') => Some(Action::StartFold),
         // Vim's yank operator: `yy` the reply at the cursor, `yA` the whole
-        // transcript, `yr` the resume command.
+        // transcript, `yr` the resume command, `yi` / `yp` the id / path.
         KeyCode::Char('y') => Some(Action::StartYank),
         // Vim-mark grammar: `m<letter>` sets, `'<letter>` jumps. Both are
         // prefixes, so the letters underneath stay free for their actions.
@@ -214,6 +216,8 @@ mod tests {
         assert_eq!(yank('y'), Some(Action::YankReply));
         assert_eq!(yank('A'), Some(Action::YankTranscript));
         assert_eq!(yank('r'), Some(Action::YankResume));
+        assert_eq!(yank('i'), Some(Action::YankId));
+        assert_eq!(yank('p'), Some(Action::YankPath));
         // `ya` reads as vim's "yank around"; it must not copy anything.
         assert_eq!(yank('a'), Some(Action::Cancel));
         assert_eq!(yank('j'), Some(Action::Cancel));
