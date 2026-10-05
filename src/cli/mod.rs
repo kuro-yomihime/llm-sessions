@@ -61,10 +61,7 @@ pub fn run() -> Result<()> {
         Some(Command::Digest(args)) => report::digest(&home, &args),
         Some(Command::Top(args)) => top::run(&home, &args),
         Some(Command::Usage(args)) => report::usage(&home, &args),
-        Some(Command::Doctor) => {
-            report::doctor(&home);
-            Ok(())
-        }
+        Some(Command::Doctor(args)) => report::doctor(&home, &args),
         Some(Command::Completions(args)) => {
             let mut command = <Cli as clap::CommandFactory>::command();
             clap_complete::generate(

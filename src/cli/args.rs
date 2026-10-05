@@ -63,7 +63,7 @@ pub enum Command {
     Hosts(HostsArgs),
     /// Report orphaned processes, dead paths, and stale caches.
     #[command(display_order = 11)]
-    Doctor,
+    Doctor(DoctorArgs),
     /// Archive or unarchive sessions by id.
     #[command(display_order = 12)]
     Archive(ArchiveArgs),
@@ -254,6 +254,13 @@ pub struct CompletionsArgs {
 #[derive(Debug, Clone, clap::Args)]
 pub struct TopArgs {
     /// Emit JSON instead of a table.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DoctorArgs {
+    /// Emit findings as JSON: severity, check, detail, fix (null when none).
     #[arg(long)]
     pub json: bool,
 }

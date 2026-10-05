@@ -10,7 +10,7 @@ use llm_sessions::runtime::doctor::{self, Severity};
 use llm_sessions::storage::index::Index;
 use llm_sessions::{Result, Usage};
 
-use super::args::{DigestArgs, UsageArgs};
+use super::args::{DigestArgs, DoctorArgs, UsageArgs};
 use super::{Liveliness, Loaded, emit, parse_since, scan_all};
 
 /// One line per session touched since `--since`, grouped by workspace.
@@ -142,19 +142,31 @@ pub(super) fn usage(home: &Path, args: &UsageArgs) -> Result<()> {
 
 /// Health report. Never fixes anything: it prints the commands and leaves the
 /// decision with the user.
-pub(super) fn doctor(home: &Path) {
+pub(super) fn doctor(home: &Path, args: &DoctorArgs) -> Result<()> {
     let Loaded { scan, .. } = scan_all(home, Liveliness::Skip);
     let mut findings = doctor::run(home, &scan.sessions);
     findings.extend(doctor::remote_findings(home));
+    if args.json {
+        let payload: Vec<_> = findings
+            .iter()
+            .map(|finding| {
+                serde_json::json!({
+                    "severity": severity_name(finding.severity),
+                    "check": finding.check,
+                    "detail": finding.detail,
+                    "fix": finding.fix,
+                })
+            })
+            .collect();
+        emit(&serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
     if findings.is_empty() {
         emit("nothing to report");
-        return;
+        return Ok(());
     }
     for finding in &findings {
-        let mark = match finding.severity {
-            Severity::Warn => "warn",
-            Severity::Info => "info",
-        };
+        let mark = severity_name(finding.severity);
         emit(&format!(
             "{mark}  {:<18}  {}",
             finding.check, finding.detail
@@ -172,4 +184,12 @@ pub(super) fn doctor(home: &Path) {
         "{} finding(s), {warnings} warning(s)",
         findings.len()
     ));
+    Ok(())
+}
+
+fn severity_name(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Warn => "warn",
+        Severity::Info => "info",
+    }
 }

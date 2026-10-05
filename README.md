@@ -86,7 +86,7 @@ llm-sessions top                 # one row per running agent
 llm-sessions usage --by workspace --since 7d   # also: model, agent, day
 llm-sessions archive <id>        # --undo restores
 llm-sessions sources             # detected stores and scan costs
-llm-sessions doctor              # diagnostics; never applies fixes
+llm-sessions doctor              # diagnostics; never applies fixes (--json)
 llm-sessions completions bash
 llm-sessions man
 ```
