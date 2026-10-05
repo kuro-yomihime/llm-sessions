@@ -242,8 +242,9 @@ pub(super) fn open_sql_script(db: &str, queries: &[(&str, String)]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
 
     #[test]
     fn a_glob_is_rooted_at_its_literal_prefix() {
