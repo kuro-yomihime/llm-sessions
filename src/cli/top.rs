@@ -16,8 +16,11 @@ use super::{Liveliness, Loaded, emit, scan_all};
 /// happened in this project".
 pub(super) fn run(home: &Path, args: &TopArgs) -> Result<()> {
     let Loaded {
-        fleet, hosts, scan, ..
+        loader,
+        fleet,
+        scan,
     } = scan_all(home, Liveliness::Needed);
+    let hosts = &loader.hosts;
     let attached: Vec<(&Process, Option<&SessionSummary>)> = fleet
         .processes()
         .iter()
@@ -51,7 +54,7 @@ pub(super) fn run(home: &Path, args: &TopArgs) -> Result<()> {
             })
             .collect();
         let mut remote_rows: Vec<_> = Vec::new();
-        for host in &hosts {
+        for host in hosts {
             match host.top() {
                 Ok(processes) => remote_rows.extend(processes.iter().map(|process| {
                     serde_json::json!({
@@ -108,7 +111,7 @@ pub(super) fn run(home: &Path, args: &TopArgs) -> Result<()> {
                 + session.map_or("—", SessionSummary::display_title),
         ));
     }
-    for host in &hosts {
+    for host in hosts {
         match host.top() {
             Ok(processes) if processes.is_empty() => {}
             Ok(processes) => {

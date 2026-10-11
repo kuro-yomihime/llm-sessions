@@ -33,7 +33,21 @@ path = "src/lib.rs"
 name = "llm-sessions"
 path = "src/main.rs"
 
+[features]
+default = ["serve"]
+# `llm-sessions serve`: the read-only HTTP/WebSocket API. Pulls in tokio and
+# axum; `--no-default-features` builds the TUI and CLI without them, and CI
+# keeps that lean build green.
+serve = ["dep:axum", "dep:tokio", "clap/env"]
+
 [dependencies]
+axum = { version = "0.8", optional = true, default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+    "ws",
+] }
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"
 clap_mangen = "0.2"
@@ -44,6 +58,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tempfile = "3"
+tokio = { version = "1", optional = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+    "signal",
+] }
 # `local-offset` is what lets display convert UTC records to the reader's own
 # clock; it pulls no crate the tree does not already build.
 time = { version = "0.3", features = [
@@ -84,3 +106,8 @@ strip = "debuginfo"
 
 [dev-dependencies]
 rusqlite = { version = "0.37", features = ["bundled"] }
+# Route and stream tests for `serve`: requests without a socket, and a
+# WebSocket client. Both are already in the tree under the `serve` feature.
+futures-util = { version = "0.3", default-features = false }
+tokio-tungstenite = "0.29"
+tower = { version = "0.5", features = ["util"] }

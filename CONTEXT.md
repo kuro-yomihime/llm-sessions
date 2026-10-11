@@ -32,8 +32,21 @@ line here when a module is named after a concept not yet listed.
 - **Report rows** (`output::report`) — a `SessionSummary` as text a person
   reads: the `list` line and the `{field}` template, shared by every
   printing subcommand.
+- **Loader** (`catalog::loader`) — the inputs of a scan (local adapters,
+  archive overlay, configured hosts) assembled once, plus the lookups every
+  frontend runs on its result: opening a listed session with tier-1 title and
+  workspace, id/prefix resolution, `body:` hits. The CLI scans once; `serve`
+  keeps one and rescans on a timer.
 - **Fleet / liveness** — which sessions are live right now: exact (fd held
   open), inferred (right agent + cwd), or recent-write.
+- **Status** (`runtime::status`) — the derived five-state view of a session
+  (running, idle, waiting for approval or input, failed, done): liveness and
+  CPU activity joined with the transcript tail, debounced by `settle`. Needs
+  a tier-2 read, so it is derived for watched sessions, never for a listing.
+- **Serve** (`serve`, feature `serve`) — the read-only HTTP/WebSocket API:
+  a poller owns a `Loader`, rescans on a timer and publishes immutable
+  snapshots; handlers only read them. GET routes and one WebSocket, nothing
+  else, so read-only holds by construction rather than by a flag.
 - **Overlay** — `llm-sessions`-owned store of archive state for agents without
   native archiving.
 - **Index** — the disposable FTS5 body-search cache plus derived usage/prompt

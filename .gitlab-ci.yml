@@ -59,6 +59,19 @@ doc:
   script:
     - cargo doc --no-deps --document-private-items --locked
 
+# The lean build: no `serve` feature. Shipped (normal) dependencies never
+# pull tokio or axum — asserted below; the --all-targets builds here still
+# compile test-only dev-dependencies (the WS client, tower), which cannot be
+# optional, so the guarantee is about the dependency graph, not this job's
+# compile list.
+lean:
+  stage: test
+  extends: .non_tag
+  script:
+    - cargo clippy --all-targets --no-default-features -- -D warnings
+    - cargo test --all-targets --no-default-features
+    - test "$(cargo tree --locked -e normal --no-default-features | grep -cE 'tokio|axum|tower')" = 0
+
 test:
   stage: test
   extends: .non_tag

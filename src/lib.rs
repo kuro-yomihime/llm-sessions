@@ -10,6 +10,8 @@ pub mod error;
 pub mod model;
 pub mod output;
 pub mod runtime;
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod source;
 pub mod storage;
 pub mod tui;

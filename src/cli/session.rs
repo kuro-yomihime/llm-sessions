@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
+use llm_sessions::catalog::loader::{Resolved, resolve};
 use llm_sessions::error::Error;
 use llm_sessions::model::ArchiveOutcome;
 use llm_sessions::output::export::{self, Format};
-use llm_sessions::source::{self, remote};
+use llm_sessions::source;
 use llm_sessions::{Result, SessionSummary, Transcript};
 
 use super::args::{ArchiveArgs, ShowArgs, ShowFormat};
@@ -13,23 +14,9 @@ use super::{Liveliness, Loaded, emit, scan_all};
 
 /// Resolve `id` and open its transcript, with tier-1 title and workspace.
 fn load(home: &Path, id: &str) -> Result<(Transcript, SessionSummary)> {
-    let Loaded {
-        sources,
-        hosts,
-        scan,
-        ..
-    } = scan_all(home, Liveliness::Skip);
+    let Loaded { loader, scan, .. } = scan_all(home, Liveliness::Skip);
     let session = resolve_one(&scan.sessions, id)?;
-    let mut transcript = open_session(home, &sources, &hosts, session)?;
-    // Tier 1 already resolved title and workspace authoritatively (Codex
-    // titles live in `state_5.sqlite`, not in the rollout; the scan also
-    // canonicalized the path and rolled worktrees up). Prefer them.
-    transcript.title = transcript.title.take().or_else(|| session.title.clone());
-    transcript.workspace = session
-        .workspace
-        .clone()
-        .or_else(|| transcript.workspace.take());
-    Ok((transcript, session.clone()))
+    Ok((loader.open(session)?, session.clone()))
 }
 
 pub(super) fn show(home: &Path, args: &ShowArgs) -> Result<()> {
@@ -80,12 +67,7 @@ fn deliver(rendered: &str, out: Option<&Path>) -> Result<()> {
 }
 
 pub(super) fn archive(home: &Path, args: &ArchiveArgs) -> Result<()> {
-    let Loaded {
-        sources,
-        overlay,
-        scan,
-        ..
-    } = scan_all(home, Liveliness::Skip);
+    let Loaded { loader, scan, .. } = scan_all(home, Liveliness::Skip);
     let archived = !args.undo;
     for id in &args.ids {
         let session = resolve_one(&scan.sessions, id)?;
@@ -98,14 +80,14 @@ pub(super) fn archive(home: &Path, args: &ArchiveArgs) -> Result<()> {
                 message: "archiving a remote session is not supported".into(),
             });
         }
-        let outcome = source::find(&sources, session.source)
+        let outcome = source::find(&loader.sources, session.source)
             .map_or(Ok(ArchiveOutcome::Unsupported), |src| {
                 src.archive(&session.locator, archived)
             })?;
         let how = match outcome {
             ArchiveOutcome::Native => "native",
             ArchiveOutcome::Unsupported => {
-                let overlay = overlay.as_ref().ok_or(Error::NoHome)?;
+                let overlay = loader.overlay.as_ref().ok_or(Error::NoHome)?;
                 overlay.set_archived(session.source, &session.id, archived)?;
                 "overlay"
             }
@@ -122,23 +104,17 @@ pub(super) fn archive(home: &Path, args: &ArchiveArgs) -> Result<()> {
 
 /// Resolve an id or unique prefix to exactly one session.
 fn resolve_one<'a>(sessions: &'a [SessionSummary], needle: &str) -> Result<&'a SessionSummary> {
-    let exact: Vec<&SessionSummary> = sessions.iter().filter(|s| s.id == needle).collect();
-    let candidates = if exact.is_empty() {
-        sessions
-            .iter()
-            .filter(|s| s.id.starts_with(needle))
-            .collect::<Vec<_>>()
-    } else {
-        exact
-    };
-    match candidates.len() {
-        1 => Ok(candidates[0]),
-        0 => Err(Error::MissingRow {
+    match resolve(sessions, needle) {
+        Resolved::One(session) => Ok(session),
+        Resolved::Missing => Err(Error::MissingRow {
             db: PathBuf::from("<any source>"),
             id: needle.to_string(),
         }),
-        n => {
-            eprintln!("llm-sessions: {needle:?} matches {n} sessions:");
+        Resolved::Ambiguous(candidates) => {
+            eprintln!(
+                "llm-sessions: {needle:?} matches {} sessions:",
+                candidates.len()
+            );
             for c in candidates.iter().take(10) {
                 eprintln!("  {} {}", c.source, c.id);
             }
@@ -146,35 +122,6 @@ fn resolve_one<'a>(sessions: &'a [SessionSummary], needle: &str) -> Result<&'a S
                 db: PathBuf::from("<ambiguous>"),
                 id: needle.to_string(),
             })
-        }
-    }
-}
-
-/// Open a session wherever it lives: locally through its adapter, remotely
-/// through the host that listed it.
-fn open_session(
-    home: &Path,
-    sources: &[Box<dyn source::Source>],
-    hosts: &[remote::Host],
-    session: &SessionSummary,
-) -> Result<Transcript> {
-    match &session.host {
-        None => {
-            let reader = source::find(sources, session.source).ok_or(Error::Unsupported {
-                agent: session.source,
-                what: "reading transcripts",
-            })?;
-            reader.open(&session.locator)
-        }
-        Some(name) => {
-            let host = hosts
-                .iter()
-                .find(|host| host.name() == name)
-                .ok_or_else(|| Error::Remote {
-                    host: name.clone(),
-                    message: "no host with this name in hosts.json".into(),
-                })?;
-            host.open(session, home)
         }
     }
 }

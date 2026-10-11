@@ -11,7 +11,10 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use llm_sessions::catalog::loader::{Cached, Loader, Remote};
 use llm_sessions::model::{Block, Role, SessionSummary, Transcript};
+use llm_sessions::runtime::live::Activity;
+use llm_sessions::runtime::status::{self, Status, WaitingReason};
 use llm_sessions::source::{
     Source, claude, codex, copilot, cursor, gemini, goose, hermes, kilo, omp, openclaw, opencode,
 };
@@ -621,4 +624,58 @@ fn base64(bytes: &[u8]) -> String {
         });
     }
     out
+}
+
+/// Status derivation reads real transcript shapes, not the ones a unit test
+/// assumed: every corpus session is a finished conversation, and cutting one
+/// right after its last tool call must read as a call awaiting approval in
+/// every adapter's encoding of calls and results.
+#[test]
+fn status_facts_read_every_adapters_tool_calls() {
+    let home = scratch_home();
+    let loader = Loader::new(home.path());
+    let scan = loader.scan(None, Cached::Ignore, Remote::Skip);
+    let mut cut = 0;
+    for session in &scan.sessions {
+        let what = format!("{} {}", session.source, session.id);
+        let mut transcript = loader
+            .open(session)
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(
+            status::analyze(&transcript),
+            status::Facts::default(),
+            "{what}: a finished session reads as done"
+        );
+
+        let Some(last_call) = transcript.turns.iter().rposition(|turn| {
+            turn.blocks
+                .iter()
+                .any(|block| matches!(block, Block::ToolCall { .. }))
+        }) else {
+            continue;
+        };
+        transcript.turns.truncate(last_call + 1);
+        let turn = &mut transcript.turns[last_call];
+        let call = turn
+            .blocks
+            .iter()
+            .rposition(|block| matches!(block, Block::ToolCall { .. }))
+            .expect("the turn holds a call");
+        turn.blocks.truncate(call + 1);
+        let facts = status::analyze(&transcript);
+        assert!(facts.pending_tool_call, "{what}: cut after its last call");
+        assert_eq!(
+            status::derive_status(
+                true,
+                Activity::Waiting,
+                &facts,
+                session.updated,
+                session.updated
+            ),
+            (Status::Waiting, Some(WaitingReason::Approval)),
+            "{what}"
+        );
+        cut += 1;
+    }
+    assert!(cut >= 8, "the corpus exercises most adapters' tool calls");
 }

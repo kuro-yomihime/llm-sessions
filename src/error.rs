@@ -41,6 +41,11 @@ pub enum Error {
 
     #[error("clipboard: {message}")]
     Clipboard { message: String },
+
+    /// `llm-sessions serve` could not start or keep serving.
+    #[cfg(feature = "serve")]
+    #[error("serve: {0}")]
+    Serve(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

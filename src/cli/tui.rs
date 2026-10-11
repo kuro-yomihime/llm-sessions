@@ -13,19 +13,17 @@ pub(super) fn run(home: &Path, read_only: bool) -> Result<()> {
     // Remote rows belong to the App's background cache: scanning them inline
     // here would duplicate every host the moment the cache filled.
     let Loaded {
-        sources,
-        overlay,
+        loader,
         fleet,
         scan,
-        ..
-    } = scan_all_with(home, Liveliness::Needed, Cached::Borrow, Remote::Cached);
+    } = scan_all_with(home, Liveliness::Needed, Cached::Borrow, Remote::Skip);
     let index = Index::open(&Index::default_path(home)).ok();
     let mut app = App::new(
         home,
-        sources,
+        loader.sources,
         scan.sessions,
         scan.failures,
-        overlay,
+        loader.overlay,
         index,
         fleet,
     );

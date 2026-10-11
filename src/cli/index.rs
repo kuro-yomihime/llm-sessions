@@ -46,7 +46,7 @@ pub(super) fn build(home: &Path, args: &IndexArgs) -> Result<()> {
         max_bytes: args.max_bytes,
     };
 
-    let Loaded { sources, scan, .. } =
+    let Loaded { loader, scan, .. } =
         scan_all_with(home, Liveliness::Skip, Cached::Ignore, Remote::Inline);
     // Remote bodies cost one ssh per session and belong to another machine's
     // index; only rows on this machine are cacheable here.
@@ -57,7 +57,7 @@ pub(super) fn build(home: &Path, args: &IndexArgs) -> Result<()> {
         .cloned()
         .collect();
     let mut index = Index::open(&path)?;
-    let stats = index.refresh_with(&local, &sources, &options)?;
+    let stats = index.refresh_with(&local, &loader.sources, &options)?;
     emit(&format!(
         "indexed {} of {} session(s), {} removed, {} unreadable, in {:.1?}",
         stats.reindexed, stats.scanned, stats.removed, stats.failed, stats.elapsed

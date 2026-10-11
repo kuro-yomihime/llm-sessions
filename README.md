@@ -37,7 +37,8 @@ cargo install llm-sessions   # or `cargo install --path .` from a checkout
 ```
 
 Requires Rust 1.96+ (pinned in `rust-toolchain.toml`). Linux only: liveness
-reads `/proc`.
+reads `/proc`. `--no-default-features` builds without `serve` and its
+tokio/axum dependencies.
 
 ## TUI basics
 
@@ -88,6 +89,45 @@ llm-sessions hosts add nx-1 nx-1.example.net --source hermes  # repeatable --sou
 llm-sessions hosts remove nx-1
 ```
 
+### Serve
+
+`llm-sessions serve` publishes this machine's sessions to clients that hold a
+token and have no shell on it:
+
+```sh
+LLMS_TOKEN=$(openssl rand -hex 32) llm-sessions serve --bind 0.0.0.0:8787
+curl -H "Authorization: Bearer $LLMS_TOKEN" 'http://host:8787/v1/sessions?q=live:yes'
+```
+
+| Route (all `GET`) | Returns |
+|---|---|
+| `/v1/healthz` | `{"ok","version","host"}`, no token |
+| `/v1/sessions?q=<query>&limit=N` | `{"serverTime","sessions":[row…]}`: `list --json` rows, same query language, `limit` 50 by default, 0 for all |
+| `/v1/sessions/<id>` | one row; a unique id prefix works, as with `show` |
+| `/v1/sessions/<id>/transcript` | exactly what `show <id> --json` prints |
+| `/v1/stream` | WebSocket: `{"type":"snapshot",…}` on connect and when a watched row changes, `{"type":"ping"}` every 20 s |
+
+A row is a `list --json` row plus `status`: `{"status","waitingReason",
+"statusSince"}` with status `running`, `idle`, `waiting` (`approval` or
+`input`), `failed` or `done`, derived from liveness and the transcript tail
+and debounced over two polls. Only watched sessions carry one in listings and
+the stream: live, or written within `--status-window` hours (default 1).
+`/v1/sessions/<id>` derives it for any session. Status is a heuristic; an
+agent waiting on a tool it is running reads `waiting/approval`.
+
+Read-only by construction: there are only `GET` routes and the WebSocket, so
+nothing archives, indexes, edits hosts or reaches a terminal, and no resume
+command is sent. Clients authenticate with `Authorization: Bearer <token>`;
+`/v1/stream` also takes `?token=` for clients that cannot set headers. The
+default bind is `127.0.0.1:8787`; every bind needs `--token` (or `LLMS_TOKEN`)
+of at least 16 characters — use high entropy, `openssl rand -hex 32`. A
+browser page can reach a loopback server through DNS rebinding and unguarded
+WebSocket connects, so `--no-auth` (loopback only) answers just requests
+whose `Host` header names the loopback. There is no TLS: off loopback, put a
+TLS reverse proxy in front. `--source` and `-q` restrict
+what is published at all; `--poll-secs` (default 3) sets the rescan interval.
+Only local sessions are served, not those of configured remote hosts.
+
 ## Commands
 
 ```sh
@@ -99,6 +139,7 @@ llm-sessions index               # build/update the optional text index
 llm-sessions search <words>      # full-text search
 llm-sessions digest --since 24h  # recent activity by project
 llm-sessions top                 # one row per running agent
+llm-sessions serve --token <t>   # read-only HTTP/WebSocket API (see below)
 llm-sessions usage --by workspace --since 7d   # also: model, agent, day
 llm-sessions archive <id>        # --undo restores
 llm-sessions sources             # detected stores and scan costs

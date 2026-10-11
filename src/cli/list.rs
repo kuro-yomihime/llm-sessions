@@ -5,11 +5,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use llm_sessions::catalog::loader::body_hits;
 use llm_sessions::catalog::query::{Filters, Query, eligible};
 use llm_sessions::catalog::workspace;
 use llm_sessions::output::reader::truncate;
 use llm_sessions::output::report::{expand, format_row};
-use llm_sessions::storage::index::Index;
 use llm_sessions::{Result, Scan, SessionSummary, SourceId};
 
 use super::args::{FilterArgs, ListArgs, WorkspacesArgs};
@@ -122,24 +122,13 @@ struct WorkspaceSummary<'a> {
 
 /// Sessions matching the query's `body:` terms, or `None` when it has none.
 ///
-/// The parser is shared with the TUI, so `body:` has to mean the same thing
-/// on both sides; without this it would silently narrow nothing on the CLI.
+/// Without the index a `body:` query narrows to nothing, said on stderr,
+/// rather than silently matching everything.
 fn body_restriction(home: &Path, query: &Query) -> Option<HashSet<(SourceId, String)>> {
-    if !query.needs_index() {
-        return None;
-    }
-    let expression = query.body_query()?;
-    let index = match Index::open(&Index::default_path(home)) {
-        Ok(index) => index,
+    match body_hits(home, query)? {
+        Ok(hits) => Some(hits),
         Err(e) => {
-            eprintln!("llm-sessions: body: needs the index ({e}); run `llm-sessions index`");
-            return Some(HashSet::new());
-        }
-    };
-    match index.search(&expression, 5000) {
-        Ok(hits) => Some(hits.into_iter().map(|h| (h.source, h.session_id)).collect()),
-        Err(e) => {
-            eprintln!("llm-sessions: body: search failed: {e}");
+            eprintln!("llm-sessions: body: search failed: {e}; run `llm-sessions index`");
             Some(HashSet::new())
         }
     }

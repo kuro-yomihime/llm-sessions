@@ -12,12 +12,10 @@ mod tui;
 use std::path::Path;
 
 use clap::Parser;
+use llm_sessions::catalog::loader::{Cached, Loader, Remote};
 use llm_sessions::error::Error;
 use llm_sessions::runtime::live::Fleet;
-use llm_sessions::source::remote;
-use llm_sessions::storage::index::Index;
-use llm_sessions::storage::overlay::Overlay;
-use llm_sessions::{Result, Scan, home, scan_with, source};
+use llm_sessions::{Result, Scan, home};
 use time::OffsetDateTime;
 
 use self::args::{Cli, Command, HostsCommand};
@@ -61,6 +59,20 @@ pub fn run() -> Result<()> {
         Some(Command::Digest(args)) => report::digest(&home, &args),
         Some(Command::Top(args)) => top::run(&home, &args),
         Some(Command::Usage(args)) => report::usage(&home, &args),
+        #[cfg(feature = "serve")]
+        Some(Command::Serve(args)) => llm_sessions::serve::run(
+            &home,
+            llm_sessions::serve::Config {
+                bind: args.bind,
+                token: args.token,
+                no_auth: args.no_auth,
+                host_name: args.host_name,
+                poll: std::time::Duration::from_secs(args.poll_secs),
+                status_window: std::time::Duration::from_hours(args.status_window),
+                sources: args.sources,
+                query: args.query,
+            },
+        ),
         Some(Command::Doctor(args)) => report::doctor(&home, &args),
         Some(Command::Completions(args)) => {
             let mut command = <Cli as clap::CommandFactory>::command();
@@ -89,12 +101,6 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// The overlay is optional: a read-only or unwritable state directory must
-/// degrade to "no archive state", never to a failed launch.
-fn overlay_for(home: &Path) -> Option<Overlay> {
-    Overlay::open(&Overlay::default_path(home)).ok()
-}
-
 /// How much a subcommand needs to know about running processes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Liveliness {
@@ -108,14 +114,11 @@ enum Liveliness {
 
 /// Everything one scan produced, for a subcommand to take what it needs.
 struct Loaded {
-    /// Every local adapter, for opening and archiving what the scan listed.
-    sources: Vec<Box<dyn source::Source>>,
-    /// Local archive state, when the state directory is usable.
-    overlay: Option<Overlay>,
+    /// The scan's inputs: adapters for opening and archiving what it
+    /// listed, the overlay, every configured host.
+    loader: Loader,
     /// Running agent processes; empty under [`Liveliness::Skip`].
     fleet: Fleet,
-    /// Every configured remote host, whether or not this scan contacted it.
-    hosts: Vec<remote::Host>,
     /// The listed sessions and every failure met along the way.
     scan: Scan,
 }
@@ -128,72 +131,19 @@ fn scan_all(home: &Path, liveliness: Liveliness) -> Loaded {
     scan_all_with(home, liveliness, Cached::Borrow, Remote::Inline)
 }
 
-/// Whether a scan may fill blank tier-1 usage from the index cache.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Cached {
-    /// Presentation: show the best number available.
-    Borrow,
-    /// Index refresh: the cache is the output, so reading it back in would
-    /// make a stale value immortal. Codex's corrected token split survived
-    /// three full rebuilds this way before the loop was cut.
-    Ignore,
-}
-
-/// Whether this scan waits on SSH or defers remote rows to the TUI cache.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Remote {
-    /// CLI: one blocking fetch per host, rows inline. A hung host costs at
-    /// most its connect timeout, then becomes a failure line.
-    Inline,
-    /// TUI: local rows only. `remote::Cache` refreshes off-thread so no
-    /// frame ever blocks on a socket.
-    Cached,
-}
-
-fn scan_all_with(
-    home: &Path,
-    liveliness: Liveliness,
-    cached: Cached,
-    remote_mode: Remote,
-) -> Loaded {
-    let sources = source::all(home);
-    let overlay = overlay_for(home);
+fn scan_all_with(home: &Path, liveliness: Liveliness, cached: Cached, remote: Remote) -> Loaded {
+    let loader = Loader::new(home);
     let fleet = match liveliness {
         Liveliness::Needed => Fleet::probe(),
         Liveliness::Skip => Fleet::default(),
     };
-    let (config, load_failure) = remote::Config::load(home);
-    let hosts: Vec<remote::Host> = config.hosts.into_iter().map(remote::Host::new).collect();
-    let scanned: &[remote::Host] = match remote_mode {
-        Remote::Inline => &hosts,
-        Remote::Cached => &[],
-    };
     let attribution = (liveliness == Liveliness::Needed).then_some(&fleet);
-    let mut scan = scan_with(&sources, overlay.as_ref(), attribution, scanned);
-    if let Some(failure) = load_failure {
-        scan.failures.push(failure);
-    }
-    if cached == Cached::Borrow {
-        borrow_cached_usage(home, &mut scan);
-    }
+    let scan = loader.scan(attribution, cached, remote);
     Loaded {
-        sources,
-        overlay,
+        loader,
         fleet,
-        hosts,
         scan,
     }
-}
-
-/// OMP and Claude only record spend inside the transcript, so tier 1 cannot
-/// price them. `llm-sessions index` already parsed those bodies; borrow its answer
-/// rather than reparsing 280 MB to fill a column.
-fn borrow_cached_usage(home: &Path, scan: &mut Scan) {
-    let Ok(index) = Index::open(&Index::default_path(home)) else {
-        return;
-    };
-    let Ok(cached) = index.usage() else { return };
-    cached.fill(&mut scan.sessions);
 }
 
 /// Parse a `--since` value against the current time.

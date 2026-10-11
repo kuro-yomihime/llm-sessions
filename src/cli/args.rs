@@ -49,6 +49,11 @@ pub enum Command {
     /// Summarize recorded spend.
     #[command(display_order = 7)]
     Usage(UsageArgs),
+    /// Serve this machine's sessions over a read-only, token-authenticated
+    /// HTTP and WebSocket API.
+    #[cfg(feature = "serve")]
+    #[command(display_order = 8)]
+    Serve(ServeArgs),
     /// Build or update the full-text search index. Indexes local sessions
     /// only: fetching remote bodies would mean one ssh per session.
     #[command(display_order = 9)]
@@ -258,6 +263,92 @@ pub struct TopArgs {
     pub json: bool,
 }
 
+/// Upper bound for --status-window: far below where `Duration::from_hours`
+/// panics on overflow, and past any session anyone will wait on.
+#[cfg(feature = "serve")]
+const MAX_STATUS_WINDOW_HOURS: u64 = 100 * 365 * 24;
+
+/// Manual `Debug`, below: the derived one would print the token.
+#[cfg(feature = "serve")]
+#[derive(Clone, clap::Args)]
+#[command(after_long_help = "Routes, all GET:\n  \
+    /v1/healthz                    liveness probe, no token\n  \
+    /v1/sessions?q=QUERY&limit=N   rows as `list --json`, plus a derived `status`\n  \
+    /v1/sessions/ID                one row; ID may be a unique prefix\n  \
+    /v1/sessions/ID/transcript     the bytes of `show ID --json`\n  \
+    /v1/stream                     WebSocket: live and recent rows, pushed on change\n\n\
+    Read-only by construction: no route archives, indexes, edits hosts, or\n\
+    reaches a terminal. Clients send `Authorization: Bearer TOKEN`; /v1/stream\n\
+    also takes `?token=TOKEN`. There is no TLS: off loopback, put a TLS\n\
+    reverse proxy in front.")]
+pub struct ServeArgs {
+    /// Address to listen on. Only a loopback address may use --no-auth.
+    #[arg(long, env = "LLMS_BIND", default_value = "127.0.0.1:8787")]
+    pub bind: std::net::SocketAddr,
+
+    /// Shared secret clients must present. Required unless --no-auth; at
+    /// least 16 characters.
+    #[arg(long, env = "LLMS_TOKEN", hide_env_values = true)]
+    pub token: Option<String>,
+
+    /// Serve without a token. Refused unless --bind is a loopback address.
+    #[arg(long, conflicts_with = "token")]
+    pub no_auth: bool,
+
+    /// Host name /v1/healthz reports [default: system hostname, lowercased].
+    #[arg(long, value_name = "NAME")]
+    pub host_name: Option<String>,
+
+    /// Seconds between rescans.
+    #[arg(long, value_name = "N", default_value_t = 3,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    pub poll_secs: u64,
+
+    /// Sessions written within this many hours get a derived status even
+    /// with no agent attached. Live sessions always do.
+    #[arg(long, value_name = "HOURS", default_value_t = 1,
+          value_parser = clap::value_parser!(u64).range(1..=MAX_STATUS_WINDOW_HOURS))]
+    pub status_window: u64,
+
+    /// Only sessions from this agent. Repeatable.
+    #[arg(long = "source", value_name = "AGENT", value_parser = parse_source)]
+    pub sources: Vec<llm_sessions::SourceId>,
+
+    /// Base query every published row must match, in the `list -q` grammar.
+    #[arg(long, short = 'q')]
+    pub query: Option<String>,
+}
+
+/// Nothing that prints args may print the token: one stray `{:?}` on the
+/// parsed CLI would otherwise copy the secret into a log. `Command` derives
+/// `Debug`, so this is a lying `Debug` on purpose.
+#[cfg(feature = "serve")]
+impl std::fmt::Debug for ServeArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeArgs")
+            .field("bind", &self.bind)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("no_auth", &self.no_auth)
+            .field("host_name", &self.host_name)
+            .field("poll_secs", &self.poll_secs)
+            .field("status_window", &self.status_window)
+            .field("sources", &self.sources)
+            .field("query", &self.query)
+            .finish()
+    }
+}
+
+#[cfg(feature = "serve")]
+fn parse_source(name: &str) -> Result<llm_sessions::SourceId, String> {
+    llm_sessions::SourceId::parse(&name.to_lowercase()).ok_or_else(|| {
+        let known: Vec<&str> = llm_sessions::SourceId::ALL
+            .iter()
+            .map(|id| id.name())
+            .collect();
+        format!("unknown agent; one of: {}", known.join(", "))
+    })
+}
+
 #[derive(Debug, Clone, clap::Args)]
 pub struct DoctorArgs {
     /// Emit findings as JSON: severity, check, detail, fix (null when none).
@@ -338,6 +429,52 @@ mod tests {
                     .command,
                 Some(Command::List(_))
             ));
+        }
+    }
+
+    /// One stray `{:?}` on the parsed CLI must not copy the token into a
+    /// log, so `Debug` is a lie for that one field.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_args_debug_never_prints_the_token() {
+        let args = ServeArgs {
+            bind: "127.0.0.1:8787".parse().unwrap(),
+            token: Some("s3cret-do-not-print".into()),
+            no_auth: false,
+            host_name: None,
+            poll_secs: 3,
+            status_window: 1,
+            sources: Vec::new(),
+            query: None,
+        };
+        let printed = format!("{args:?}");
+        assert!(!printed.contains("s3cret"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    /// `--status-window` used to panic at startup on huge values, when
+    /// `Duration::from_hours` overflowed; now the parser refuses.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn status_window_takes_a_range_not_a_panic() {
+        for bad in ["0", "99999999999"] {
+            let error =
+                Cli::try_parse_from(["llm-sessions", "serve", "--status-window", bad]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{bad}"
+            );
+        }
+        let parsed =
+            Cli::try_parse_from(["llm-sessions", "serve", "--status-window", "87600"]).unwrap();
+        match parsed.command {
+            Some(Command::Serve(args)) => {
+                assert_eq!(args.status_window, 87_600);
+                // The ceiling stays convertible to a Duration.
+                let _ = std::time::Duration::from_hours(MAX_STATUS_WINDOW_HOURS);
+            }
+            _ => panic!("the serve command did not parse"),
         }
     }
 }
