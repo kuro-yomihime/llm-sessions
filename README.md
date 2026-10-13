@@ -78,16 +78,56 @@ Configure in `$XDG_CONFIG_HOME/llm-sessions/hosts.json`:
 ```
 
 Remote sessions appear beside local ones (`--host` filter, `host:` in
-queries, host view `5`). With `llm-sessions` installed on the host its JSON
-output is used; otherwise a generated `sh` script lists stores over one SSH
-connection (`mode`: `"auto"`, `"llm-sessions"`, or `"shell"`). Connections
-use `BatchMode=yes`, so passphrase-protected hosts fail fast.
+queries, host view `5`). A federation-capable `llm-sessions` on a peer also
+discovers that peer's configured hosts. Otherwise a generated `sh` script
+lists only its local stores (`mode`: `"auto"`, `"llm-sessions"`, or `"shell"`).
+Older binaries are shell-only leaves, with a diagnostic; they never receive
+an unguarded recursive `list`. Connections use `BatchMode=yes`, so
+passphrase-protected hosts fail fast.
 
 ```sh
 llm-sessions hosts                                            # list + probe
 llm-sessions hosts add nx-1 nx-1.example.net --source hermes  # repeatable --source
 llm-sessions hosts remove nx-1
 ```
+
+Initialize each originating account once, on that machine:
+
+```sh
+llm-sessions origin --init       # create-only; prints the persisted UUID
+llm-sessions origin              # read the existing identity
+```
+
+Normal local commands initialize it automatically unless `--read-only` is
+set. Remote requests never initialize it. The marker lives at
+`$XDG_STATE_HOME/llm-sessions/origin-id` (default
+`~/.local/state/llm-sessions/origin-id`), resolved the same way locally, by
+the SSH probe, and by guarded commands on the peer. Shell-only hosts must
+provision a UUID there beforehand; missing or malformed identity produces a
+diagnostic rather than an observer-specific substitute. A configured `home`
+selects that namespace for the marker, stores, and guarded commands,
+including its HOME/XDG environment.
+
+Sessions are deduplicated by `(origin_id, source, id)` before counts or
+filters. The agent-assigned `id` stays unchanged. A session reached directly
+and through a gateway appears once under its origin, not the gateway. JSON
+includes `origin_id` and `routes`; display names are not identity keys.
+The shortest successful route wins, with a lexical tie-break. Transcript
+opening and resume also work when an origin is reachable only through a
+gateway. Disambiguate colliding IDs when opening:
+
+```sh
+llm-sessions show shared --origin <origin-uuid> --source omp
+```
+
+Discovery skips an already-visited origin before querying its sessions.
+Paths are branch-local: independent routes may query the same origin and
+their results merge. Traversal is bounded to eight SSH hops; endpoint local
+sessions remain visible and truncation is reported.
+
+Preserve the marker across upgrades and restores of the same instance.
+Independent clones must get a new UUID; copied identities cause false
+deduplication and false cycle detection.
 
 ### Serve
 
@@ -148,8 +188,8 @@ llm-sessions completions bash
 llm-sessions man
 ```
 
-`--read-only` refuses archiving, indexing, tmux focus changes, and saving
-bookmarks.
+`--read-only` refuses archiving, indexing, origin initialization, host-config
+edits, tmux focus changes, and saving bookmarks.
 
 ## Keys
 
@@ -264,10 +304,12 @@ rustdoc with `-D warnings`, tests, and a non-blocking `cargo audit`.
 |---|---|
 | `$XDG_STATE_HOME/llm-sessions/overlay.db` | archive state for agents without it |
 | `$XDG_CACHE_HOME/llm-sessions/index.db` | FTS5 body index, spend cache; delete any time |
+| `$XDG_STATE_HOME/llm-sessions/origin-id` | persistent host/account federation UUID |
 
-Both are disposable. The index is large (~690 MB per ~5 GB of bodies) and
-only written by `llm-sessions index`; `--since`/`--max-bytes` bound it,
-`--max-body` truncates oversized tool output, `--vacuum` reclaims pages.
+The databases are disposable; the origin marker is not. The index is large
+(~690 MB per ~5 GB of bodies) and only written by `llm-sessions index`;
+`--since`/`--max-bytes` bound it, `--max-body` truncates oversized tool output,
+`--vacuum` reclaims pages.
 
 ## License
 

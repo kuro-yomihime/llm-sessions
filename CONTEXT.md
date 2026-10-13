@@ -4,8 +4,16 @@ Terms used by the code and by architecture reviews. Keep names stable; add a
 line here when a module is named after a concept not yet listed.
 
 - **Session** — one conversation an agent ran, normalized from any store into a
-  `SessionSummary`. Keyed by the workspace it ran in, not by the tool that
-  wrote it.
+  `SessionSummary`. Identified by its origin, source, and agent-assigned ID;
+  grouped by the workspace it ran in.
+- **Origin** — the host/account session namespace where a session lives.
+  Its stable identity is shared by every observer and access method.
+- **Origin display label** — human-readable attribution for an origin;
+  different observers may use different labels for the same origin.
+- **Access route** — an ordered path through remote hosts to a session's
+  origin. Multiple routes can reach the same session.
+- **Discovery path** — origins already visited by one traversal branch.
+  A repeated origin is a cycle; a separate branch can visit it independently.
 - **Transcript** — the opened body of a session: turns of blocks (text,
   thinking, tool use/result, changed files, unknown raw JSON).
 - **Workspace** — the repository a session's recorded cwd canonicalizes to;
