@@ -26,8 +26,8 @@ pub struct Entry {
 
 /// Sessions touched since `since`, grouped by workspace and newest first.
 ///
-/// Prompts are read from the index when present. A session absent from the
-/// index uses its tier-1 title as a fast fallback; this function never parses a
+/// Prompts are read from the local index only for local sessions. Other rows
+/// use their tier-1 title as a fast fallback; this function never parses a
 /// session body.
 pub fn build(
     index: &Index,
@@ -38,9 +38,10 @@ pub fn build(
     let mut groups: HashMap<Option<PathBuf>, Vec<Entry>> = HashMap::new();
 
     for session in sessions.iter().filter(|session| session.updated >= since) {
-        let prompt = cached
-            .prompts
-            .get(&(session.source, session.id.clone()))
+        let prompt = session
+            .is_local()
+            .then(|| cached.prompts.get(&(session.source, session.id.clone())))
+            .flatten()
             .cloned()
             .or_else(|| session.title.clone());
         let usage = cached.usage.resolve(session);

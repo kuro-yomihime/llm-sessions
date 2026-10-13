@@ -77,7 +77,10 @@ pub fn report(
                 add(&mut rows, session.updated.date().to_string(), usage);
             }
             Axis::Model => {
-                let models = cached_models.get(&(session.source, session.id.clone()));
+                let models = session
+                    .is_local()
+                    .then(|| cached_models.get(&(session.source, session.id.clone())))
+                    .flatten();
                 if models.is_some_and(|models| !models.is_empty()) {
                     for (model, model_usage) in models.into_iter().flatten() {
                         add(&mut rows, model.clone(), Some(*model_usage));

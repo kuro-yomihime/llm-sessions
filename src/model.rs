@@ -202,15 +202,42 @@ pub enum PathTrust {
     Decoded,
 }
 
+/// Origin-qualified identity; an absent origin is not a canonical identity.
+pub type SessionKey = (Option<String>, SourceId, String);
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct RouteHop {
+    pub origin_id: String,
+    pub name: String,
+    pub ssh: String,
+    /// Configured remote account home; preserved when constructing delegated hosts.
+    #[serde(default)]
+    pub home: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct AccessRoute {
+    /// A zero-hop route explicitly represents direct local access when a
+    /// merged local observation also retains remote alternatives. Forwarding
+    /// prepends the queried peer to every path, including this sentinel.
+    pub hops: Vec<RouteHop>,
+}
+
 /// Tier-1 row. Producing one MUST NOT require parsing message bodies.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
     pub source: SourceId,
-    /// Host the session lives on. `None` is this machine; `Some` is the
-    /// `name` of a configured remote host, not a DNS name.
+    /// Stable identity of the originating host/account namespace.
     #[serde(default)]
-    pub host: Option<String>,
+    pub origin_id: Option<String>,
+    /// Origin display label, never an SSH destination. `None` is local.
+    /// The wire key predates the label/identity split and stays `host`.
+    #[serde(default, rename = "host")]
+    pub origin_label: Option<String>,
+    /// Successful access paths, relative to the instance presenting this row.
+    #[serde(default)]
+    pub routes: Vec<AccessRoute>,
     /// Canonical workspace root, after worktree rollup.
     pub workspace: Option<PathBuf>,
     /// Path exactly as the agent recorded it, before canonicalization.
@@ -255,7 +282,9 @@ impl SessionSummary {
             source,
             updated,
             locator,
-            host: None,
+            origin_label: None,
+            origin_id: None,
+            routes: Vec::new(),
             workspace: None,
             recorded_cwd: None,
             trust: PathTrust::Recorded,
@@ -273,9 +302,29 @@ impl SessionSummary {
         }
     }
 
-    /// Stable cross-source key. Ids collide across agents, never within one.
-    pub fn key(&self) -> (SourceId, &str) {
-        (self.source, self.id.as_str())
+    /// Borrowed origin-qualified identity.
+    pub fn key(&self) -> (Option<&str>, SourceId, &str) {
+        (self.origin_id.as_deref(), self.source, self.id.as_str())
+    }
+
+    pub fn identity(&self) -> SessionKey {
+        (self.origin_id.clone(), self.source, self.id.clone())
+    }
+
+    /// Local access remains preferred even when a merged row also carries
+    /// remote alternatives. An explicit zero-hop route preserves that fact.
+    pub fn is_local(&self) -> bool {
+        self.origin_label.is_none()
+            && (self.routes.is_empty()
+                || self
+                    .preferred_route()
+                    .is_some_and(|route| route.hops.is_empty()))
+    }
+
+    pub fn preferred_route(&self) -> Option<&AccessRoute> {
+        self.routes
+            .iter()
+            .min_by(|a, b| a.hops.len().cmp(&b.hops.len()).then_with(|| a.cmp(b)))
     }
 
     pub fn display_title(&self) -> &str {
@@ -629,5 +678,87 @@ mod tests {
             assert_eq!(source.badge().chars().count(), 4, "badges stay fixed-width");
         }
         assert_eq!(SourceId::parse("not-a-source"), None);
+    }
+
+    #[test]
+    fn legacy_summary_defaults_origin_and_routes_without_changing_agent_identity() {
+        let summary = SessionSummary::new(
+            "agent-id".into(),
+            SourceId::Omp,
+            OffsetDateTime::UNIX_EPOCH,
+            Locator::File {
+                path: "session.jsonl".into(),
+            },
+        );
+        let mut wire = serde_json::to_value(summary).unwrap();
+        wire.as_object_mut().unwrap().remove("origin_id");
+        wire.as_object_mut().unwrap().remove("routes");
+        let mut restored: SessionSummary = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored.origin_id, None);
+        assert!(restored.routes.is_empty());
+        assert!(restored.is_local());
+        restored.origin_id = Some("origin".into());
+        assert_eq!(restored.key(), (Some("origin"), SourceId::Omp, "agent-id"));
+        assert_eq!(
+            restored.identity(),
+            (Some("origin".into()), SourceId::Omp, "agent-id".into())
+        );
+        assert!(
+            restored.is_local(),
+            "known origin identity is independent of access locality"
+        );
+    }
+
+    #[test]
+    fn preferred_route_is_shortest_then_lexical_with_an_explicit_local_path() {
+        let alpha = RouteHop {
+            origin_id: "A".into(),
+            name: "alpha".into(),
+            ssh: "a".into(),
+            home: None,
+        };
+        let beta = RouteHop {
+            origin_id: "B".into(),
+            name: "beta".into(),
+            ssh: "b".into(),
+            home: None,
+        };
+        let direct = AccessRoute {
+            hops: vec![alpha.clone()],
+        };
+        let mut summary = SessionSummary::new(
+            "agent-id".into(),
+            SourceId::Omp,
+            OffsetDateTime::UNIX_EPOCH,
+            Locator::File {
+                path: "session.jsonl".into(),
+            },
+        );
+        summary.routes = vec![
+            AccessRoute {
+                hops: vec![beta.clone(), alpha.clone()],
+            },
+            AccessRoute { hops: vec![beta] },
+            direct.clone(),
+        ];
+        assert_eq!(summary.preferred_route(), Some(&direct));
+        assert!(
+            !summary.is_local(),
+            "remote-only routes prevent observer-local operations"
+        );
+        summary.routes.reverse();
+        assert_eq!(summary.preferred_route(), Some(&direct));
+        let local = AccessRoute { hops: vec![] };
+        summary.routes.push(local.clone());
+        assert_eq!(summary.preferred_route(), Some(&local));
+        assert!(
+            summary.is_local(),
+            "the zero-hop sentinel preserves direct local access"
+        );
+        summary.origin_label = Some("remote".into());
+        assert!(
+            !summary.is_local(),
+            "an empty route cannot override remote origin attribution"
+        );
     }
 }

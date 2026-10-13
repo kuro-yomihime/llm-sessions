@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(session.updated, seconds(1_700_000_100.25));
         assert_eq!(session.created, Some(seconds(1_700_000_000.5)));
         assert!(!session.archived);
-        assert_eq!(session.host, None);
+        assert_eq!(session.origin_label, None);
     }
 
     #[test]

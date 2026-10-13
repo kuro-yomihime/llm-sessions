@@ -28,9 +28,7 @@ pub struct Overlay {
 impl Overlay {
     /// Default location, honouring `$XDG_STATE_HOME`.
     pub fn default_path(home: &Path) -> PathBuf {
-        std::env::var_os("XDG_STATE_HOME")
-            .map_or_else(|| home.join(".local/state"), PathBuf::from)
-            .join("llm-sessions/overlay.db")
+        crate::state_home(home).join("llm-sessions/overlay.db")
     }
 
     pub fn open(path: &Path) -> Result<Self> {

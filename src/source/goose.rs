@@ -29,7 +29,7 @@ pub struct Goose {
 impl Goose {
     pub fn new(home: &Path) -> Self {
         Self {
-            root: home.join(".local/share/goose"),
+            root: crate::data_home(home).join("goose"),
         }
     }
 

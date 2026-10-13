@@ -32,7 +32,7 @@ pub fn eligible(session: &SessionSummary, filters: &Filters<'_>) -> bool {
         return false;
     }
     if let Some(hits) = filters.hits
-        && !hits.contains(&(session.source, session.id.clone()))
+        && (!session.is_local() || !hits.contains(&(session.source, session.id.clone())))
     {
         return false;
     }
@@ -64,8 +64,8 @@ enum Archived {
 #[derive(Clone, Debug)]
 enum Predicate {
     Source(String),
-    /// Machine a session lives on. `local` is this one, anything else is a
-    /// host name from `hosts.json`.
+    /// Origin display label. `local` requires a genuinely local row, not
+    /// merely an absent label on a forwarded row.
     Host(String),
     Workspace(String),
     Model(String),
@@ -165,9 +165,9 @@ impl Query {
                 searchable.push('\n');
             }
             searchable.push_str(session.source.name());
-            if let Some(host) = &session.host {
+            if let Some(origin_label) = &session.origin_label {
                 searchable.push('\n');
-                searchable.push_str(host);
+                searchable.push_str(origin_label);
             }
             let searchable = searchable.to_lowercase();
             if self
@@ -181,11 +181,16 @@ impl Query {
 
         self.predicates.iter().all(|predicate| match predicate {
             Predicate::Source(value) => session.source.name().starts_with(value),
-            Predicate::Host(value) => session
-                .host
-                .as_deref()
-                .unwrap_or("local")
-                .starts_with(value),
+            Predicate::Host(value) => {
+                if session.is_local() {
+                    "local".starts_with(value)
+                } else {
+                    session
+                        .origin_label
+                        .as_deref()
+                        .is_some_and(|host| fold(host).starts_with(value))
+                }
+            }
             Predicate::Workspace(value) => session
                 .workspace
                 .as_ref()
@@ -337,7 +342,9 @@ mod tests {
                 path: PathBuf::from("session.jsonl"),
             },
             liveness: Liveness::Stale,
-            host: None,
+            origin_label: None,
+            origin_id: None,
+            routes: Vec::new(),
         }
     }
 
@@ -379,5 +386,37 @@ mod tests {
         let query = Query::parse("body:naming");
         assert!(query.needs_index());
         assert_eq!(query.body_query().as_deref(), Some("naming"));
+    }
+
+    #[test]
+    fn local_full_text_hits_do_not_match_remote_identity_collisions() {
+        let local = session(SourceId::Omp, "work", "/work");
+        let mut remote = local.clone();
+        remote.origin_label = Some("beta".into());
+        remote.origin_id = Some("remote-origin".into());
+        let query = Query::parse("body:secret");
+        let hits = HashSet::from([(local.source, local.id.clone())]);
+        let filters = Filters {
+            query: &query,
+            hits: Some(&hits),
+            show_archived: true,
+            live_only: false,
+        };
+        assert!(eligible(&local, &filters));
+        assert!(!eligible(&remote, &filters));
+    }
+
+    #[test]
+    fn a_forwarded_row_without_a_display_label_is_not_host_local() {
+        let mut remote = session(SourceId::Omp, "work", "/work");
+        remote.routes.push(crate::model::AccessRoute {
+            hops: vec![crate::model::RouteHop {
+                origin_id: "remote-origin".into(),
+                name: "beta".into(),
+                ssh: "beta".into(),
+                home: None,
+            }],
+        });
+        assert!(!Query::parse("host:local").matches(&remote));
     }
 }

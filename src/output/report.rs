@@ -25,7 +25,7 @@ pub fn expand(template: &str, row: &SessionSummary, home: &Path, fleet: &Fleet) 
         let field = &rest[start + 1..end];
         out.push_str(&match field {
             "liveness" => row.liveness.badge().to_string(),
-            "host" => row.host.clone().unwrap_or_else(|| "local".into()),
+            "host" => row.origin_label.clone().unwrap_or_else(|| "local".into()),
             "pid" => process.map(|p| p.pid.to_string()).unwrap_or_default(),
             "pane" => process
                 .and_then(|p| p.pane.as_ref())

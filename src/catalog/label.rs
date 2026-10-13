@@ -13,25 +13,32 @@
 
 use std::collections::HashMap;
 
-use crate::model::{Label, LabelSource, SessionSummary, SourceId};
+use crate::model::{Label, LabelSource, SessionKey, SessionSummary, SourceId};
 use crate::output::reader::truncate;
 
 /// Longest label worth carrying; the panes truncate further as they see fit.
 const MAX_LEN: usize = 160;
 
-pub type Key = (SourceId, String);
+pub type Key = SessionKey;
 
 /// Label every session, then break ties inside each workspace.
 ///
-/// `prompts` is the index's `first_prompt` cache, keyed like
-/// [`SessionSummary::key`]. Without it the chain simply falls through to the
-/// tool or fallback rungs — labelling never requires parsing a body.
-pub fn assign(sessions: &[SessionSummary], prompts: &HashMap<Key, String>) -> HashMap<Key, Label> {
+/// `prompts` is the local index's `first_prompt` cache, keyed by source and
+/// agent session ID. Remote rows never consult this observer-local cache.
+/// Without a prompt the chain falls through to the fallback rung.
+pub fn assign(
+    sessions: &[SessionSummary],
+    prompts: &HashMap<(SourceId, String), String>,
+) -> HashMap<Key, Label> {
     let mut labels: HashMap<Key, Label> = sessions
         .iter()
         .map(|session| {
-            let key = (session.source, session.id.clone());
-            let prompt = prompts.get(&key).map(String::as_str);
+            let key = session.identity();
+            let prompt = session
+                .is_local()
+                .then(|| prompts.get(&(session.source, session.id.clone())))
+                .flatten()
+                .map(String::as_str);
             (key, derive(session, prompt))
         })
         .collect();
@@ -48,7 +55,7 @@ pub fn derive(session: &SessionSummary, prompt: Option<&str>) -> Label {
             source: LabelSource::Title,
         };
     }
-    if let Some(text) = prompt.and_then(clean) {
+    if let Some(text) = prompt.filter(|_| session.is_local()).and_then(clean) {
         return Label {
             text,
             source: LabelSource::Prompt,
@@ -67,11 +74,11 @@ pub fn derive(session: &SessionSummary, prompt: Option<&str>) -> Label {
 /// every source, so it is not used here — an inconsistent suffix is worse
 /// than a dull one.
 fn disambiguate(sessions: &[SessionSummary], labels: &mut HashMap<Key, Label>) {
-    // Bucket by (workspace, label text) with owned keys, so the pass that
-    // rewrites labels cannot alias the pass that grouped them.
-    let mut buckets: HashMap<(String, String), Vec<Key>> = HashMap::new();
+    // Bucket by (origin, workspace, label text), so a remote namespace never
+    // disambiguates otherwise unrelated local display labels.
+    let mut buckets: HashMap<(Option<String>, String, String), Vec<Key>> = HashMap::new();
     for session in sessions {
-        let key = (session.source, session.id.clone());
+        let key = session.identity();
         let Some(label) = labels.get(&key) else {
             continue;
         };
@@ -81,7 +88,7 @@ fn disambiguate(sessions: &[SessionSummary], labels: &mut HashMap<Key, Label>) {
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
         buckets
-            .entry((workspace, label.text.clone()))
+            .entry((session.origin_id.clone(), workspace, label.text.clone()))
             .or_default()
             .push(key);
     }
@@ -91,7 +98,10 @@ fn disambiguate(sessions: &[SessionSummary], labels: &mut HashMap<Key, Label>) {
             continue;
         }
         for key in keys {
-            let Some(session) = sessions.iter().find(|s| s.source == key.0 && s.id == key.1) else {
+            let Some(session) = sessions
+                .iter()
+                .find(|s| s.key() == (key.0.as_deref(), key.1, key.2.as_str()))
+            else {
                 continue;
             };
             let suffix = session
@@ -157,12 +167,14 @@ mod tests {
                 path: PathBuf::from("/nonexistent"),
             },
             liveness: Liveness::Stale,
-            host: None,
+            origin_label: None,
+            origin_id: None,
+            routes: Vec::new(),
         }
     }
 
     fn key(s: &SessionSummary) -> Key {
-        (s.source, s.id.clone())
+        s.identity()
     }
 
     #[test]
@@ -210,8 +222,60 @@ mod tests {
     fn a_derived_label_never_claims_to_be_a_title() {
         let sessions = vec![session("a", None, "/w")];
         let mut prompts = HashMap::new();
-        prompts.insert(key(&sessions[0]), "do the thing".to_string());
+        prompts.insert(
+            (sessions[0].source, sessions[0].id.clone()),
+            "do the thing".to_string(),
+        );
         let labels = assign(&sessions, &prompts);
         assert_eq!(labels[&key(&sessions[0])].source, LabelSource::Prompt);
+    }
+
+    #[test]
+    fn local_prompts_never_label_remote_rows_with_colliding_agent_ids() {
+        let mut local = session("same", None, "/w");
+        local.origin_id = Some("local-origin".into());
+        let mut remote = local.clone();
+        remote.origin_id = Some("remote-origin".into());
+        remote.origin_label = Some("remote".into());
+        let prompts = HashMap::from([((SourceId::Omp, "same".into()), "local secret".into())]);
+        let labels = assign(&[local.clone(), remote.clone()], &prompts);
+        assert_eq!(labels[&local.identity()].source, LabelSource::Prompt);
+        assert_eq!(labels[&remote.identity()].source, LabelSource::Fallback);
+        assert!(!labels[&remote.identity()].text.contains("local secret"));
+        assert_eq!(
+            derive(&remote, Some("local secret")).source,
+            LabelSource::Fallback
+        );
+
+        // Missing display attribution does not make a routed row local.
+        remote.origin_label = None;
+        remote.routes.push(crate::model::AccessRoute {
+            hops: vec![crate::model::RouteHop {
+                origin_id: "remote-origin".into(),
+                name: "remote".into(),
+                ssh: "remote".into(),
+                home: None,
+            }],
+        });
+        let labels = assign(&[remote.clone()], &prompts);
+        assert_eq!(labels[&remote.identity()].source, LabelSource::Fallback);
+    }
+
+    #[test]
+    fn disambiguation_is_scoped_to_the_origin_not_a_shared_workspace_path() {
+        let mut first = session("a", Some("same title"), "/w");
+        first.origin_id = Some("origin-a".into());
+        let mut elsewhere = session("b", Some("same title"), "/w");
+        elsewhere.origin_id = Some("origin-b".into());
+        elsewhere.origin_label = Some("beta".into());
+        let mut sibling = session("c", Some("same title"), "/w");
+        sibling.origin_id = first.origin_id.clone();
+        let labels = assign(
+            &[first.clone(), elsewhere.clone(), sibling.clone()],
+            &HashMap::new(),
+        );
+        assert_eq!(labels[&first.identity()].text, "same title · a");
+        assert_eq!(labels[&sibling.identity()].text, "same title · c");
+        assert_eq!(labels[&elsewhere.identity()].text, "same title");
     }
 }

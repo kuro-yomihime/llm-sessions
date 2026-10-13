@@ -76,11 +76,14 @@ pub struct UsageCache {
 }
 
 impl UsageCache {
-    /// The session's own tier-1 usage, else what the index cached for it.
+    /// The session's own tier-1 usage, else the local index cache for local rows.
     pub fn resolve(&self, session: &SessionSummary) -> Option<Usage> {
-        session
-            .usage
-            .or_else(|| self.get(session.source, &session.id))
+        session.usage.or_else(|| {
+            session
+                .is_local()
+                .then(|| self.get(session.source, &session.id))
+                .flatten()
+        })
     }
 
     /// Replace every session's usage with [`UsageCache::resolve`]'s answer.
@@ -156,9 +159,7 @@ struct DocumentState {
 impl Index {
     /// Default location, honouring `$XDG_CACHE_HOME`.
     pub fn default_path(home: &Path) -> PathBuf {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map_or_else(|| home.join(".cache"), PathBuf::from)
-            .join("llm-sessions/index.db")
+        crate::cache_home(home).join("llm-sessions/index.db")
     }
 
     /// Open or create the application's own cache database.
@@ -206,6 +207,7 @@ impl Index {
         let started = Instant::now();
         let retained: Vec<&SessionSummary> = sessions
             .iter()
+            .filter(|session| session.is_local())
             .filter(|session| options.since.is_none_or(|since| session.updated >= since))
             .collect();
         let mut stats = RefreshStats {
@@ -1285,5 +1287,131 @@ mod tests {
         assert!(reclaimed > 0);
         assert!(reclaimed < before);
         assert_eq!(index.search("durable", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn usage_cache_is_local_only_even_with_an_absent_remote_display_label() {
+        let cached = Usage {
+            input: 12,
+            output: 34,
+            cost: 5.0,
+        };
+        let mut cache = UsageCache::default();
+        cache.insert(SourceId::Omp, "same".into(), cached);
+        let local = session(SourceId::Omp, "same", OffsetDateTime::UNIX_EPOCH);
+        let mut remote = local.clone();
+        remote.origin_label = Some("beta".into());
+        remote.origin_id = Some("remote-origin".into());
+        assert_eq!(cache.resolve(&local), Some(cached));
+        assert_eq!(cache.resolve(&remote), None);
+        let own_usage = Usage {
+            input: 1,
+            output: 2,
+            cost: 3.0,
+        };
+        remote.usage = Some(own_usage);
+        assert_eq!(cache.resolve(&remote), Some(own_usage));
+        remote.origin_label = None;
+        remote.usage = None;
+        remote.routes.push(crate::model::AccessRoute {
+            hops: vec![crate::model::RouteHop {
+                origin_id: "remote-origin".into(),
+                name: "beta".into(),
+                ssh: "beta".into(),
+                home: None,
+            }],
+        });
+        let mut sessions = vec![local, remote];
+        cache.fill(&mut sessions);
+        assert_eq!(sessions[0].usage, Some(cached));
+        assert_eq!(sessions[1].usage, None);
+    }
+
+    #[test]
+    fn refresh_indexes_only_local_rows_and_ignores_colliding_remote_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(&dir.path().join("index.db")).unwrap();
+        let local = session(SourceId::Omp, "same", OffsetDateTime::UNIX_EPOCH);
+        let mut remote = local.clone();
+        remote.origin_label = Some("beta".into());
+        remote.title = Some("remote snapshot".into());
+        remote.updated += time::Duration::days(1);
+        let sources = vec![source(SourceId::Omp, &[("same", "local secret")])];
+        let stats = index.refresh(&[local, remote], &sources).unwrap();
+        assert_eq!(stats.scanned, 1);
+        assert_eq!(stats.reindexed, 1);
+        let hits = index.search("secret", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title.as_deref(), Some("session same"));
+        assert_eq!(hits[0].updated, OffsetDateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn digest_prompts_and_model_usage_never_cross_into_remote_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(&dir.path().join("index.db")).unwrap();
+        let cached = Usage {
+            input: 12,
+            output: 34,
+            cost: 5.0,
+        };
+        let sources: Vec<Box<dyn Source>> = vec![Box::new(FakeSource {
+            id: SourceId::Omp,
+            bodies: BTreeMap::from([("same".into(), "local secret".into())]),
+            usage: Some(cached),
+            model: Some("local-model".into()),
+            fails: false,
+        })];
+        let mut local = session(SourceId::Omp, "same", OffsetDateTime::UNIX_EPOCH);
+        local.origin_id = Some("local-origin".into());
+        local.workspace = Some("/workspace".into());
+        index
+            .refresh(std::slice::from_ref(&local), &sources)
+            .unwrap();
+        let mut remote = local.clone();
+        remote.origin_id = Some("remote-origin".into());
+        remote.title = Some("remote title".into());
+        remote.model = Some("remote-model".into());
+        remote.routes.push(crate::model::AccessRoute {
+            hops: vec![crate::model::RouteHop {
+                origin_id: "remote-origin".into(),
+                name: "beta".into(),
+                ssh: "beta".into(),
+                home: None,
+            }],
+        });
+        let sessions = vec![local, remote];
+        let digest =
+            crate::output::digest::build(&index, &sessions, OffsetDateTime::UNIX_EPOCH).unwrap();
+        let entries = &digest[0].1;
+        let local_entry = entries
+            .iter()
+            .find(|entry| entry.title.as_deref() != Some("remote title"))
+            .unwrap();
+        let remote_entry = entries
+            .iter()
+            .find(|entry| entry.title.as_deref() == Some("remote title"))
+            .unwrap();
+        assert_eq!(local_entry.prompt.as_deref(), Some("local secret"));
+        assert_eq!(local_entry.usage, Some(cached));
+        assert_eq!(remote_entry.prompt.as_deref(), Some("remote title"));
+        assert_eq!(remote_entry.usage, None);
+
+        let rows = crate::output::usage::report(
+            &index,
+            &sessions,
+            crate::output::usage::Axis::Model,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        let local_row = rows.iter().find(|row| row.key == "local-model").unwrap();
+        let remote_row = rows.iter().find(|row| row.key == "remote-model").unwrap();
+        assert_eq!(local_row.sessions, 1);
+        assert_eq!(local_row.priced, 1);
+        assert_eq!(local_row.usage, cached);
+        assert_eq!(remote_row.sessions, 1);
+        assert_eq!(remote_row.priced, 0);
+        assert!(remote_row.usage.is_zero());
     }
 }

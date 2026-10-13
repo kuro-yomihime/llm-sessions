@@ -31,7 +31,7 @@ pub struct OpenCode {
 impl OpenCode {
     pub fn new(home: &Path) -> Self {
         Self {
-            db: home.join(".local/share/opencode/opencode.db"),
+            db: crate::data_home(home).join("opencode/opencode.db"),
         }
     }
 }

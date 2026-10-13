@@ -409,7 +409,9 @@ mod tests {
             subagent: false,
             change: None,
             liveness: Liveness::Stale,
-            host: None,
+            origin_label: None,
+            origin_id: None,
+            routes: Vec::new(),
         }
     }
 

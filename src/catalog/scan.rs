@@ -18,7 +18,7 @@ use std::thread;
 use time::OffsetDateTime;
 
 use crate::catalog::workspace::Resolver;
-use crate::model::{SessionSummary, SourceId};
+use crate::model::{SessionKey, SessionSummary, SourceId};
 use crate::runtime::live::Fleet;
 use crate::source::Source;
 use crate::source::remote;
@@ -38,9 +38,9 @@ pub struct Scan {
 /// `fleet` attributes running processes to sessions. Without it every session
 /// falls back to mtime-based liveness, which is still correct, just coarser.
 ///
-/// `hosts` are machines reached over SSH. Their rows arrive already keyed to
-/// the host that produced them, and the TUI passes none: it reads a
-/// background cache instead of paying an `ssh` per two-second tick.
+/// `hosts` are machines reached over SSH. Their rows retain origin identity
+/// and explicit access routes. The TUI passes none: it reads a background
+/// cache instead of paying an `ssh` per two-second tick.
 pub fn scan_with(
     sources: &[Box<dyn Source>],
     overlay: Option<&Overlay>,
@@ -95,12 +95,16 @@ pub fn scan_with(
         }
     }
 
+    sessions = crate::catalog::merge::merge(sessions);
+
     if let Some(overlay) = overlay {
         match overlay.archived() {
             Ok(rows) => {
                 let archived: HashSet<(SourceId, String)> = rows.into_iter().collect();
                 for session in &mut sessions {
-                    if archived.contains(&(session.source, session.id.clone())) {
+                    if session.is_local()
+                        && archived.contains(&(session.source, session.id.clone()))
+                    {
                         session.archived = true;
                     }
                 }
@@ -118,7 +122,7 @@ pub fn scan_with(
         // unrelated local directory of the same name. A host that ran its own
         // `llm-sessions` already sent a resolved workspace; the shell transport can
         // only offer what the agent recorded.
-        if session.host.is_some() {
+        if !session.is_local() {
             if session.workspace.is_none() {
                 session.workspace = session.recorded_cwd.clone();
             }
@@ -140,17 +144,17 @@ pub fn scan_with(
     // parent had no file, and the whole instance was therefore invisible in
     // every list — including the fleet view, which is about processes. A row
     // with no parent in the scan has nothing to nest under.
-    let present: HashSet<(SourceId, String)> = sessions
+    let present: HashSet<SessionKey> = sessions
         .iter()
-        .filter(|session| !session.subagent)
-        .map(|session| (session.source, session.id.clone()))
+        .filter(|session| !session.subagent && (session.origin_id.is_some() || session.is_local()))
+        .map(SessionSummary::identity)
         .collect();
     for session in &mut sessions {
         let orphan = session.subagent
-            && session
-                .parent
-                .as_ref()
-                .is_none_or(|id| !present.contains(&(session.source, id.clone())));
+            && (session.origin_id.is_none() && !session.is_local()
+                || session.parent.as_ref().is_none_or(|id| {
+                    !present.contains(&(session.origin_id.clone(), session.source, id.clone()))
+                }));
         if orphan {
             session.subagent = false;
             session.parent = None;
@@ -166,7 +170,7 @@ pub fn scan_with(
     if let Some(fleet) = fleet {
         let mut local = 0;
         for index in 0..sessions.len() {
-            if sessions[index].host.is_none() {
+            if sessions[index].is_local() {
                 sessions.swap(local, index);
                 local += 1;
             }
@@ -182,6 +186,8 @@ pub fn scan_with(
             .then_with(|| b.updated.cmp(&a.updated))
             .then_with(|| a.source.cmp(&b.source))
             .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.origin_id.cmp(&b.origin_id))
+            .then_with(|| a.preferred_route().cmp(&b.preferred_route()))
     });
     Scan { sessions, failures }
 }
@@ -233,7 +239,9 @@ mod tests {
             subagent,
             change: None,
             liveness: Liveness::Stale,
-            host: None,
+            origin_label: None,
+            origin_id: None,
+            routes: Vec::new(),
         }
     }
 
@@ -305,7 +313,7 @@ mod tests {
         local.recorded_cwd = Some(dir.path().to_path_buf());
 
         let mut far = row("far", None, false);
-        far.host = Some("nx-1".into());
+        far.origin_label = Some("nx-1".into());
         far.recorded_cwd = Some(PathBuf::from("/var/lib/hermes/work"));
         far.liveness = Liveness::Live { pid: 9 };
 
@@ -325,11 +333,96 @@ mod tests {
             "a remote row keeps what its agent recorded"
         );
         assert_eq!(of("far").liveness, Liveness::Live { pid: 9 });
-        assert_eq!(of("far").host.as_deref(), Some("nx-1"));
+        assert_eq!(of("far").origin_label.as_deref(), Some("nx-1"));
         assert_eq!(
             of("local").workspace,
             Some(Resolver::new().resolve(dir.path())),
             "and a local row in the same scan is still resolved"
         );
+    }
+
+    #[test]
+    fn parent_relationships_require_the_same_origin_and_source() {
+        let mut parent = row("parent", None, false);
+        parent.origin_id = Some("origin-a".into());
+        let mut wrong_origin = row("wrong-origin", Some("parent"), true);
+        wrong_origin.origin_id = Some("origin-b".into());
+        wrong_origin.origin_label = Some("beta".into());
+        let mut wrong_source = row("wrong-source", Some("parent"), true);
+        wrong_source.origin_id = parent.origin_id.clone();
+        wrong_source.source = SourceId::Claude;
+        let mut child = row("child", Some("parent"), true);
+        child.origin_id = parent.origin_id.clone();
+        child.origin_label = Some("forwarder".into());
+        let sources: Vec<Box<dyn Source>> = vec![Box::new(Fake(vec![
+            parent,
+            wrong_origin,
+            wrong_source,
+            child,
+        ]))];
+        let scan = scan_with(&sources, None, None, &[]);
+        let of = |id: &str| {
+            scan.sessions
+                .iter()
+                .find(|session| session.id == id)
+                .unwrap()
+        };
+        assert!(!of("wrong-origin").subagent);
+        assert_eq!(of("wrong-origin").parent, None);
+        assert!(!of("wrong-source").subagent);
+        assert_eq!(of("wrong-source").parent, None);
+        assert!(
+            of("child").subagent,
+            "route/display label is not parent identity"
+        );
+        assert_eq!(of("child").parent.as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn unknown_remote_parents_cannot_capture_local_children_or_each_other() {
+        let mut remote_parent = row("parent", None, false);
+        remote_parent.origin_label = Some("beta".into());
+        let local_child = row("local-child", Some("parent"), true);
+        let mut remote_child = row("remote-child", Some("parent"), true);
+        remote_child.origin_label = Some("beta".into());
+        let sources: Vec<Box<dyn Source>> = vec![Box::new(Fake(vec![
+            remote_parent,
+            local_child,
+            remote_child,
+        ]))];
+        let scan = scan_with(&sources, None, None, &[]);
+        assert!(scan.sessions.iter().all(|session| !session.subagent));
+        assert!(scan.sessions.iter().all(|session| session.parent.is_none()));
+    }
+
+    #[test]
+    fn local_archive_overlay_does_not_leak_to_remote_identity_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = Overlay::open(&dir.path().join("overlay.db")).unwrap();
+        overlay.set_archived(SourceId::Omp, "same", true).unwrap();
+        let mut local = row("same", None, false);
+        local.origin_id = Some("origin-a".into());
+        let mut remote = local.clone();
+        remote.origin_id = Some("origin-b".into());
+        remote.origin_label = Some("beta".into());
+        let mut route_only = local.clone();
+        route_only.origin_id = Some("origin-c".into());
+        route_only.routes.push(crate::model::AccessRoute {
+            hops: vec![crate::model::RouteHop {
+                origin_id: "origin-c".into(),
+                name: "gamma".into(),
+                ssh: "gamma".into(),
+                home: None,
+            }],
+        });
+        let sources: Vec<Box<dyn Source>> = vec![Box::new(Fake(vec![local, remote, route_only]))];
+        let scan = scan_with(&sources, Some(&overlay), None, &[]);
+        assert_eq!(scan.sessions.len(), 3);
+        for session in scan.sessions {
+            assert_eq!(
+                session.archived,
+                session.origin_id.as_deref() == Some("origin-a")
+            );
+        }
     }
 }

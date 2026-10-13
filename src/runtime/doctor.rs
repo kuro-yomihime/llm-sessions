@@ -272,7 +272,7 @@ fn check_dead_paths(sessions: &[SessionSummary], findings: &mut Vec<Finding>) {
 }
 
 fn check_locks(home: &Path, proc_root: &Path, findings: &mut Vec<Finding>) {
-    let devin = home.join(".local/share/devin/cli/session_locks");
+    let devin = crate::data_home(home).join("devin/cli/session_locks");
     let locks = directory_entries(&devin, "stale locks", findings).unwrap_or_default();
     for lock in locks {
         let path = lock.path();
@@ -377,7 +377,7 @@ fn check_locks(home: &Path, proc_root: &Path, findings: &mut Vec<Finding>) {
 fn check_wals(home: &Path, proc_root: &Path, findings: &mut Vec<Finding>) {
     let roots = [
         (home.join(".omp/agent"), "omp"),
-        (home.join(".local/share/opencode"), "opencode"),
+        (crate::data_home(home).join("opencode"), "opencode"),
     ];
     let processes = match list_processes(proc_root) {
         Ok(processes) => Some(processes),
@@ -930,7 +930,9 @@ mod tests {
             subagent: false,
             change: None,
             liveness: Liveness::Stale,
-            host: None,
+            origin_label: None,
+            origin_id: None,
+            routes: Vec::new(),
             usage: None,
             size_bytes: None,
             locator: Locator::File {

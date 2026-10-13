@@ -33,7 +33,7 @@ pub struct Kilo {
 
 impl Kilo {
     pub fn new(home: &Path) -> Self {
-        let root = home.join(".local/share/kilo");
+        let root = crate::data_home(home).join("kilo");
         Self {
             db: root.join("kilo.db"),
             storage: root.join("storage"),
