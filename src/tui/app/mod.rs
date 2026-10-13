@@ -12,7 +12,7 @@ use crate::catalog::label;
 use crate::catalog::query::{Filters, Query};
 use crate::catalog::scan::{Scan, scan_with};
 use crate::clock;
-use crate::model::{Label, Locator, SessionSummary, SourceId, Transcript};
+use crate::model::{Label, Locator, SessionKey, SessionSummary, SourceId, Transcript};
 use crate::output::reader::{RenderedLine, fit, plural, render};
 use crate::runtime::live::{Activity, Fleet};
 use crate::source::Source;
@@ -63,7 +63,7 @@ pub enum Prompt {
     },
     /// Insert mode: one message for `target`'s agent, sent on Enter.
     Insert {
-        target: (SourceId, String),
+        target: SessionKey,
         text: String,
     },
 }
@@ -153,6 +153,8 @@ struct Fingerprint {
 pub struct App {
     home: PathBuf,
     sources: Vec<Box<dyn Source>>,
+    local_origin: Option<String>,
+    local_origin_failure: Option<String>,
     overlay: Option<Overlay>,
     index: Option<Index>,
     fleet: Fleet,
@@ -174,7 +176,7 @@ pub struct App {
     /// First user prompt per session, from the index; feeds label derivation.
     prompts: HashMap<(SourceId, String), String>,
     /// Display name per session, with the rung of the chain that produced it.
-    labels: HashMap<(SourceId, String), Label>,
+    labels: HashMap<SessionKey, Label>,
 
     grouping: Grouping,
     show_archived: bool,
@@ -190,17 +192,17 @@ pub struct App {
     group_sel: usize,
     visible: Vec<Row>,
     session_sel: usize,
-    marked: HashSet<(SourceId, String)>,
+    marked: HashSet<SessionKey>,
     /// Whole groups selected with `V`; keyed like [`Group::key`].
     marked_groups: HashSet<Option<String>>,
     /// Sessions whose fork tree `F` has hidden. Keyed by identity, not row
     /// position, so a refilter, regroup or rescan cannot move a fold onto a
     /// different session. Session-lifetime only: nothing is written to disk.
-    collapsed: HashSet<(SourceId, String)>,
+    collapsed: HashSet<SessionKey>,
 
     focus: Pane,
     transcript: Option<Transcript>,
-    transcript_key: Option<(SourceId, String)>,
+    transcript_key: Option<SessionKey>,
     transcript_print: Option<Fingerprint>,
     rendered: Vec<RenderedLine>,
     scroll: usize,
@@ -239,12 +241,45 @@ impl App {
     pub fn new(
         home: &Path,
         sources: Vec<Box<dyn Source>>,
+        sessions: Vec<SessionSummary>,
+        failures: Vec<String>,
+        overlay: Option<Overlay>,
+        index: Option<Index>,
+        fleet: Fleet,
+    ) -> Self {
+        Self::new_with_mode(
+            home, sources, sessions, failures, overlay, index, fleet, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_mode(
+        home: &Path,
+        sources: Vec<Box<dyn Source>>,
         mut sessions: Vec<SessionSummary>,
         mut failures: Vec<String>,
         overlay: Option<Overlay>,
         index: Option<Index>,
         fleet: Fleet,
+        read_only: bool,
     ) -> Self {
+        #[cfg(not(test))]
+        let origin = if read_only {
+            crate::federation::read_origin(home)
+        } else {
+            crate::federation::ensure_origin(home)
+        };
+        // Synthetic test homes must not create state on the workstation.
+        #[cfg(test)]
+        let origin: crate::Result<String> = Ok("9c66d120-48bf-44c5-a129-6d8d45c3e2a8".into());
+        let (local_origin, local_origin_failure) = match origin {
+            Ok(origin) => (Some(origin), None),
+            Err(error) => (None, Some(format!("local origin: {error}"))),
+        };
+        failures.extend(local_origin_failure.iter().cloned());
+        for session in sessions.iter_mut().filter(|session| session.is_local()) {
+            session.origin_id.clone_from(&local_origin);
+        }
         // The index already caches every session's first prompt for the
         // digest; labelling reuses it rather than opening a single body.
         let cached = index
@@ -275,9 +310,12 @@ impl App {
         failures.extend(alias_failure);
         cache.poll(true);
         sessions.extend(cache.sessions().iter().cloned());
+        sessions = crate::catalog::merge::merge(sessions);
         let mut app = Self {
             home: home.to_path_buf(),
             sources,
+            local_origin,
+            local_origin_failure,
             overlay,
             index,
             fleet,
@@ -325,7 +363,7 @@ impl App {
             help_scroll: 0,
             help_viewport: 20,
             help_max_scroll: 0,
-            read_only: false,
+            read_only,
             quit: false,
             resume: None,
             deliveries: Vec::new(),
@@ -482,7 +520,7 @@ impl App {
     /// derived name never passes as one the agent chose.
     pub fn label(&self, session: &SessionSummary) -> Label {
         self.labels
-            .get(&(session.source, session.id.clone()))
+            .get(&session.identity())
             .cloned()
             .unwrap_or_else(|| label::derive(session, None))
     }
@@ -500,6 +538,9 @@ impl App {
         &self,
         session: &SessionSummary,
     ) -> Option<(&crate::runtime::live::Process, Activity)> {
+        if !session.is_local() {
+            return None;
+        }
         let pid = session.liveness.pid()?;
         let process = self.fleet.get(pid)?;
         Some((process, process.activity))
@@ -581,8 +622,18 @@ impl App {
         let selected = self.selected_session().map(owned_key);
 
         self.sessions = sessions;
+        for session in self
+            .sessions
+            .iter_mut()
+            .filter(|session| session.is_local())
+        {
+            session.origin_id.clone_from(&self.local_origin);
+        }
         self.sessions.extend(self.remote.sessions().iter().cloned());
+        self.sessions = crate::catalog::merge::merge(std::mem::take(&mut self.sessions));
         self.failures = failures;
+        self.failures
+            .extend(self.local_origin_failure.iter().cloned());
         self.failures.extend(self.remote.failures().iter().cloned());
         self.apply_cached_usage();
         self.regroup();
@@ -913,8 +964,13 @@ impl App {
             self.status = Some("read-only refuses saving bookmarks".into());
             return;
         }
+        if session.origin_id.is_none() {
+            self.status = Some("cannot bookmark: canonical origin identity is unavailable".into());
+            return;
+        }
         let bookmark = crate::storage::alias::Bookmark {
-            host: session.host.clone(),
+            origin_id: session.origin_id.clone(),
+            host: session.origin_label.clone(),
             source: session.source,
             id: session.id.clone(),
             view: self.grouping.label().to_owned(),
@@ -940,7 +996,8 @@ impl App {
         // same axis the bookmark was saved under.
         self.show(Grouping::from_label(&bookmark.view));
         let Some(index) = self.sessions.iter().position(|session| {
-            session.host == bookmark.host
+            bookmark.origin_id.is_some()
+                && session.origin_id == bookmark.origin_id
                 && session.source == bookmark.source
                 && session.id == bookmark.id
         }) else {
@@ -1025,7 +1082,7 @@ impl App {
         }
     }
 
-    fn composing(&mut self, action: Action, target: (SourceId, String), mut text: String) {
+    fn composing(&mut self, action: Action, target: SessionKey, mut text: String) {
         match action {
             Action::Char(c) => {
                 text.push(c);
@@ -1250,7 +1307,10 @@ impl App {
         self.sessions
             .iter()
             .filter(|child| {
-                child.subagent && child.source == source && child.parent.as_deref() == Some(&id)
+                child.subagent
+                    && child.origin_id == session.origin_id
+                    && child.source == source
+                    && child.parent.as_deref() == Some(&id)
             })
             .filter_map(|child| {
                 child
@@ -1270,7 +1330,8 @@ impl App {
         else {
             return false;
         };
-        self.jump_to(&target);
+        let origin = self.transcript_key.as_ref().and_then(|key| key.0.clone());
+        self.jump_to(&(origin, target.0, target.1));
         true
     }
 
@@ -1278,13 +1339,13 @@ impl App {
     ///
     /// False when it is filtered out of the current view: widening the view
     /// silently would be worse than saying so.
-    fn jump_to(&mut self, target: &(SourceId, String)) -> bool {
+    fn jump_to(&mut self, target: &SessionKey) -> bool {
         let Some(position) = self
             .visible
             .iter()
             .position(|row| owned_key(&self.sessions[row.index]) == *target)
         else {
-            self.status = Some(format!("{} {} is not in this view", target.0, target.1));
+            self.status = Some(format!("{} {} is not in this view", target.1, target.2));
             return false;
         };
         self.session_sel = position;
@@ -1336,7 +1397,7 @@ impl App {
         Some(row)
     }
 
-    fn set_fold(&mut self, key: &(SourceId, String), fold: bool) {
+    fn set_fold(&mut self, key: &SessionKey, fold: bool) {
         if fold {
             self.collapsed.insert(key.clone());
         } else {
@@ -1364,7 +1425,7 @@ impl App {
                 session
                     .parent
                     .as_ref()
-                    .map(|parent| (session.source, parent.clone()))
+                    .map(|parent| (session.origin_id.clone(), session.source, parent.clone()))
             }));
         self.refilter();
     }
@@ -1422,7 +1483,7 @@ impl App {
     }
 
     /// Every session a marked group owns, whatever the current filter shows.
-    fn group_members(&self) -> Vec<(SourceId, String)> {
+    fn group_members(&self) -> Vec<SessionKey> {
         if self.marked_groups.is_empty() {
             return Vec::new();
         }
@@ -1441,12 +1502,17 @@ impl App {
 
     /// What an archive action would touch: marked groups, then marked rows,
     /// and only if neither exists, the row under the cursor.
-    fn targets(&self) -> Vec<(SourceId, String)> {
-        let mut keys: HashSet<(SourceId, String)> = self.group_members().into_iter().collect();
+    fn targets(&self) -> Vec<SessionKey> {
+        let mut keys: HashSet<SessionKey> = self.group_members().into_iter().collect();
         keys.extend(self.marked.iter().cloned());
         if keys.is_empty() {
             keys.extend(self.selected_session().map(owned_key));
         }
+        keys.retain(|key| {
+            self.sessions
+                .iter()
+                .any(|session| session.is_local() && session.identity() == *key)
+        });
         let mut keys: Vec<_> = keys.into_iter().collect();
         keys.sort();
         keys
@@ -1462,10 +1528,10 @@ impl App {
         let count = self
             .targets()
             .iter()
-            .filter(|(source, id)| {
+            .filter(|key| {
                 self.sessions
                     .iter()
-                    .any(|s| s.source == *source && s.id == *id && s.archived != archive)
+                    .any(|s| s.is_local() && s.identity() == **key && s.archived != archive)
             })
             .count();
         if count == 0 {
@@ -1529,6 +1595,12 @@ fn shift(current: usize, delta: isize, len: usize) -> usize {
 
 /// Has the body changed? A `stat` for files; the scanned timestamp otherwise.
 fn fingerprint(session: &SessionSummary) -> Option<Fingerprint> {
+    if !session.is_local() {
+        return Some(Fingerprint {
+            len: session.size_bytes.unwrap_or(0),
+            stamp: session.updated.unix_timestamp_nanos(),
+        });
+    }
     match &session.locator {
         Locator::File { path } => {
             let meta = std::fs::metadata(path).ok()?;

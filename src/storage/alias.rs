@@ -16,8 +16,10 @@ use crate::model::SourceId;
 /// Everything needed to put the user back where they stood.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bookmark {
-    /// Host name from `hosts.json`; `None` is this machine. Ids collide
-    /// across machines, so the bookmark without a host is ambiguous.
+    /// Canonical origin identity; legacy bookmarks without it cannot resolve.
+    #[serde(default)]
+    pub origin_id: Option<String>,
+    /// Optional display label, never used to resolve a bookmark.
     #[serde(default)]
     pub host: Option<String>,
     pub source: SourceId,
@@ -37,9 +39,7 @@ pub struct Store {
 
 impl Store {
     pub fn default_path(home: &Path) -> PathBuf {
-        std::env::var_os("XDG_STATE_HOME")
-            .map_or_else(|| home.join(".local/state"), PathBuf::from)
-            .join("llm-sessions/aliases.json")
+        crate::state_home(home).join("llm-sessions/aliases.json")
     }
 
     /// Absent file means no bookmarks, not an error; an unreadable one is
@@ -94,6 +94,7 @@ mod tests {
             marks: BTreeMap::from([(
                 'a',
                 Bookmark {
+                    origin_id: Some("9c66d120-48bf-44c5-a129-6d8d45c3e2a8".into()),
                     host: Some("nx-1".into()),
                     source: SourceId::Omp,
                     id: "01a0".into(),
@@ -117,6 +118,16 @@ mod tests {
         let (store, failure) = Store::load_at(&path);
         assert!(store.marks.is_empty());
         assert!(failure.is_some());
+    }
+
+    #[test]
+    fn legacy_display_only_bookmarks_have_no_canonical_identity() {
+        let bookmark: Bookmark = serde_json::from_str(
+            r#"{"host":"nx-1","source":"omp","id":"same","view":"host","focus":"t"}"#,
+        )
+        .unwrap();
+        assert_eq!(bookmark.origin_id, None);
+        assert_eq!(bookmark.host.as_deref(), Some("nx-1"));
     }
 
     #[test]

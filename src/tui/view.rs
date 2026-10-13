@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 
 use crate::catalog::query::{Filters, eligible};
 use crate::catalog::workspace;
-use crate::model::{Change, SessionSummary, SourceId, Usage};
+use crate::model::{Change, SessionKey, SessionSummary, SourceId, Usage};
 use crate::runtime::live::Fleet;
 
 /// Half-life of the workspace recency score, in days. Raw counts let `/tmp`
@@ -175,9 +175,9 @@ pub struct Row {
     pub folded: bool,
 }
 
-/// Row identity: the pair every keyed view structure agrees on.
-pub fn owned_key(session: &SessionSummary) -> (SourceId, String) {
-    (session.source, session.id.clone())
+/// Origin-qualified row identity shared with discovery and transcript caches.
+pub fn owned_key(session: &SessionSummary) -> SessionKey {
+    session.identity()
 }
 
 /// Sessions eligible for the current view.
@@ -189,17 +189,16 @@ pub fn candidates<'a>(
     sessions: &'a [SessionSummary],
     filters: &Filters<'_>,
 ) -> impl Iterator<Item = (usize, &'a SessionSummary)> {
-    let visible_parents: HashSet<(SourceId, &str)> = sessions
+    let visible_parents: HashSet<(Option<&str>, SourceId, &str)> = sessions
         .iter()
         .filter(|s| !s.subagent && eligible(s, filters))
-        .map(|s| (s.source, s.id.as_str()))
+        .map(SessionSummary::key)
         .collect();
     sessions.iter().enumerate().filter(move |(_, s)| {
         if s.subagent {
-            return s
-                .parent
-                .as_deref()
-                .is_some_and(|id| visible_parents.contains(&(s.source, id)));
+            return s.parent.as_deref().is_some_and(|id| {
+                visible_parents.contains(&(s.origin_id.as_deref(), s.source, id))
+            });
         }
         eligible(s, filters)
     })
@@ -224,9 +223,9 @@ fn fleet_pid(session: &SessionSummary, sessions: &[SessionSummary]) -> Option<u3
             return None;
         }
         let parent = current.parent.as_deref()?;
-        current = sessions
-            .iter()
-            .find(|s| s.source == current.source && s.id == parent)?;
+        current = sessions.iter().find(|s| {
+            s.origin_id == current.origin_id && s.source == current.source && s.id == parent
+        })?;
     }
     None
 }
@@ -236,9 +235,14 @@ pub fn group_key(
     grouping: Grouping,
     sessions: &[SessionSummary],
 ) -> Option<String> {
-    // Hosts qualify the path-based keys, or `/var/lib/hermes` on two
-    // nodes merges into one project that exists on neither.
-    let host = session.host.clone().unwrap_or_else(|| "local".into());
+    // Canonical origins qualify groups; display labels are not identities.
+    let host = session.origin_id.clone().unwrap_or_else(|| {
+        if session.is_local() {
+            "local".into()
+        } else {
+            format!("unknown:{:?}", session.routes)
+        }
+    });
     match grouping {
         Grouping::Timeline => None,
         Grouping::Agent => Some(session.source.name().to_string()),
@@ -259,10 +263,7 @@ pub fn group_key(
         // whole point of the view is "what is this instance doing", and
         // that includes the children it already finished. A remote pid is
         // prefixed with its host, because two machines each have a pid 42.
-        Grouping::Fleet => Some(match (&session.host, fleet_pid(session, sessions)?) {
-            (Some(host), pid) => format!("{host}:{pid}"),
-            (None, pid) => pid.to_string(),
-        }),
+        Grouping::Fleet => Some(format!("{host}:{}", fleet_pid(session, sessions)?)),
         Grouping::Workspace => Some(format!(
             "{host}\u{1f}{}",
             session
@@ -283,17 +284,26 @@ fn group_label(
 ) -> String {
     match (grouping, key) {
         (Grouping::Timeline, _) | (_, None) => "all sessions".to_string(),
-        (Grouping::Agent | Grouping::Host, Some(name)) => name.to_string(),
+        (Grouping::Agent, Some(name)) => name.to_string(),
+        (Grouping::Host, Some(_)) => session
+            .origin_label
+            .clone()
+            .unwrap_or_else(|| "local".into()),
         (Grouping::Fleet, Some(pid)) => {
+            let pid = pid.rsplit_once(':').map_or(pid, |(_, pid)| pid);
+            let origin = session.origin_label.as_deref().unwrap_or("");
+            let separator = if session.origin_label.is_some() {
+                ":"
+            } else {
+                ""
+            };
             let place = session
                 .workspace
                 .as_deref()
                 .map_or_else(|| "?".into(), |p| workspace::display(p, home));
             // A pane address is this machine's tmux state; a remote row
             // must not claim an unrelated local pane that shares the pid.
-            let pane = if session.host.is_some() {
-                String::new()
-            } else {
+            let pane = if session.is_local() {
                 session
                     .liveness
                     .pid()
@@ -301,12 +311,14 @@ fn group_label(
                     .and_then(|process| process.pane.as_ref())
                     .map(|pane| format!(" [{}]", pane.address))
                     .unwrap_or_default()
+            } else {
+                String::new()
             };
             // The pid is what distinguishes two instances of the same
             // agent in the same project, so it leads: this is the
             // narrowest pane, and the tail is what truncation eats.
             format!(
-                "{} pid {pid} · {place}{pane}",
+                "{} pid {origin}{separator}{pid} · {place}{pane}",
                 session.source.badge().trim_end()
             )
         }
@@ -315,7 +327,7 @@ fn group_label(
                 .workspace
                 .as_deref()
                 .map_or_else(|| "(unattributed)".into(), |p| workspace::display(p, home));
-            let place = match &session.host {
+            let place = match &session.origin_label {
                 Some(host) => format!("{place} · {host}"),
                 None => place,
             };
@@ -324,18 +336,15 @@ fn group_label(
                 None => place,
             }
         }
-        // The key is `host \u{1f} path`; local groups render exactly as
-        // they always did, remote ones get the machine named.
-        (Grouping::Workspace, Some(key)) => {
-            let (host, path) = key.split_once('\u{1f}').unwrap_or(("local", key));
-            let place = if path.is_empty() {
-                "(unattributed)".to_string()
-            } else {
-                workspace::display(Path::new(path), home)
-            };
-            match host {
-                "local" => place,
-                host => format!("{place} · {host}"),
+        // Identity keys stay separate from the human-readable origin label.
+        (Grouping::Workspace, Some(_)) => {
+            let place = session.workspace.as_deref().map_or_else(
+                || "(unattributed)".to_string(),
+                |path| workspace::display(path, home),
+            );
+            match session.origin_label.as_deref() {
+                None => place,
+                Some(host) => format!("{place} · {host}"),
             }
         }
     }
@@ -433,12 +442,10 @@ pub fn members(
 pub fn tree(
     sessions: &[SessionSummary],
     members: &[usize],
-    collapsed: &HashSet<(SourceId, String)>,
+    collapsed: &HashSet<SessionKey>,
 ) -> Vec<Row> {
-    let present: std::collections::HashMap<(SourceId, &str), usize> = members
-        .iter()
-        .map(|&i| ((sessions[i].source, sessions[i].id.as_str()), i))
-        .collect();
+    let present: std::collections::HashMap<(Option<&str>, SourceId, &str), usize> =
+        members.iter().map(|&i| (sessions[i].key(), i)).collect();
 
     let mut children: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
@@ -448,7 +455,11 @@ pub fn tree(
         let parent = session
             .parent
             .as_deref()
-            .and_then(|id| present.get(&(session.source, id)).copied())
+            .and_then(|id| {
+                present
+                    .get(&(session.origin_id.as_deref(), session.source, id))
+                    .copied()
+            })
             .filter(|&parent| parent != index);
         match parent {
             Some(parent) => children.entry(parent).or_default().push(index),
@@ -485,7 +496,7 @@ fn push_subtree(
     children: &std::collections::HashMap<usize, Vec<usize>>,
     out: &mut Vec<Row>,
     seen: &mut HashSet<usize>,
-    collapsed: &HashSet<(SourceId, String)>,
+    collapsed: &HashSet<SessionKey>,
 ) {
     if !seen.insert(index) {
         return;

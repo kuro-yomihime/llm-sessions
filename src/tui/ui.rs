@@ -518,8 +518,8 @@ fn session_item(row: Row, app: &App, width: usize, now: time::OffsetDateTime) ->
     let mut detail = vec![session.source.to_string(), when(session.updated, now)];
     // A remote row names its host; a local row shows nothing, and the
     // absence is the "this machine" signal.
-    if let Some(host) = &session.host {
-        detail.push(host.clone());
+    if let Some(origin_label) = &session.origin_label {
+        detail.push(origin_label.clone());
     }
     if session.archived {
         detail.push("archived".to_owned());
@@ -889,7 +889,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // The end of the message is where typing happens, so a long one
         // loses its head, not the cursor.
         Prompt::Insert { target, text } => {
-            let head = format!("Message to {}: ", target.0);
+            let head = format!("Message to {}: ", target.1);
             let room = width.saturating_sub(Span::raw(head.as_str()).width() + 1);
             (
                 Span::styled(format!("{head}{}_", tail_cells(text, room)), cyan),

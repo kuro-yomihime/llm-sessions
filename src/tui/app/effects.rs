@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::model::{ArchiveOutcome, Liveness, SessionSummary, SourceId};
+use crate::model::{ArchiveOutcome, Liveness, SessionKey, SessionSummary};
 use crate::output::reader::plural;
 use crate::runtime::{insert, tmux};
 use crate::tui::app::{App, Prompt, fingerprint};
@@ -17,11 +17,12 @@ impl App {
         let mut overlaid = 0usize;
         let mut errors = Vec::new();
 
-        for (source_id, id) in &targets {
+        for key in &targets {
+            let (_, source_id, id) = key;
             let Some(position) = self
                 .sessions
                 .iter()
-                .position(|s| s.source == *source_id && s.id == *id)
+                .position(|s| s.is_local() && s.identity() == *key)
             else {
                 continue;
             };
@@ -112,26 +113,7 @@ impl App {
             .selected_session()
             .ok_or_else(|| "no session selected to resume".to_owned())?;
         let source_id = session.source;
-        let id = session.id.clone();
-        let host = session.host.clone();
-        let inner =
-            crate::source::find(&self.sources, source_id).and_then(|s| s.resume_command(&id));
-        let command = match (host, inner) {
-            // A remote session resumes through its host: the argv is the same
-            // one the local agent understands, wrapped in an inspectable `ssh -t`.
-            (Some(host), Some(inner)) => {
-                let mut command = vec!["ssh".into(), "-t".into()];
-                command.push(
-                    self.remote
-                        .host(&host)
-                        .map_or_else(|| host.clone(), |config| config.ssh.clone()),
-                );
-                command.extend(inner);
-                Some(command)
-            }
-            (None, inner) => inner,
-            (Some(_), None) => None,
-        };
+        let command = crate::source::remote::resume_command(session, &self.sources);
         command.ok_or_else(|| format!("{source_id} has no resume command"))
     }
 }
@@ -152,14 +134,14 @@ impl App {
             return;
         }
         self.prompt = Prompt::Insert {
-            target: (session.source, session.id.clone()),
+            target: session.identity(),
             text: String::new(),
         };
     }
 
     /// The route is chosen again on send: the session may have gone live,
     /// or gone quiet, while the message was being typed.
-    pub(super) fn send_insert(&mut self, target: &(SourceId, String), text: &str) {
+    pub(super) fn send_insert(&mut self, target: &SessionKey, text: &str) {
         let message = text.trim();
         if message.is_empty() {
             self.status = Some("empty message; nothing sent".into());
@@ -168,7 +150,7 @@ impl App {
         let Some(session) = self
             .sessions
             .iter()
-            .find(|s| s.host.is_none() && s.source == target.0 && s.id == target.1)
+            .find(|s| s.is_local() && s.identity() == *target)
         else {
             self.status = Some("that session is gone; nothing sent".into());
             return;
@@ -206,7 +188,7 @@ impl App {
         if self.read_only {
             return Err("--read-only: refusing to send messages".into());
         }
-        if session.host.is_some() {
+        if !session.is_local() {
             return Err("insert mode sends to local sessions only".into());
         }
         if session.subagent {
@@ -272,6 +254,7 @@ impl App {
         }
         let Some(pane) = self
             .selected_session()
+            .filter(|session| session.is_local())
             .and_then(|session| session.liveness.pid())
             .and_then(|pid| self.fleet.get(pid))
             .and_then(|process| process.pane.as_ref())
@@ -385,7 +368,7 @@ impl App {
 }
 
 impl App {
-    pub(super) fn open_selected(&mut self, key: (SourceId, String)) {
+    pub(super) fn open_selected(&mut self, key: SessionKey) {
         let Some(session) = self.selected_session() else {
             return;
         };
@@ -394,7 +377,11 @@ impl App {
         // here would read a local file of the same name, or fail claiming the
         // host's store is unreadable. The host transport owns this body, and
         // it costs an ssh round trip, so it runs off-thread.
-        if let Some(host) = session.host.clone() {
+        if !session.is_local() {
+            let host = session
+                .origin_label
+                .clone()
+                .unwrap_or_else(|| "remote".into());
             let session = session.clone();
             self.transcript = None;
             self.transcript_key = Some(key);

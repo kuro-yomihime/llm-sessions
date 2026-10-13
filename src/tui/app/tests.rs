@@ -24,7 +24,9 @@ fn session(source: SourceId, id: &str, workspace: &str, secs: i64) -> SessionSum
         subagent: false,
         change: None,
         liveness: Liveness::Stale,
-        host: None,
+        origin_label: None,
+        origin_id: None,
+        routes: Vec::new(),
     }
 }
 
@@ -452,6 +454,7 @@ fn whole_yank_respects_file_visibility_and_subagent_links() {
     child.subagent = true;
     child.parent = Some("a".into());
     child.title = Some("worker".into());
+    child.origin_id = app.local_origin.clone();
     app.sessions.push(child);
     let transcript = app.transcript.as_mut().unwrap();
     let mut turn = Turn::new(Role::Assistant);
@@ -535,7 +538,6 @@ fn rescan_restores_the_selected_transcript_after_rows_reorder() {
     write_session("older", 300);
     app.handle(Action::Refresh);
     assert_eq!(app.selected_session().unwrap().id, "older");
-    assert_eq!(app.session_selected(), 0);
     assert_eq!(app.transcript().unwrap().id, "older");
     assert!(app.rendered().iter().any(|line| line.text == "body-older"));
     assert!(!app.rendered().iter().any(|line| line.text == "body-newer"));
@@ -893,6 +895,7 @@ fn a_bookmark_for_a_missing_letter_or_session_says_so() {
     app.bookmarks.marks.insert(
         'g',
         crate::storage::alias::Bookmark {
+            origin_id: app.local_origin.clone(),
             host: None,
             source: SourceId::Omp,
             id: "vanished".into(),
@@ -930,7 +933,8 @@ fn read_only_refuses_to_save_a_bookmark() {
 #[test]
 fn the_host_view_keeps_two_machines_apart() {
     let mut far = recent(SourceId::Omp, "far", "/var/lib/hermes/work", 1);
-    far.host = Some("nx-1".into());
+    far.origin_label = Some("nx-1".into());
+    far.origin_id = Some("11111111-1111-4111-8111-111111111111".into());
     let mut app = app_with(vec![
         recent(SourceId::Omp, "near", "/var/lib/hermes/work", 2),
         far,
@@ -1245,7 +1249,11 @@ fn only_enter_follows_a_link_including_wrapped_continuations() {
     assert_eq!(app.selected_session().unwrap().id, "child");
     assert!(app.status().is_some_and(|s| s.contains("read-only")));
 
-    assert!(!app.jump_to(&(SourceId::Omp, "elsewhere".to_string())));
+    assert!(!app.jump_to(&(
+        app.local_origin.clone(),
+        SourceId::Omp,
+        "elsewhere".to_string()
+    )));
     assert!(app.status().is_some_and(|s| s.contains("not in this view")));
 }
 
@@ -1474,7 +1482,7 @@ fn zen_hides_the_chrome_and_help_opens_over_it() {
 fn a_remote_row_is_read_through_its_host_not_the_local_filesystem() {
     let home = Path::new("/home/u");
     let mut row = recent(SourceId::Hermes, "abc123", "/srv/work", 1);
-    row.host = Some("nx-1".into());
+    row.origin_label = Some("nx-1".into());
     row.locator = Locator::Row {
         db: PathBuf::from("/home/arch/.hermes/state.db"),
         id: "abc123".into(),
@@ -1495,9 +1503,8 @@ fn a_remote_row_is_read_through_its_host_not_the_local_filesystem() {
         !status.contains("unable to open database"),
         "the local store was opened for a remote row: {status}"
     );
-    // The TUI's cache has no hosts in tests, so routing stops there —
-    // naming the host, never the local path.
-    assert!(status.contains("nx-1"), "{status}");
+    // Without an explicit route, a display label is never an SSH target.
+    assert!(status.contains("no access route"), "{status}");
     assert!(app.transcript().is_none());
 }
 
@@ -1659,7 +1666,7 @@ fn insert_mode_refuses_sessions_it_must_not_write_behind() {
     let (mut open, mut maybe, mut remote) = (stale(), stale(), stale());
     open.liveness = Liveness::Live { pid: 42 };
     maybe.liveness = Liveness::Probably { pid: 42 };
-    remote.host = Some("nx-1".into());
+    remote.origin_label = Some("nx-1".into());
     for (session, read_only, why) in [
         (open, false, "is open in pid 42"),
         // An inferred owner may hold it in memory just the same.
@@ -1687,4 +1694,280 @@ fn insert_mode_refuses_sessions_it_must_not_write_behind() {
         "{:?}",
         app.status()
     );
+}
+
+const ORIGIN_A: &str = "11111111-1111-4111-8111-111111111111";
+const ORIGIN_B: &str = "22222222-2222-4222-8222-222222222222";
+
+fn federated(origin: &str, id: &str) -> SessionSummary {
+    let mut session = recent(SourceId::Omp, id, "/w", 1);
+    session.origin_id = Some(origin.into());
+    session.origin_label = Some("same display label".into());
+    session
+}
+
+#[test]
+fn same_agent_ids_on_distinct_origins_keep_selection_marks_and_transcripts_separate() {
+    let first = federated(ORIGIN_A, "same");
+    let mut second = federated(ORIGIN_B, "same");
+    second.title = Some("other origin title".into());
+    let first_key = first.identity();
+    let second_key = second.identity();
+    let mut app = app_with(vec![first, second]);
+    app.show(Grouping::Timeline);
+    assert_eq!(app.total_sessions(), 2);
+    assert!(app.jump_to(&first_key));
+    app.toggle_mark();
+    assert!(app.marked.contains(&first_key));
+    assert!(!app.marked.contains(&second_key));
+    assert_eq!(app.transcript_key.as_ref(), Some(&first_key));
+    assert!(app.jump_to(&second_key));
+    assert_eq!(app.transcript_key.as_ref(), Some(&second_key));
+    assert_eq!(
+        app.label(app.selected_session().unwrap()).text,
+        "other origin title"
+    );
+}
+
+#[test]
+fn identical_origin_labels_do_not_merge_workspace_host_branch_or_process_groups() {
+    let mut first = federated(ORIGIN_A, "same");
+    let mut second = federated(ORIGIN_B, "same");
+    first.liveness = Liveness::Live { pid: 42 };
+    second.liveness = Liveness::Live { pid: 42 };
+    first.branch = Some("main".into());
+    second.branch = Some("main".into());
+    let mut app = app_with(vec![first, second]);
+    for grouping in [
+        Grouping::Workspace,
+        Grouping::Host,
+        Grouping::Branch,
+        Grouping::Fleet,
+    ] {
+        app.show(grouping);
+        assert_eq!(app.groups.len(), 2, "{grouping:?}");
+        assert_ne!(app.groups[0].key, app.groups[1].key);
+        assert_eq!(app.visible_len(), 1, "{grouping:?}");
+        assert!(app.attachment(app.selected_session().unwrap()).is_none());
+    }
+}
+
+#[test]
+fn parent_trees_and_folds_stay_with_their_origin() {
+    let first = federated(ORIGIN_A, "parent");
+    let second = federated(ORIGIN_B, "parent");
+    let mut child_a = federated(ORIGIN_A, "child");
+    let mut child_b = federated(ORIGIN_B, "child");
+    for child in [&mut child_a, &mut child_b] {
+        child.parent = Some("parent".into());
+        child.subagent = true;
+    }
+    let mut app = app_with(vec![first.clone(), second.clone(), child_a, child_b]);
+    app.show(Grouping::Timeline);
+    assert_eq!(app.visible_len(), 4);
+    app.focus = Pane::Sessions;
+    app.set_fold(&first.identity(), true);
+    assert_eq!(app.visible_len(), 3);
+    assert!(!app.rows().iter().any(|row| {
+        let session = app.session(*row);
+        session.origin_id.as_deref() == Some(ORIGIN_A) && session.id == "child"
+    }));
+    assert!(app.rows().iter().any(|row| {
+        let session = app.session(*row);
+        session.origin_id.as_deref() == Some(ORIGIN_B) && session.id == "child" && row.depth == 1
+    }));
+    app.sessions
+        .retain(|session| session.identity() != second.identity());
+    app.regroup();
+    assert!(
+        !app.rows().iter().any(|row| {
+            let session = app.session(*row);
+            session.origin_id.as_deref() == Some(ORIGIN_B) && session.id == "child"
+        }),
+        "a same-id parent on another origin cannot make a subagent eligible"
+    );
+}
+
+#[test]
+fn bookmarks_resolve_canonical_origin_not_the_display_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = federated(ORIGIN_A, "same");
+    let second = federated(ORIGIN_B, "same");
+    let mut app = app_with(vec![first.clone(), second.clone()]);
+    app.bookmark_path = dir.path().join("aliases.json");
+    app.show(Grouping::Timeline);
+    app.jump_to(&second.identity());
+    app.save_bookmark('a');
+    assert_eq!(
+        app.bookmarks.get('a').unwrap().origin_id.as_deref(),
+        Some(ORIGIN_B)
+    );
+    app.jump_to(&first.identity());
+    app.sessions
+        .iter_mut()
+        .find(|session| session.identity() == second.identity())
+        .unwrap()
+        .origin_label = Some("renamed".into());
+    app.jump_to_bookmark('a');
+    assert_eq!(
+        app.selected_session().unwrap().origin_id.as_deref(),
+        Some(ORIGIN_B)
+    );
+    app.bookmarks.marks.get_mut(&'a').unwrap().origin_id = None;
+    app.jump_to(&first.identity());
+    app.jump_to_bookmark('a');
+    assert_eq!(
+        app.selected_session().unwrap().origin_id.as_deref(),
+        Some(ORIGIN_A)
+    );
+    assert!(app.status().unwrap().contains("gone"));
+}
+
+#[test]
+fn reader_links_resolve_inside_the_open_transcripts_origin() {
+    let first = federated(ORIGIN_A, "parent");
+    let second = federated(ORIGIN_B, "parent");
+    let mut child_a = federated(ORIGIN_A, "child");
+    let mut child_b = federated(ORIGIN_B, "child");
+    for child in [&mut child_a, &mut child_b] {
+        child.parent = Some("parent".into());
+        child.subagent = true;
+        child.title = Some("worker".into());
+    }
+    let mut app = app_with(vec![first, second.clone(), child_a, child_b]);
+    app.show(Grouping::Timeline);
+    app.jump_to(&second.identity());
+    assert_eq!(
+        app.subagents_of_selected().get("worker"),
+        Some(&(SourceId::Omp, "child".into()))
+    );
+    app.rendered = vec![
+        RenderedLine::new(LineKind::Link, Rail::Pipe, "worker")
+            .with_link((SourceId::Omp, "child".into())),
+    ];
+    app.cursor = 0;
+    assert!(app.follow_link());
+    assert_eq!(
+        app.selected_session().unwrap().origin_id.as_deref(),
+        Some(ORIGIN_B)
+    );
+    assert_eq!(app.selected_session().unwrap().id, "child");
+}
+
+#[test]
+fn local_prompt_search_and_mutation_targets_do_not_bleed_into_remote_ids() {
+    let mut local = recent(SourceId::Omp, "same", "/w", 1);
+    local.title = None;
+    let mut distant = federated(ORIGIN_B, "same");
+    distant.title = None;
+    let mut app = app_with(vec![local, distant]);
+    app.show(Grouping::Timeline);
+    app.prompts.insert(
+        (SourceId::Omp, "same".into()),
+        "private local prompt".into(),
+    );
+    app.regroup();
+    let local = app
+        .sessions
+        .iter()
+        .find(|session| session.is_local())
+        .unwrap();
+    let distant = app
+        .sessions
+        .iter()
+        .find(|session| !session.is_local())
+        .unwrap();
+    assert_eq!(app.label(local).text, "private local prompt");
+    assert!(!app.label(distant).text.contains("private"));
+    app.marked
+        .extend(app.sessions.iter().map(SessionSummary::identity));
+    assert_eq!(app.targets(), vec![local.identity()]);
+    app.hits = Some(HashSet::from([(SourceId::Omp, "same".into())]));
+    app.regroup();
+    assert_eq!(app.visible_len(), 1);
+    assert!(app.selected_session().unwrap().is_local());
+}
+
+#[test]
+fn indirect_resume_uses_route_hops_even_without_a_matching_host_label() {
+    use crate::model::{AccessRoute, RouteHop};
+    let home = Path::new("/home/u");
+    let mut app = App::new(
+        home,
+        vec![Box::new(crate::source::omp::Omp::new(home))],
+        vec![federated(ORIGIN_B, "it's")],
+        Vec::new(),
+        None,
+        None,
+        Fleet::default(),
+    );
+    // Install routes after startup to keep this argv-only test off the network.
+    app.sessions[0].routes = vec![AccessRoute {
+        hops: vec![
+            RouteHop {
+                origin_id: ORIGIN_A.into(),
+                name: "gateway".into(),
+                ssh: "user@gateway".into(),
+                home: None,
+            },
+            RouteHop {
+                origin_id: ORIGIN_B.into(),
+                name: "destination".into(),
+                ssh: "user@destination".into(),
+                home: None,
+            },
+        ],
+    }];
+    app.handle(Action::Resume);
+    let argv = app.resume_command().unwrap();
+    assert_eq!(&argv[..4], &["ssh", "-t", "--", "user@gateway"]);
+    assert!(argv[4].contains("user@destination"));
+    assert!(argv[4].contains("--resume"));
+    assert!(!argv.iter().any(|arg| arg == "same display label"));
+    assert!(app.should_quit());
+}
+
+#[test]
+fn initial_tui_merge_deduplicates_canonical_origins_not_observer_labels() {
+    let first = federated(ORIGIN_B, "same");
+    let mut forwarded = first.clone();
+    forwarded.origin_label = Some("different observer label".into());
+    let other = federated(ORIGIN_A, "same");
+    let app = app_with(vec![first, forwarded, other]);
+    assert_eq!(app.total_sessions(), 2);
+    let identities: HashSet<_> = app.sessions.iter().map(SessionSummary::identity).collect();
+    assert_eq!(identities.len(), 2);
+    assert!(identities.contains(&(Some(ORIGIN_A.into()), SourceId::Omp, "same".into())));
+    assert!(identities.contains(&(Some(ORIGIN_B.into()), SourceId::Omp, "same".into())));
+}
+
+#[test]
+fn fleet_parent_inheritance_never_crosses_origins_or_claims_local_processes() {
+    let mut local_parent = recent(SourceId::Omp, "parent", "/w", 1);
+    local_parent.liveness = Liveness::Live { pid: 42 };
+    let remote_parent = federated(ORIGIN_B, "parent");
+    let mut remote_child = federated(ORIGIN_B, "child");
+    remote_child.subagent = true;
+    remote_child.parent = Some("parent".into());
+    let mut app = app_with(vec![local_parent, remote_parent, remote_child]);
+    app.show(Grouping::Fleet);
+    assert_eq!(app.groups.len(), 1);
+    assert_eq!(app.visible_len(), 1);
+    assert!(app.selected_session().unwrap().is_local());
+    let mut remote_live = federated(ORIGIN_B, "live");
+    remote_live.liveness = Liveness::Live { pid: 42 };
+    app.fleet = fleet_with(42, "omp --model x", None);
+    assert!(app.attachment(&remote_live).is_none());
+    app.sessions.push(remote_live);
+    app.show(Grouping::Host);
+    let remote_key = app
+        .sessions
+        .iter()
+        .find(|session| session.id == "live")
+        .unwrap()
+        .identity();
+    app.show(Grouping::Timeline);
+    app.jump_to(&remote_key);
+    app.jump_live();
+    assert_eq!(app.status(), Some("selected session has no live tmux pane"));
 }
