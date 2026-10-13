@@ -254,6 +254,31 @@ pub fn body_hits(home: &Path, query: &Query) -> Option<Result<HashSet<(SourceId,
     )
 }
 
+fn query_hosts<T: Send>(
+    hosts: &[remote::Host],
+    panic_message: &str,
+    query: impl Fn(&remote::Host) -> Result<T> + Sync,
+) -> Vec<Result<T>> {
+    thread::scope(|scope| {
+        let query = &query;
+        let handles: Vec<_> = hosts
+            .iter()
+            .map(|host| (host.name(), scope.spawn(move || query(host))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|(name, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(Error::Remote {
+                        host: name.to_owned(),
+                        message: panic_message.to_owned(),
+                    })
+                })
+            })
+            .collect()
+    })
+}
+
 /// Merge independent branches. A failure on one route never suppresses another.
 fn extend_scan(
     scan: &mut Scan,
@@ -270,32 +295,14 @@ fn extend_scan(
         // like one, and a probe never recurses. A peer that cannot even
         // answer its probe is reported for that, not claimed as truncated.
         let mut truncated = false;
-        let probes = thread::scope(|scope| {
-            let handles: Vec<_> = hosts
-                .iter()
-                .map(|host| {
-                    (
-                        host.name(),
-                        scope.spawn(move || host.origin_id().map(str::to_owned)),
-                    )
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|(name, handle)| {
-                    handle.join().unwrap_or_else(|_| {
-                        Err(Error::Remote {
-                            host: name.to_owned(),
-                            message: "origin probe panicked".into(),
-                        })
-                    })
-                })
-                .collect::<Vec<_>>()
+        let probes = query_hosts(hosts, "origin probe panicked", |host| {
+            host.origin_id()
+                .map(|origin| !context.visited.iter().any(|visited| visited == origin))
         });
         for probe in probes {
             match probe {
-                Ok(origin) => {
-                    truncated |= !context.visited.contains(&origin);
+                Ok(outside_branch) => {
+                    truncated |= outside_branch;
                 }
                 Err(error) => scan.failures.push(error.to_string()),
             }
@@ -306,30 +313,13 @@ fn extend_scan(
         }
         return;
     }
-    let results = thread::scope(|scope| {
-        let handles: Vec<_> = hosts
-            .iter()
-            .map(|host| {
-                (
-                    host.name(),
-                    scope.spawn(move || host.list_with(sources, context)),
-                )
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|(name, handle)| {
-                handle
-                    .join()
-                    .map_err(|_| format!("{name}: remote listing panicked"))
-            })
-            .collect::<Vec<_>>()
+    let results = query_hosts(hosts, "remote listing panicked", |host| {
+        host.list_with(sources, context)
     });
     for result in results {
         match result {
-            Ok(Ok(branch)) => scan.extend(branch),
-            Ok(Err(error)) => scan.failures.push(error.to_string()),
-            Err(error) => scan.failures.push(error),
+            Ok(branch) => scan.extend(branch),
+            Err(error) => scan.failures.push(error.to_string()),
         }
     }
 }

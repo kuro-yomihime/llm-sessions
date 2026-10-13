@@ -274,6 +274,8 @@ Probe capability support before using recursive federation.
   observation. HTTP routes are read-only and carry no credentials.
 - Discovery depth: eight SSH/HTTP hops by default; caller-side identity check
   plus receiving-side guard. Older SSH peers remain shell leaves.
+- Peer probes and listings share scoped parallel workers; each peer failure
+  or panic is reported without discarding other branches.
 - `federation top` is local-only; `llm-sessions top --json` remote rows carry
   both the configured display name and the peer's `origin_id`.
 - Configured home: the marker and guarded binary commands share the supplied
