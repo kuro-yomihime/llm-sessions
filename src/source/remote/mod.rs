@@ -54,10 +54,12 @@ const REFRESH: Duration = Duration::from_secs(15);
 /// One configured machine. `name` labels rows; the [`Transport`] says how
 /// it is reached. The token itself never enters this file, a route, or an
 /// error.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostConfig {
     pub name: String,
     pub transport: Transport,
+    /// Explicitly enrolled peer identity; absent pins refuse remote access.
+    pub origin_id: Option<String>,
     /// Agent names ([`SourceId::name`]) to scan. Empty: all of them.
     pub sources: Vec<String>,
     pub mode: Mode,
@@ -71,6 +73,13 @@ impl HostConfig {
     /// settled by construction ([`Transport::from_parts`]); what remains
     /// are the values an explicit transport can still carry wrongly.
     pub fn problem(&self) -> Option<String> {
+        if self
+            .origin_id
+            .as_deref()
+            .is_some_and(|id| !crate::federation::valid_origin(id))
+        {
+            return Some("origin_id must be a UUID".to_string());
+        }
         let Transport::Http { url, token_env } = &self.transport else {
             return None;
         };
@@ -102,8 +111,9 @@ impl Serialize for HostConfig {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct as _;
-        let mut state = serializer.serialize_struct("HostConfig", 7)?;
+        let mut state = serializer.serialize_struct("HostConfig", 8)?;
         state.serialize_field("name", &self.name)?;
+        state.serialize_field("origin_id", &self.origin_id)?;
         match &self.transport {
             Transport::Ssh { ssh, home } => {
                 state.serialize_field("ssh", ssh)?;
@@ -129,7 +139,7 @@ impl Serialize for HostConfig {
 /// `~/.ssh/config` or `user@host`. An HTTP peer carries `url` instead
 /// (never both), with an optional `token_env` naming the environment
 /// variable that holds its bearer token.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Transport {
     /// Reached with the `ssh` command.
     Ssh {
@@ -231,6 +241,8 @@ mod wire {
     pub(super) struct HostConfig {
         pub(super) name: String,
         #[serde(default)]
+        pub(super) origin_id: Option<String>,
+        #[serde(default)]
         pub(super) ssh: String,
         #[serde(default)]
         pub(super) url: Option<String>,
@@ -249,6 +261,15 @@ impl Config {
     /// Default location, honouring `$XDG_CONFIG_HOME`.
     pub fn default_path(home: &Path) -> PathBuf {
         crate::config_home(home).join("llm-sessions/hosts.json")
+    }
+
+    pub fn revision(home: &Path) -> Option<(std::time::SystemTime, u64)> {
+        Self::revision_at(&Self::default_path(home))
+    }
+
+    fn revision_at(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.modified().ok()?, metadata.len()))
     }
 
     /// Absent file means no remote hosts, not an error. A malformed file is
@@ -292,6 +313,7 @@ impl Config {
         let mut problems: Vec<String> = Vec::new();
         for wire::HostConfig {
             name,
+            origin_id,
             ssh,
             url,
             token_env,
@@ -309,6 +331,7 @@ impl Config {
             let entry = match Transport::from_parts(Some(ssh), url, home, token_env) {
                 Ok(transport) => HostConfig {
                     name: name.clone(),
+                    origin_id: origin_id.as_deref().map(crate::model::normalize_origin),
                     transport,
                     sources,
                     mode,
@@ -422,6 +445,32 @@ fn resume_route(session: &SessionSummary) -> Option<&AccessRoute> {
 }
 
 impl Host {
+    fn check_origin(&self, observed: &str) -> Result<()> {
+        match self.config.origin_id.as_deref() {
+            Some(expected) if expected == observed => Ok(()),
+            Some(expected) => Err(self.fail(format!(
+                "origin mismatch: expected {expected}, received {observed}; sessions excluded; verify the peer, then run `llm-sessions hosts refresh {}`",
+                self.name()
+            ))),
+            None => Err(self.fail(format!(
+                "origin not enrolled; sessions excluded; run `llm-sessions hosts refresh {}`",
+                self.name()
+            ))),
+        }
+    }
+
+    /// Read the authenticated endpoint's identity for an explicit trust reset.
+    pub fn observed_origin(&self) -> Result<&str> {
+        if self.is_http() {
+            return self
+                .http_observed_origin()
+                .map_err(|message| self.fail(message));
+        }
+        self.probe_once()
+            .map(|probe| probe.origin_id.as_str())
+            .map_err(|message| self.fail(message))
+    }
+
     pub fn new(config: HostConfig) -> Self {
         Self {
             config,
@@ -440,31 +489,30 @@ impl Host {
     /// hosts.json. A URL this observer never configured is asked nothing
     /// this observer holds.
     pub fn from_route_hop(hop: &RouteHop, home: &Path) -> Self {
-        let transport = match hop.url.as_deref() {
-            Some(url) => {
-                let token_env = Config::load(home)
-                    .0
-                    .hosts
-                    .into_iter()
-                    .find(|configured| {
-                        matches!(&configured.transport, Transport::Http { url: bound, .. }
-                            if bound.trim_end_matches('/') == url.trim_end_matches('/'))
-                    })
-                    .and_then(|configured| match configured.transport {
-                        Transport::Http { token_env, .. } => token_env,
-                        Transport::Ssh { .. } => None,
-                    });
-                Transport::Http {
-                    url: url.to_owned(),
-                    token_env,
+        if let Some(config) = Config::load(home).0.hosts.into_iter().find(|config| {
+            match (&config.transport, hop.url.as_deref()) {
+                (Transport::Http { url, .. }, Some(received)) => {
+                    url.trim_end_matches('/') == received.trim_end_matches('/')
                 }
+                (Transport::Ssh { ssh, home }, None) => ssh == &hop.ssh && home == &hop.home,
+                _ => false,
             }
+        }) {
+            return Self::new(config);
+        }
+        // Unconfigured downstream hops remain claims trusted through a gateway.
+        let transport = match &hop.url {
+            Some(url) => Transport::Http {
+                url: url.clone(),
+                token_env: None,
+            },
             None => Transport::Ssh {
                 ssh: hop.ssh.clone(),
                 home: hop.home.clone(),
             },
         };
         Self::new(HostConfig {
+            origin_id: Some(hop.origin_id.clone()),
             name: hop.name.clone(),
             transport,
             sources: Vec::new(),
@@ -522,7 +570,7 @@ impl Host {
         if self.is_http() {
             return self.http_status();
         }
-        match self.probe_once() {
+        match self.probed() {
             Err(message) => format!("unreachable: {message}"),
             Ok(probe) if self.use_llm_sessions(probe) => "llm-sessions".to_string(),
             Ok(_) => "shell".to_string(),
@@ -929,6 +977,10 @@ impl Host {
         Err(self.http_unavailable())
     }
 
+    fn http_observed_origin(&self) -> std::result::Result<&str, String> {
+        Err(self.http_unavailable().to_string())
+    }
+
     fn http_origin_id(&self) -> Result<&str> {
         Err(self.http_unavailable())
     }
@@ -1003,11 +1055,13 @@ struct Pending {
 pub struct Cache {
     hosts: Arc<Vec<HostConfig>>,
     home: PathBuf,
+    config_path: PathBuf,
     sessions: Vec<SessionSummary>,
     failures: Vec<String>,
     /// Problems with `hosts.json` itself, which no refresh can clear.
     base: Vec<String>,
     fetched: Option<Instant>,
+    config_revision: Option<(std::time::SystemTime, u64)>,
     worker: Option<thread::JoinHandle<(Vec<SessionSummary>, Vec<String>)>>,
     /// One opener per explicit first hop, preserving probes between fetches.
     openers: BTreeMap<RouteHop, Arc<Host>>,
@@ -1024,10 +1078,12 @@ impl Cache {
             Self {
                 hosts: Arc::new(Vec::new()),
                 home: PathBuf::new(),
+                config_path: PathBuf::new(),
                 sessions: Vec::new(),
                 failures: Vec::new(),
                 base: Vec::new(),
                 fetched: None,
+                config_revision: None,
                 worker: None,
                 openers: BTreeMap::new(),
                 pending: None,
@@ -1037,11 +1093,17 @@ impl Cache {
     }
 
     pub fn new(home: &Path) -> (Self, Vec<String>) {
-        let (config, failure) = Config::load(home);
+        Self::new_at(home, Config::default_path(home))
+    }
+
+    fn new_at(home: &Path, config_path: PathBuf) -> (Self, Vec<String>) {
+        let (config, failure) = Config::load_at(&config_path);
         let base: Vec<String> = failure.into_iter().collect();
         let cache = Self {
             hosts: Arc::new(config.hosts),
             home: home.to_path_buf(),
+            config_revision: Config::revision_at(&config_path),
+            config_path,
             sessions: Vec::new(),
             failures: base.clone(),
             base: base.clone(),
@@ -1061,6 +1123,23 @@ impl Cache {
     /// ignores the TTL. Returns true when rows changed.
     pub fn poll(&mut self, force: bool) -> bool {
         let mut changed = false;
+        let stale = self.fetched.is_none_or(|at| at.elapsed() >= REFRESH);
+        if !self.home.as_os_str().is_empty() && (force || stale) {
+            let revision = Config::revision_at(&self.config_path);
+            if revision != self.config_revision {
+                let (config, failure) = Config::load_at(&self.config_path);
+                self.hosts = Arc::new(config.hosts);
+                self.config_revision = revision;
+                self.sessions.clear();
+                self.base = failure.into_iter().collect();
+                self.failures.clone_from(&self.base);
+                self.openers.clear();
+                self.pending = None;
+                self.worker = None;
+                self.fetched = None;
+                changed = true;
+            }
+        }
         if self
             .worker
             .as_ref()
@@ -1393,6 +1472,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let config = HostConfig {
             name: "must-not-contact".into(),
+            origin_id: None,
             transport: Transport::Ssh {
                 ssh: "must-not-contact".into(),
                 home: None,
@@ -1998,6 +2078,7 @@ mod tests {
         {
             let host = Host::new(HostConfig {
                 name: "gateway".into(),
+                origin_id: Some("00000000-0000-4000-8000-0000000000aa".into()),
                 transport: Transport::Http {
                     url: "http://127.0.0.1:8001".into(),
                     token_env: Some("LLMS_LOCAL_PEER_TOKEN".into()),
@@ -2042,6 +2123,7 @@ mod tests {
         let config = Config {
             hosts: vec![HostConfig {
                 name: "nx-1".into(),
+                origin_id: Some(A.into()),
                 transport: Transport::Ssh {
                     ssh: "p1g3-nx-1".into(),
                     home: Some(PathBuf::from("/var/lib/hermes")),
@@ -2061,5 +2143,43 @@ mod tests {
         ));
         assert_eq!(loaded.hosts[0].mode, Mode::Shell);
         assert_eq!(loaded.hosts[0].sources, vec!["hermes".to_string()]);
+    }
+
+    #[test]
+    fn configuration_refresh_discards_cached_peer_rows_and_openers() {
+        let home = tempfile::tempdir().unwrap();
+        let config = Config {
+            hosts: vec![HostConfig {
+                name: "worker".into(),
+                origin_id: Some(A.into()),
+                transport: Transport::Ssh {
+                    ssh: "worker".into(),
+                    home: None,
+                },
+                sources: Vec::new(),
+                mode: Mode::Auto,
+            }],
+        };
+        let path = home.path().join("hosts.json");
+        Config::save_at(&config, &path).unwrap();
+        let (mut cache, _) = Cache::new_at(home.path(), path.clone());
+        let session = row(A);
+        let hop = RouteHop {
+            origin_id: A.into(),
+            name: "worker".into(),
+            ssh: "worker".into(),
+            url: None,
+            token_env: None,
+            home: None,
+        };
+        cache.sessions.push(session);
+        cache
+            .openers
+            .insert(hop, Arc::new(Host::new(config.hosts[0].clone())));
+        Config::save_at(&Config::default(), &path).unwrap();
+        assert!(cache.poll(true));
+        assert!(cache.sessions().is_empty());
+        assert!(cache.openers.is_empty());
+        assert!(cache.is_empty());
     }
 }

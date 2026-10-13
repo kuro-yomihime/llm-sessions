@@ -88,7 +88,7 @@ impl Host {
     /// This peer's origin identity, learned from its capabilities once per
     /// process. The probe doubles as the reachability check `status` and
     /// `hosts list` report, exactly as the ssh probe does.
-    pub(super) fn http_probed(&self) -> std::result::Result<&str, String> {
+    pub(super) fn http_observed_origin(&self) -> std::result::Result<&str, String> {
         self.http_origin
             .get_or_init(|| {
                 let capabilities: Capabilities = self
@@ -107,6 +107,13 @@ impl Host {
             })
             .as_deref()
             .map_err(String::clone)
+    }
+
+    fn http_probed(&self) -> std::result::Result<&str, String> {
+        let origin = self.http_observed_origin()?;
+        self.check_origin(origin)
+            .map_err(|error| error.to_string())?;
+        Ok(origin)
     }
 
     /// `list_with` for an HTTP peer: one guarded listing filtered to the
@@ -446,6 +453,7 @@ mod tests {
     fn host(url: &str, token_env: Option<&str>) -> Host {
         Host::new(crate::source::remote::HostConfig {
             name: "gateway".into(),
+            origin_id: Some(A.into()),
             transport: crate::source::remote::Transport::Http {
                 url: url.into(),
                 token_env: token_env.map(str::to_owned),
@@ -515,7 +523,7 @@ mod tests {
             Reply(200, row_with_forwarded_route()),
         ]);
         let host = host(&peer.base, None);
-        assert_eq!(host.http_probed().unwrap(), A);
+        assert_eq!(host.http_observed_origin().unwrap(), A);
 
         let scan = host.list_with(&[], &guarded(3)).unwrap();
         assert_eq!(scan.sessions.len(), 1);
@@ -699,7 +707,7 @@ mod tests {
                 200,
                 serde_json::json!({"version": version, "origin_id": A}).to_string(),
             )]);
-            let error = host(&peer.base, None).http_probed().unwrap_err();
+            let error = host(&peer.base, None).http_observed_origin().unwrap_err();
             assert!(error.contains(&format!("version {version}")), "{error}");
         }
 
@@ -711,7 +719,7 @@ mod tests {
             })
             .to_string(),
         )]);
-        let error = host(&peer.base, None).http_probed().unwrap_err();
+        let error = host(&peer.base, None).http_observed_origin().unwrap_err();
         assert!(error.contains("origin identity"), "{error}");
     }
 }

@@ -57,7 +57,7 @@ try:
     threading.Thread(target=proxy.serve_forever,daemon=True).start()
     url='https://127.0.0.1:'+str(proxy.server_port)+'/proxy'
     config = root/'observer/config/llm-sessions'; config.mkdir(parents=True)
-    (config/'hosts.json').write_text(json.dumps({'hosts':[{'name':'tls-peer','url':url,'token_env':'PROXY_TOKEN','sources':['omp']}]}))
+    (config/'hosts.json').write_text(json.dumps({'hosts':[{'name':'tls-peer','url':url,'origin_id':origin,'token_env':'PROXY_TOKEN','sources':['omp']}]}))
     subprocess.run([binary,'origin','--init'],env=env('observer'),check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
     def cli(trusted,*args):
         e=env('observer')

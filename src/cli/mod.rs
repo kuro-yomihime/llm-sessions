@@ -67,13 +67,14 @@ pub fn run() -> Result<()> {
                 hosts::list(&home);
                 Ok(())
             }
-            Some(HostsCommand::Add(_) | HostsCommand::Remove { .. }) if cli.read_only => {
-                Err(Error::ReadOnly {
-                    what: "editing hosts.json",
-                })
-            }
+            Some(
+                HostsCommand::Add(_) | HostsCommand::Remove { .. } | HostsCommand::Refresh { .. },
+            ) if cli.read_only => Err(Error::ReadOnly {
+                what: "editing hosts.json",
+            }),
             Some(HostsCommand::Add(args)) => hosts::add(&home, args),
             Some(HostsCommand::Remove { name }) => hosts::remove(&home, &name),
+            Some(HostsCommand::Refresh { name }) => hosts::refresh(&home, &name),
         },
         Some(Command::Index(args)) if cli.read_only && !args.stats => {
             Err(Error::ReadOnly { what: "indexing" })

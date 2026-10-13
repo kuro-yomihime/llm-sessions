@@ -130,6 +130,7 @@ pub(super) fn add(home: &Path, args: super::args::AddHostArgs) -> Result<()> {
         Ok(transport) => remote::HostConfig {
             name,
             transport,
+            origin_id: None,
             sources: wanted,
             mode: mode.unwrap_or_default(),
         },
@@ -174,5 +175,32 @@ pub(super) fn remove(home: &Path, name: &str) -> Result<()> {
     }
     config.save(home)?;
     emit(&format!("removed {name}"));
+    Ok(())
+}
+
+pub(super) fn refresh(home: &Path, name: &str) -> Result<()> {
+    let (mut config, failure) = remote::Config::load(home);
+    if let Some(failure) = failure {
+        return Err(Error::BadArgument {
+            what: "hosts.json",
+            got: failure,
+        });
+    }
+    let entry = config
+        .hosts
+        .iter_mut()
+        .find(|host| host.name == name)
+        .ok_or_else(|| Error::BadArgument {
+            what: "host name",
+            got: name.to_owned(),
+        })?;
+    let peer = remote::Host::new(entry.clone());
+    let observed = peer.observed_origin()?.to_owned();
+    let previous = entry.origin_id.replace(observed.clone());
+    config.save(home)?;
+    emit(&format!(
+        "{name}: {} -> {observed}",
+        previous.as_deref().unwrap_or("unregistered")
+    ));
     Ok(())
 }

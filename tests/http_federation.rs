@@ -67,7 +67,7 @@ fn peers(home: &Path, hosts: Value) {
 }
 
 fn peer(name: &str, server: &Server) -> Value {
-    json!({"name":name,"url":server.url,"token_env":SECRET_ENV,"sources":["omp"]})
+    json!({"name":name,"url":server.url,"origin_id":get(server, "/v1/federation/capabilities", &[]).1["origin_id"],"token_env":SECRET_ENV,"sources":["omp"]})
 }
 
 fn server(home: &Path, gateway: bool) -> Server {
@@ -346,7 +346,7 @@ fn ssh_forwarder_can_discover_and_open_an_http_only_origin() {
     let l = home(root.path(), "L", 1);
     peers(
         &l,
-        json!([{"name":"ssh-gateway","ssh":"A","sources":["omp"]}]),
+        json!([{"name":"ssh-gateway","ssh":"A","origin_id":origin(3),"sources":["omp"]}]),
     );
     let bin = root.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -402,7 +402,7 @@ exec /bin/sh -c "$*"
     assert_eq!(transcript["title"], "HTTP origin through SSH");
     peers(
         &l,
-        json!([{"name":"ssh-gateway","ssh":"A","sources":["omp"]}, peer("direct-http", &bs)]),
+        json!([{"name":"ssh-gateway","ssh":"A","origin_id":origin(3),"sources":["omp"]}, peer("direct-http", &bs)]),
     );
     let rows = execute(&["--read-only", "list", "--json", "--limit", "0"]);
     assert_eq!(rows.as_array().unwrap().len(), 1);
@@ -422,7 +422,7 @@ fn gateway_source_policy_bounds_regular_and_federation_reads() {
     let a = home(root.path(), "A", 3);
     peers(
         &a,
-        json!([{"name":"worker","url":bs.url,"token_env":SECRET_ENV}]),
+        json!([{"name":"worker","url":bs.url,"origin_id":origin(2),"token_env":SECRET_ENV}]),
     );
     let gateway = server_options(&a, true, "1", &["--source", "claude"]);
     let regular = get(&gateway, "/v1/sessions", &[("limit", "0")]);
@@ -746,7 +746,7 @@ fn an_http_hop_delegates_the_ssh_leg_to_the_gateway() {
     let a = home(root.path(), "A", 3);
     peers(
         &a,
-        json!([{"name": "ssh-leaf", "ssh": "C", "sources": ["omp"]}]),
+        json!([{"name": "ssh-leaf", "ssh": "C", "origin_id":origin(2), "sources": ["omp"]}]),
     );
     let gateway = ssh_server(&a, root.path(), &bin);
     let l = home(root.path(), "L", 1);
@@ -804,7 +804,7 @@ fn mixed_transport_cycles_terminate_and_keep_alias_identity() {
     session(&a, "a-row", "Alpha cycle row");
     peers(
         &a,
-        json!([peer("b-http", &bs), {"name": "c-ssh", "ssh": "C", "sources": ["omp"]}]),
+        json!([peer("b-http", &bs), {"name": "c-ssh", "ssh": "C", "origin_id":origin(4), "sources": ["omp"]}]),
     );
     let gateway = ssh_server(&a, root.path(), &bin);
     // Close the ring: B answers A over HTTP, C answers A over HTTP while
@@ -817,7 +817,7 @@ fn mixed_transport_cycles_terminate_and_keep_alias_identity() {
         json!([
             peer("a-gateway", &gateway),
             peer("direct-b", &bs),
-            {"name": "direct-c", "ssh": "C", "sources": ["omp"]}
+            {"name": "direct-c", "ssh": "C", "origin_id":origin(4), "sources": ["omp"]}
         ]),
     );
     let run = |args: &[&str]| observer(&l, root.path(), &bin, args);
@@ -915,8 +915,8 @@ fn resume_keeps_the_ssh_alternate_after_http_dedup_prefers_the_http_route() {
     peers(
         &l,
         json!([
-            {"name":"api","url":bs.url,"token_env":SECRET_ENV,"sources":["omp"]},
-            {"name":"ssh-direct","ssh":"B","sources":["omp"]}
+            {"name":"api","url":bs.url,"origin_id":origin(2),"token_env":SECRET_ENV,"sources":["omp"]},
+            {"name":"ssh-direct","ssh":"B","origin_id":origin(2),"sources":["omp"]}
         ]),
     );
     let rows: Vec<SessionSummary> = serde_json::from_value(observer(
@@ -963,4 +963,56 @@ fn resume_keeps_the_ssh_alternate_after_http_dedup_prefers_the_http_route() {
         format!("{}\n--resume mixed id 'quoted'", b.display()),
         "the quoted session id survives every ssh shell layer and lands on B"
     );
+}
+
+#[test]
+fn http_origin_refresh_rejects_mismatch_then_recovers_without_serving_cached_old_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let b = home(root.path(), "B", 2);
+    session(&b, "pinned", "Pinned transcript");
+    let bs = server(&b, false);
+    let l = home(root.path(), "L", 1);
+    peers(&l, json!([peer("worker", &bs)]));
+    let gateway = server_options(&l, true, "3600", &[]);
+    let old_query = [("origin", origin(2)), ("source", "omp".to_owned())];
+    let read = |query: &[(&str, String)]| {
+        let query: Vec<_> = query
+            .iter()
+            .map(|(key, value)| (*key, value.as_str()))
+            .collect();
+        get(&gateway, "/v1/sessions/pinned/transcript", &query)
+    };
+    assert_eq!(read(&old_query).0, 200);
+    fs::write(b.join(".local/state/llm-sessions/origin-id"), origin(3)).unwrap();
+    let mismatch = command(&l)
+        .args(["--read-only", "list", "--json", "--limit", "0"])
+        .output()
+        .unwrap();
+    assert!(mismatch.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&mismatch.stdout).unwrap(),
+        json!([])
+    );
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("origin mismatch"));
+    let refreshed = command(&l)
+        .args(["hosts", "refresh", "worker"])
+        .output()
+        .unwrap();
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let saved: Value =
+        serde_json::from_slice(&fs::read(l.join(".config/llm-sessions/hosts.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["hosts"][0]["origin_id"], origin(3));
+    assert_ne!(
+        read(&old_query).0,
+        200,
+        "a pre-refresh cached transcript must not bypass the new pin"
+    );
+    let current = read(&[("origin", origin(3)), ("source", "omp".to_owned())]);
+    assert_eq!(current.0, 200);
+    assert_eq!(current.1["id"], "pinned");
 }

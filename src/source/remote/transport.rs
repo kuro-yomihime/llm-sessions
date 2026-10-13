@@ -110,7 +110,9 @@ impl Host {
     }
 
     pub(super) fn probed(&self) -> Result<&Probe> {
-        self.probe_once().map_err(|message| self.fail(message))
+        let probe = self.probe_once().map_err(|message| self.fail(message))?;
+        self.check_origin(&probe.origin_id)?;
+        Ok(probe)
     }
 
     pub(super) fn probe_once(&self) -> std::result::Result<&Probe, String> {
@@ -370,6 +372,7 @@ mod tests {
         let configured_origin = crate::federation::ensure_origin(&configured).unwrap();
         let host = Host::new(crate::source::remote::HostConfig {
             name: "namespace".into(),
+            origin_id: Some(configured_origin.clone()),
             transport: crate::source::remote::Transport::Ssh {
                 ssh: "namespace".into(),
                 home: Some(configured.clone()),

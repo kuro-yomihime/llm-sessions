@@ -165,6 +165,8 @@ pub enum HostsCommand {
     Add(AddHostArgs),
     /// Remove a host by name.
     Remove { name: String },
+    /// Enroll or replace a peer's origin UUID through its configured connection.
+    Refresh { name: String },
 }
 
 #[derive(Debug, Clone, clap::Args)]

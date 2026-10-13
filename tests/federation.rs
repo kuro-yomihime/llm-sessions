@@ -84,7 +84,10 @@ exec /bin/sh -c "$*"
             .expect("origin marker");
         let hosts: Vec<_> = peers
             .iter()
-            .map(|(label, ssh, mode)| json!({"name":label,"ssh":ssh,"mode":mode,"sources":["omp"]}))
+            .map(|(label, ssh, mode)| {
+                let identity = match *ssh { "b-alias" | "unreachable" => "B", peer => peer };
+                json!({"name":label,"ssh":ssh,"origin_id":Self::origin(identity),"mode":mode,"sources":["omp"]})
+            })
             .collect();
         fs::write(
             config.join("hosts.json"),
@@ -540,6 +543,7 @@ fn configured_home_routes_keep_the_alternate_namespace_end_to_end() {
         graph.home("L").join(".config/llm-sessions/hosts.json"),
         json!({"hosts":[{
             "name":"alt", "ssh":"B", "home":alternate_home,
+            "origin_id":Graph::origin("C"),
             "mode":"auto", "sources":["omp"]
         }]})
         .to_string(),
@@ -623,4 +627,67 @@ fn explicit_origin_initialization_survives_restart_and_read_only_refuses_creatio
     assert!(reopened.status.success());
     assert_eq!(created.stdout, reopened.stdout);
     assert_eq!(fs::read(&marker).expect("marker"), created.stdout);
+}
+
+#[test]
+fn pinned_ssh_identity_requires_explicit_refresh_and_failed_refresh_keeps_pin() {
+    let graph = Graph::new();
+    graph.host("L", &[("worker", "B", "auto")]);
+    graph.host("B", &[]);
+    graph.session("B", "remote-session");
+    let marker = graph.home("B").join(".local/state/llm-sessions/origin-id");
+    fs::write(&marker, Graph::origin("C")).unwrap();
+    let (rows, failures) = graph.list("L");
+    assert!(rows.is_empty());
+    assert!(failures.contains("origin mismatch"));
+    assert!(failures.contains(&Graph::origin("B")));
+    assert!(failures.contains(&Graph::origin("C")));
+    let config_path = graph.home("L").join(".config/llm-sessions/hosts.json");
+    let before = fs::read(&config_path).unwrap();
+    let denied = graph.command("L", &["--read-only", "hosts", "refresh", "worker"]);
+    assert!(!denied.status.success());
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    let refreshed = graph.command("L", &["hosts", "refresh", "worker"]);
+    assert!(
+        refreshed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&refreshed.stderr)
+    );
+    let config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(config["hosts"][0]["origin_id"], Graph::origin("C"));
+    let (rows, _) = graph.list("L");
+    assert_eq!(
+        rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["remote-session"]
+    );
+    let pinned = fs::read(&config_path).unwrap();
+    fs::write(&marker, "invalid-marker").unwrap();
+    let failed = graph.command("L", &["hosts", "refresh", "worker"]);
+    assert!(!failed.status.success());
+    assert_eq!(fs::read(&config_path).unwrap(), pinned);
+}
+
+#[test]
+fn an_unpinned_ssh_peer_is_enrolled_only_by_hosts_refresh() {
+    let graph = Graph::new();
+    graph.host("L", &[("worker", "B", "auto")]);
+    graph.host("B", &[]);
+    graph.session("B", "remote-session");
+    let path = graph.home("L").join(".config/llm-sessions/hosts.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["hosts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("origin_id");
+    fs::write(&path, config.to_string()).unwrap();
+    let (rows, failures) = graph.list("L");
+    assert!(rows.is_empty());
+    assert!(failures.contains("origin not enrolled"));
+    let refreshed = graph.command("L", &["hosts", "refresh", "worker"]);
+    assert!(refreshed.status.success());
+    let (rows, _) = graph.list("L");
+    assert_eq!(
+        rows[0].origin_id.as_deref(),
+        Some(Graph::origin("B").as_str())
+    );
 }

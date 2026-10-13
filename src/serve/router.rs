@@ -336,7 +336,10 @@ async fn transcript(
 ) -> Result<Response, ApiError> {
     let (origin, source) = qualifiers(&params)?;
     let session = resolve(&app, &id, origin.as_deref(), source).await?;
-    let body = if let Some(body) = app.transcripts.get(&session) {
+    let config_revision = (!session.is_local())
+        .then(|| remote::Config::revision(&app.home))
+        .flatten();
+    let body = if let Some(body) = app.transcripts.get(&session, config_revision) {
         body
     } else {
         let worker = app.clone();
@@ -355,7 +358,7 @@ async fn transcript(
         .await
         .map_err(|e| ApiError::internal(format!("reading the transcript panicked: {e}")))?
         .map_err(ApiError::internal)?;
-        app.transcripts.put(&session, body.clone());
+        app.transcripts.put(&session, config_revision, body.clone());
         body
     };
     Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
@@ -475,27 +478,51 @@ async fn stream(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| stream::push(socket, snapshot, stopped))
 }
 
-/// Serialized transcripts by session, valid while `updated` is unchanged;
-/// the oldest entry goes first once full.
+/// Serialized transcripts remain valid only within one peer configuration.
+struct CachedTranscript {
+    key: Key,
+    updated: OffsetDateTime,
+    config_revision: Option<(std::time::SystemTime, u64)>,
+    body: Bytes,
+}
+
 #[derive(Default)]
-pub(super) struct TranscriptCache(Mutex<VecDeque<(Key, OffsetDateTime, Bytes)>>);
+pub(super) struct TranscriptCache(Mutex<VecDeque<CachedTranscript>>);
 
 impl TranscriptCache {
-    fn get(&self, session: &SessionSummary) -> Option<Bytes> {
+    fn get(
+        &self,
+        session: &SessionSummary,
+        revision: Option<(std::time::SystemTime, u64)>,
+    ) -> Option<Bytes> {
         lock(&self.0)
             .iter()
-            .find(|(key, updated, _)| *key == session.identity() && *updated == session.updated)
-            .map(|(_, _, body)| body.clone())
+            .find(|entry| {
+                entry.key == session.key()
+                    && entry.updated == session.updated
+                    && entry.config_revision == revision
+            })
+            .map(|entry| entry.body.clone())
     }
 
-    fn put(&self, session: &SessionSummary, body: Bytes) {
+    fn put(
+        &self,
+        session: &SessionSummary,
+        config_revision: Option<(std::time::SystemTime, u64)>,
+        body: Bytes,
+    ) {
         let mut cache = lock(&self.0);
         let key = session.identity();
-        cache.retain(|(cached, _, _)| *cached != key);
+        cache.retain(|entry| entry.key != key);
         if cache.len() >= CACHED_TRANSCRIPTS {
             cache.pop_front();
         }
-        cache.push_back((key, session.updated, body));
+        cache.push_back(CachedTranscript {
+            key,
+            updated: session.updated,
+            config_revision,
+            body,
+        });
     }
 }
 
