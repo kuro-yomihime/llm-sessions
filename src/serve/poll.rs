@@ -12,17 +12,20 @@ use tokio::sync::watch;
 use crate::catalog::loader::{Cached, Loader, Remote, body_hits};
 use crate::catalog::query::Query;
 use crate::error::Result;
-use crate::model::{SessionSummary, SourceId, Transcript};
+use crate::model::{SessionKey, SessionSummary, SourceId, Transcript};
 use crate::runtime::live::{Activity, Fleet};
 use crate::runtime::status::{
     Facts, Settled, Status, WaitingReason, analyze, derive_status, settle,
 };
+use crate::source::remote;
 
-/// A session, as the server keys it. Local only: ids are unique per agent.
-pub(super) type Key = (SourceId, String);
+/// A session, as the server keys it: full canonical identity, so a local row
+/// and a federated row that share an agent and id never share a status, a
+/// facts entry or a cached transcript.
+pub(super) type Key = SessionKey;
 
 fn key(session: &SessionSummary) -> Key {
-    (session.source, session.id.clone())
+    session.identity()
 }
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -147,6 +150,13 @@ pub(super) struct Poller {
     base: Query,
     window: Duration,
     facts: Arc<FactsCache>,
+    /// Gateway mode: each tick also lists the configured peers, under the
+    /// server's own discovery context. Local-only (the default) never
+    /// contacts a peer, even with peers configured.
+    federate: bool,
+    /// The `--source` allow-list, applied to local and federated rows alike
+    /// before any status, cache entry or watched row exists.
+    allowed: Vec<SourceId>,
     /// The published (debounced) status per watched session.
     settled: HashMap<Key, Settled>,
     /// Failure lines already printed; a broken store is reported once, not
@@ -155,13 +165,22 @@ pub(super) struct Poller {
 }
 
 impl Poller {
-    pub fn new(loader: Loader, base: Query, window: Duration, facts: Arc<FactsCache>) -> Self {
+    pub fn new(
+        loader: Loader,
+        base: Query,
+        window: Duration,
+        facts: Arc<FactsCache>,
+        federate: bool,
+        allowed: Vec<SourceId>,
+    ) -> Self {
         Self {
             loader,
             fleet: Fleet::default(),
             base,
             window,
             facts,
+            federate,
+            allowed,
             settled: HashMap::new(),
             warned: HashSet::new(),
         }
@@ -183,29 +202,31 @@ impl Poller {
     pub fn tick(&mut self) -> Snapshot {
         let now = OffsetDateTime::now_utc();
         self.fleet.refresh();
-        let scan = self
-            .loader
-            .scan(Some(&self.fleet), Cached::Borrow, Remote::Skip);
-        for failure in scan.failures {
+        // Gateway mode rereads hosts.json every tick: a peer added after
+        // startup is discovered without a restart, like the request-local
+        // federation route.
+        let remote = if self.federate {
+            let (config, failure) = remote::Config::load(self.loader.home());
+            self.loader.hosts = config.hosts.into_iter().map(remote::Host::new).collect();
+            if let Some(failure) = failure {
+                self.warn(failure);
+            }
+            Remote::Inline
+        } else {
+            Remote::Skip
+        };
+        let mut scan = self.loader.scan(Some(&self.fleet), Cached::Borrow, remote);
+        for failure in scan.failures.drain(..) {
             self.warn(failure);
         }
-        let hits = match body_hits(self.loader.home(), &self.base) {
-            None => None,
-            Some(Ok(hits)) => Some(hits),
-            Some(Err(e)) => {
-                self.warn(format!("--query body: search failed: {e}"));
-                Some(HashSet::new())
-            }
-        };
-        let sessions: Vec<SessionSummary> = scan
-            .sessions
-            .into_iter()
-            .filter(|session| {
-                hits.as_ref()
-                    .is_none_or(|hits| hits.contains(&key(session)))
-            })
-            .filter(|session| self.base.matches(session))
-            .collect();
+        let own = crate::federation::read_origin(self.loader.home()).ok();
+        let sessions = policy_filter(
+            self.loader.home(),
+            &self.base,
+            &self.allowed,
+            own.as_deref(),
+            &mut scan,
+        );
 
         let window = time::Duration::try_from(self.window).unwrap_or(time::Duration::MAX);
         let mut statuses = HashMap::new();
@@ -225,11 +246,22 @@ impl Poller {
                     Facts::default()
                 }
             };
-            let activity = session
-                .liveness
-                .pid()
-                .and_then(|pid| self.fleet.get(pid))
-                .map_or(Activity::Unknown, |process| process.activity);
+            // The local fleet says nothing about another machine: a remote
+            // row keeps whatever liveness its own origin reported, and a
+            // coincidentally equal pid is never attributed to it.
+            let local = session
+                .origin_id
+                .as_deref()
+                .is_none_or(|origin| Some(origin) == own.as_deref());
+            let activity = if local {
+                session
+                    .liveness
+                    .pid()
+                    .and_then(|pid| self.fleet.get(pid))
+                    .map_or(Activity::Unknown, |process| process.activity)
+            } else {
+                Activity::Unknown
+            };
             let (status, reason) = derive_status(live, activity, &facts, session.updated, now);
             let key = key(session);
             let settled = settle(
@@ -257,5 +289,137 @@ impl Poller {
         snapshot.watched = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_owned());
         snapshot.sessions = sessions;
         snapshot
+    }
+}
+
+/// The publication policy every outgoing listing enforces: the `--source`
+/// allow-list over everything including rows a federated peer contributed,
+/// and the base query over the local rows.
+///
+/// `body:` terms are answered by this machine's index, which knows nothing
+/// about other origins: a remote row simply does not pass a body query,
+/// rather than being matched against some local session's hits.
+pub(super) fn policy_filter(
+    home: &std::path::Path,
+    base: &Query,
+    allowed: &[SourceId],
+    own: Option<&str>,
+    scan: &mut crate::catalog::scan::Scan,
+) -> Vec<SessionSummary> {
+    let hits = match body_hits(home, base) {
+        None => None,
+        Some(Ok(hits)) => Some(hits),
+        Some(Err(_)) => Some(HashSet::new()),
+    };
+    let indexed = hits.is_some();
+    scan.sessions
+        .drain(..)
+        .filter(|session| allowed.is_empty() || allowed.contains(&session.source))
+        .filter(|session| {
+            let local = session
+                .origin_id
+                .as_deref()
+                .is_none_or(|origin| Some(origin) == own);
+            (!indexed || local)
+                && hits
+                    .as_ref()
+                    .is_none_or(|hits| hits.contains(&(session.source, session.id.clone())))
+                && base.matches(session)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::model::{Locator, SourceId};
+
+    const ORIGIN_A: &str = "00000000-0000-4000-8000-00000000000a";
+
+    fn summary(origin: Option<&str>, id: &str) -> SessionSummary {
+        let mut session = SessionSummary::new(
+            id.to_owned(),
+            SourceId::Codex,
+            OffsetDateTime::from_unix_timestamp(1).unwrap(),
+            Locator::File {
+                path: PathBuf::from("/store/x.jsonl"),
+            },
+        );
+        session.origin_id = origin.map(str::to_owned);
+        session
+    }
+
+    /// A local row and a federated row that share an agent and id are two
+    /// sessions: neither facts nor a status may cross that boundary.
+    #[test]
+    fn caches_key_on_canonical_identity_not_agent_and_id() {
+        let facts = FactsCache::default();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let local = summary(None, "shared");
+        let remote = summary(Some(ORIGIN_A), "shared");
+        for session in [&local, &local, &remote, &local] {
+            let counter = Arc::clone(&opens);
+            let opened = facts.get(session, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::model::Transcript::new("x", SourceId::Codex))
+            });
+            assert!(opened.is_ok());
+        }
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            2,
+            "one open per origin; the repeat read is served from the cache"
+        );
+    }
+
+    #[test]
+    fn statuses_never_cross_origins() {
+        let waiting = StatusBlock {
+            status: Status::Waiting,
+            waiting_reason: None,
+            status_since: OffsetDateTime::from_unix_timestamp(1).unwrap(),
+        };
+        let mut snapshot = Snapshot::default();
+        snapshot.statuses.insert(
+            (Some(ORIGIN_A.to_owned()), SourceId::Codex, "shared".into()),
+            waiting,
+        );
+        let federated = summary(Some(ORIGIN_A), "shared");
+        let local_row = summary(None, "shared");
+        let remote = snapshot.row(&federated);
+        let local = snapshot.row(&local_row);
+        assert_eq!(remote.status, Some(waiting));
+        assert_eq!(
+            local.status, None,
+            "a local row never wears a federated status"
+        );
+    }
+
+    /// The `--source` allow-list bounds publication: a row a federated
+    /// peer contributed is dropped exactly like a local one, before any
+    /// status or cache entry could exist for it.
+    #[test]
+    fn policy_filter_applies_the_source_allow_list_to_remote_rows_too() {
+        let mut scan = crate::catalog::scan::Scan::default();
+        let mut remote_omp = summary(Some(ORIGIN_A), "remote-omp");
+        remote_omp.source = SourceId::Omp;
+        scan.sessions = vec![
+            summary(None, "local-codex"),
+            summary(Some(ORIGIN_A), "remote-codex"),
+            remote_omp,
+        ];
+        let kept = policy_filter(
+            std::path::Path::new("/nonexistent-home"),
+            &Query::parse(""),
+            &[SourceId::Omp],
+            None,
+            &mut scan,
+        );
+        let ids: Vec<&str> = kept.iter().map(|session| session.id.as_str()).collect();
+        assert_eq!(ids, ["remote-omp"]);
     }
 }

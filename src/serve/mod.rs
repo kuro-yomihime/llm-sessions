@@ -6,8 +6,15 @@
 //! GET /v1/sessions?q=<query>&limit=N    {"serverTime", "sessions": [Row]}
 //! GET /v1/sessions/{id}                 Row
 //! GET /v1/sessions/{id}/transcript      Transcript, the bytes of `show <id> --json`
+//! GET /v1/federation/capabilities       {"version", "origin_id"}: the handshake
+//! GET /v1/federation/list?path=&hops=   FederationScan, guarded like the SSH route
 //! GET /v1/stream                        WebSocket: watched rows as snapshot frames
 //! ```
+//!
+//! `origin`/`source` query parameters qualify the detail routes when
+//! federated rows collide with local ids. Federation discovery is opt-in
+//! (`--federate`): without it the server lists this machine only, even
+//! with peers configured, and never contacts one.
 //!
 //! A Row is a [`crate::SessionSummary`] exactly as `list --json` prints it,
 //! plus `status`: `{"status", "waitingReason", "statusSince"}` from
@@ -73,6 +80,9 @@ pub struct Config {
     pub sources: Vec<SourceId>,
     /// A base query, in the `list -q` grammar, every published row matches.
     pub query: Option<String>,
+    /// Gateway mode: also list the configured peers each scan and answer
+    /// federation discovery through them. Default is this machine only.
+    pub federate: bool,
 }
 
 /// Serve until SIGINT or SIGTERM.
@@ -109,13 +119,15 @@ async fn serve(home: &Path, config: Config, token: Option<String>) -> Result<()>
     // overlay holds a database connection, so it cannot be shared.
     let mut sources = source::all(home);
     wanted(&mut sources);
-
     let facts = Arc::new(poll::FactsCache::default());
+    let base = Query::parse(config.query.as_deref().unwrap_or_default());
     let mut poller = poll::Poller::new(
         loader,
         Query::parse(config.query.as_deref().unwrap_or_default()),
         config.status_window,
         facts.clone(),
+        config.federate,
+        config.sources.clone(),
     );
     let (poller, first) = tokio::task::spawn_blocking(move || {
         poller.set_fleet(Fleet::probe());
@@ -131,8 +143,13 @@ async fn serve(home: &Path, config: Config, token: Option<String>) -> Result<()>
 
     let host = config.host_name.clone().unwrap_or_else(system_hostname);
     eprintln!(
-        "llm-sessions: serving {listed} session(s) on http://{address} as {host:?}, auth {}",
-        if token.is_some() { "by token" } else { "OFF" }
+        "llm-sessions: serving {listed} session(s) on http://{address} as {host:?}, auth {}, {}",
+        if token.is_some() { "by token" } else { "OFF" },
+        if config.federate {
+            "federation gateway"
+        } else {
+            "local-only"
+        },
     );
     let app = Arc::new(router::App {
         token,
@@ -143,6 +160,9 @@ async fn serve(home: &Path, config: Config, token: Option<String>) -> Result<()>
         facts,
         transcripts: router::TranscriptCache::default(),
         stopped,
+        federate: config.federate,
+        base,
+        source_filter: config.sources.clone(),
     });
     axum::serve(listener, router::router(app))
         .with_graceful_shutdown(async move {

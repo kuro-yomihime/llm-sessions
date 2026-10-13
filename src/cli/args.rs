@@ -326,11 +326,15 @@ const MAX_STATUS_WINDOW_HOURS: u64 = 100 * 365 * 24;
     /v1/sessions?q=QUERY&limit=N   rows as `list --json`, plus a derived `status`\n  \
     /v1/sessions/ID                one row; ID may be a unique prefix\n  \
     /v1/sessions/ID/transcript     the bytes of `show ID --json`\n  \
+    /v1/federation/capabilities    this server's stable origin identity\n  \
+    /v1/federation/list?path=P&hops=H   guarded federation discovery (see --federate)\n  \
     /v1/stream                     WebSocket: live and recent rows, pushed on change\n\n\
     Read-only by construction: no route archives, indexes, edits hosts, or\n\
     reaches a terminal. Clients send `Authorization: Bearer TOKEN`; /v1/stream\n\
     also takes `?token=TOKEN`. There is no TLS: off loopback, put a TLS\n\
-    reverse proxy in front.")]
+    reverse proxy in front.\n\n\
+    Federation is opt-in: without --federate the server lists this machine\n\
+    only and never contacts a peer, even with hosts configured.")]
 pub struct ServeArgs {
     /// Address to listen on. Only a loopback address may use --no-auth.
     #[arg(long, env = "LLMS_BIND", default_value = "127.0.0.1:8787")]
@@ -367,6 +371,12 @@ pub struct ServeArgs {
     /// Base query every published row must match, in the `list -q` grammar.
     #[arg(long, short = 'q')]
     pub query: Option<String>,
+
+    /// Gateway mode: also list the peers in hosts.json and serve their
+    /// sessions, origin-qualified. Without it, serve publishes this
+    /// machine only and never contacts a peer.
+    #[arg(long)]
+    pub federate: bool,
 }
 
 /// Nothing that prints args may print the token: one stray `{:?}` on the
@@ -384,6 +394,7 @@ impl std::fmt::Debug for ServeArgs {
             .field("status_window", &self.status_window)
             .field("sources", &self.sources)
             .field("query", &self.query)
+            .field("federate", &self.federate)
             .finish()
     }
 }
@@ -496,6 +507,7 @@ mod tests {
             status_window: 1,
             sources: Vec::new(),
             query: None,
+            federate: false,
         };
         let printed = format!("{args:?}");
         assert!(!printed.contains("s3cret"), "{printed}");

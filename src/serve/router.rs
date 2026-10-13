@@ -21,12 +21,17 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::watch;
 
 use super::auth;
-use super::poll::{FactsCache, Key, Snapshot, lock, status_now};
+use super::poll::{FactsCache, Key, Snapshot, lock, policy_filter, status_now};
 use super::stream;
-use crate::catalog::loader::{self, Resolved, body_hits, resolve};
+use crate::catalog::loader::{self, body_hits, borrow_cached_usage, extend_from_origin};
+use crate::catalog::merge;
 use crate::catalog::query::{self, Filters};
-use crate::model::SessionSummary;
-use crate::source::Source;
+use crate::catalog::scan::scan_with;
+use crate::federation::{DEFAULT_HOPS, valid_origin};
+use crate::model::{SessionSummary, SourceId};
+use crate::runtime::live::Fleet;
+use crate::source::{Source, remote};
+use crate::storage::overlay::Overlay;
 
 /// Rows `/v1/sessions` returns without `limit`, as `list` prints.
 const DEFAULT_LIMIT: usize = 50;
@@ -47,6 +52,14 @@ pub(super) struct App {
     pub transcripts: TranscriptCache,
     /// Flips once, on shutdown; open streams close on it.
     pub stopped: watch::Receiver<bool>,
+    /// Gateway mode: federation discovery may contact the configured
+    /// peers. Local-only (the default) answers with this machine's rows
+    /// whatever the peer configuration says.
+    pub federate: bool,
+    /// The base query every published row matches, as on the command line.
+    pub base: query::Query,
+    /// The `--source` allow-list; empty for all.
+    pub source_filter: Vec<SourceId>,
 }
 
 pub(super) fn router(app: Arc<App>) -> Router {
@@ -54,6 +67,8 @@ pub(super) fn router(app: Arc<App>) -> Router {
         .route("/v1/sessions", get(sessions))
         .route("/v1/sessions/{id}", get(session))
         .route("/v1/sessions/{id}/transcript", get(transcript))
+        .route("/v1/federation/capabilities", get(federation_capabilities))
+        .route("/v1/federation/list", get(federation_list))
         .route_layer(middleware::from_fn_with_state(app.clone(), auth::bearer));
     let stream =
         Router::new()
@@ -187,18 +202,111 @@ async fn sessions(
     Ok(Json(json!({ "serverTime": now(), "sessions": rows })))
 }
 
-/// The one session `id` names in the latest snapshot.
-fn find(snapshot: &Snapshot, id: &str) -> Result<SessionSummary, ApiError> {
-    match resolve(&snapshot.sessions, id) {
-        Resolved::One(session) => Ok(session.clone()),
-        Resolved::Missing => Err(ApiError::new(StatusCode::NOT_FOUND, "no such session")),
-        Resolved::Ambiguous(candidates) => Err(ApiError::new(
+/// The one session `id` names in a row set. `origin` and `source`, when a
+/// client sends them, narrow the pool first: federated rows can share an
+/// agent and id with a local one, and the collision is answered, never
+/// guessed.
+fn find(
+    sessions: &[SessionSummary],
+    id: &str,
+    origin: Option<&str>,
+    source: Option<SourceId>,
+) -> Result<SessionSummary, ApiError> {
+    let pool: Vec<&SessionSummary> = sessions
+        .iter()
+        .filter(|s| origin.is_none_or(|want| s.origin_id.as_deref() == Some(want)))
+        .filter(|s| source.is_none_or(|want| s.source == want))
+        .collect();
+    let exact: Vec<&SessionSummary> = pool.iter().filter(|s| s.id == id).copied().collect();
+    let candidates: Vec<&SessionSummary> = if exact.is_empty() {
+        pool.iter()
+            .filter(|s| s.id.starts_with(id))
+            .copied()
+            .collect()
+    } else {
+        exact
+    };
+    match candidates.len() {
+        0 => Err(ApiError::new(StatusCode::NOT_FOUND, "no such session")),
+        1 => Ok(candidates[0].clone()),
+        _ => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             format!(
-                "{id:?} matches {} sessions; send more of the id",
+                "{id:?} matches {} sessions; send the origin and source, or more of the id",
                 candidates.len()
             ),
         )),
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionQuery {
+    origin: Option<String>,
+    source: Option<String>,
+}
+
+/// The `origin`/`source` query parameters, validated once: a malformed
+/// UUID or agent name is the client's mistake, not a missing session.
+fn qualifiers(params: &SessionQuery) -> Result<(Option<String>, Option<SourceId>), ApiError> {
+    let origin = match &params.origin {
+        Some(text) => {
+            let id = text.to_ascii_lowercase();
+            if valid_origin(&id) {
+                Some(id)
+            } else {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid origin: expected the peer's UUID origin identity",
+                ));
+            }
+        }
+        None => None,
+    };
+    let source = match &params.source {
+        Some(name) => Some(SourceId::parse(&name.to_lowercase()).ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_REQUEST, format!("unknown source {name:?}"))
+        })?),
+        None => None,
+    };
+    Ok((origin, source))
+}
+
+/// A detail read's id resolution. The poll snapshot answers first; a miss
+/// carrying both qualifiers — exactly what a discovery row hands a client —
+/// is retried against one fresh, policy-filtered discovery, so a row first
+/// seen through `/v1/federation/list` is readable before the next poll
+/// tick. A less-qualified miss stays a miss: only a read that already
+/// names its row pays for discovery, and the refreshed rows passed the
+/// same publication policy, so nothing hidden becomes readable.
+async fn resolve(
+    app: &Arc<App>,
+    id: &str,
+    origin: Option<&str>,
+    source: Option<SourceId>,
+) -> Result<SessionSummary, ApiError> {
+    let snapshot = app.snapshot.borrow().clone();
+    match find(&snapshot.sessions, id, origin, source) {
+        Ok(session) => Ok(session),
+        Err(miss) => {
+            if miss.status != StatusCode::NOT_FOUND || origin.is_none() || source.is_none() {
+                return Err(miss);
+            }
+            let worker = app.clone();
+            let id = id.to_owned();
+            let origin = origin.unwrap().to_owned();
+            // A discovery that itself failed is the answer, not a detail
+            // to smooth over: its 503 or 500 reaches the client instead
+            // of a miss that pretends the row is absent. A completed scan
+            // answers on its own terms — its misses read exactly like the
+            // snapshot's, and an ambiguity it introduced is an ambiguity
+            // the client must see.
+            let scan =
+                tokio::task::spawn_blocking(move || discover(&worker, Vec::new(), DEFAULT_HOPS))
+                    .await
+                    .map_err(|e| ApiError::internal(format!("federation discovery panicked: {e}")))
+                    .and_then(|scan| scan)?;
+            find(&scan.sessions, &id, Some(&origin), source)
+        }
     }
 }
 
@@ -206,9 +314,11 @@ fn find(snapshot: &Snapshot, id: &str) -> Result<SessionSummary, ApiError> {
 async fn session(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
+    Query(params): Query<SessionQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let (origin, source) = qualifiers(&params)?;
     let snapshot = app.snapshot.borrow().clone();
-    let session = find(&snapshot, &id)?;
+    let session = resolve(&app, &id, origin.as_deref(), source).await?;
     let mut row = snapshot.row(&session);
     if row.status.is_none() {
         let worker = app.clone();
@@ -236,8 +346,10 @@ async fn session(
 async fn transcript(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
+    Query(params): Query<SessionQuery>,
 ) -> Result<Response, ApiError> {
-    let session = find(&app.snapshot.borrow().clone(), &id)?;
+    let (origin, source) = qualifiers(&params)?;
+    let session = resolve(&app, &id, origin.as_deref(), source).await?;
     let body = if let Some(body) = app.transcripts.get(&session) {
         body
     } else {
@@ -263,6 +375,147 @@ async fn transcript(
     Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
 }
 
+/// This server's federation handshake: the protocol version and the stable
+/// origin identity. A missing or unreadable marker is an explicit error —
+/// never an invented identity.
+async fn federation_capabilities(
+    State(app): State<Arc<App>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let home = app.home.clone();
+    let origin = tokio::task::spawn_blocking(move || crate::federation::read_origin(&home))
+        .await
+        .map_err(|e| ApiError::internal(format!("reading the origin identity panicked: {e}")))?;
+    match origin {
+        Ok(origin) => Ok(Json(json!({
+            "version": crate::federation::PROTOCOL_VERSION,
+            "origin_id": origin
+        }))),
+        Err(e) => {
+            // The error names this machine's state directory; that stays here.
+            eprintln!("llm-sessions: federation identity unavailable: {e}");
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "federation identity unavailable on this server",
+            ))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct FederationQuery {
+    /// A JSON array of the UUIDs already visiting on this request's branch.
+    path: Option<String>,
+    /// The remaining hop budget, already decremented by the caller.
+    hops: Option<String>,
+}
+
+/// Guarded discovery over HTTP, the same contract as `federation list`
+/// over SSH: the caller's own ancestors and depth, never a cached gateway
+/// snapshot. Local-only servers answer with this machine's rows alone,
+/// whatever the peer configuration says.
+async fn federation_list(
+    State(app): State<Arc<App>>,
+    Query(params): Query<FederationQuery>,
+) -> Result<Json<crate::federation::FederationScan>, ApiError> {
+    let bad = |what: &str| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid {what}: use a JSON array of origin ids and hops of at most {DEFAULT_HOPS}"
+            ),
+        )
+    };
+    let mut visited: Vec<String> = serde_json::from_str(params.path.as_deref().unwrap_or("[]"))
+        .map_err(|_| bad("federation path"))?;
+    if visited.len() > DEFAULT_HOPS as usize || visited.iter().any(|id| !valid_origin(id)) {
+        return Err(bad("federation path"));
+    }
+    for id in &mut visited {
+        id.make_ascii_lowercase();
+    }
+    let hops: u32 = params
+        .hops
+        .as_deref()
+        .unwrap_or(&DEFAULT_HOPS.to_string())
+        .parse()
+        .map_err(|_| bad("hops"))?;
+    if hops > DEFAULT_HOPS {
+        return Err(bad("hops"));
+    }
+    let worker = app.clone();
+    let scan = tokio::task::spawn_blocking(move || discover(&worker, visited, hops))
+        .await
+        .map_err(|e| ApiError::internal(format!("federation discovery panicked: {e}")))?;
+    Ok(Json(scan?))
+}
+
+/// One request-local discovery: a fresh scan under the caller's own branch
+/// context, stamped and merged exactly as the SSH endpoint does, then
+/// narrowed to what this server's publication policy allows.
+fn discover(
+    app: &Arc<App>,
+    visited: Vec<String>,
+    hops: u32,
+) -> std::result::Result<crate::federation::FederationScan, ApiError> {
+    let origin = crate::federation::read_origin(&app.home).map_err(|e| {
+        // The error names this machine's state directory; that stays here.
+        eprintln!("llm-sessions: federation identity unavailable: {e}");
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "federation identity unavailable on this server",
+        )
+    })?;
+    if visited.contains(&origin) {
+        return Ok(crate::federation::FederationScan::default());
+    }
+    let fleet = Fleet::probe();
+    let overlay = Overlay::open(&Overlay::default_path(&app.home)).ok();
+    let mut scan = scan_with(&app.sources, overlay.as_ref(), Some(&fleet), &[]);
+    let hosts: Vec<remote::Host> = if app.federate {
+        let (hosts, failure) = configured_hosts(app);
+        if let Some(failure) = failure {
+            // A broken hosts.json is part of the answer, not only the log:
+            // the caller learns why this branch contributed no peers.
+            scan.failures.push(failure);
+        }
+        hosts
+    } else {
+        Vec::new()
+    };
+    extend_from_origin(
+        &mut scan,
+        &app.sources,
+        &hosts,
+        origin.clone(),
+        visited,
+        hops,
+    );
+    scan.sessions = merge::merge(scan.sessions);
+    borrow_cached_usage(&app.home, &mut scan);
+    let sessions = policy_filter(
+        &app.home,
+        &app.base,
+        &app.source_filter,
+        Some(&origin),
+        &mut scan,
+    );
+    Ok(crate::federation::FederationScan {
+        sessions,
+        failures: scan.failures,
+    })
+}
+
+/// The peers configured right now, not at startup: a host added after the
+/// server started is discoverable without a restart. A malformed file is
+/// reported, never swallowed.
+fn configured_hosts(app: &Arc<App>) -> (Vec<remote::Host>, Option<String>) {
+    let (config, failure) = remote::Config::load(&app.home);
+    (
+        config.hosts.into_iter().map(remote::Host::new).collect(),
+        failure,
+    )
+}
+
 async fn stream(State(app): State<Arc<App>>, ws: WebSocketUpgrade) -> Response {
     let snapshot = app.snapshot.clone();
     let stopped = app.stopped.clone();
@@ -278,19 +531,18 @@ impl TranscriptCache {
     fn get(&self, session: &SessionSummary) -> Option<Bytes> {
         lock(&self.0)
             .iter()
-            .find(|(key, updated, _)| {
-                key.0 == session.source && key.1 == session.id && *updated == session.updated
-            })
+            .find(|(key, updated, _)| *key == session.identity() && *updated == session.updated)
             .map(|(_, _, body)| body.clone())
     }
 
     fn put(&self, session: &SessionSummary, body: Bytes) {
         let mut cache = lock(&self.0);
-        cache.retain(|(key, _, _)| !(key.0 == session.source && key.1 == session.id));
+        let key = session.identity();
+        cache.retain(|(cached, _, _)| *cached != key);
         if cache.len() >= CACHED_TRANSCRIPTS {
             cache.pop_front();
         }
-        cache.push_back(((session.source, session.id.clone()), session.updated, body));
+        cache.push_back((key, session.updated, body));
     }
 }
 
@@ -381,7 +633,7 @@ mod tests {
         };
         Snapshot {
             sessions: vec![live, row("dead-2"), archived, child],
-            statuses: HashMap::from([((SourceId::Codex, "live-1".to_owned()), block)]),
+            statuses: HashMap::from([((None, SourceId::Codex, "live-1".to_owned()), block)]),
             watched: watched.to_owned(),
         }
     }
@@ -417,6 +669,9 @@ mod tests {
             facts: Arc::default(),
             transcripts: TranscriptCache::default(),
             stopped,
+            federate: false,
+            base: query::Query::parse(""),
+            source_filter: Vec::new(),
         });
         Harness {
             app,
@@ -469,7 +724,8 @@ mod tests {
             "/v1/sessions",
             "/v1/sessions/live-1",
             "/v1/sessions/live-1/transcript",
-            "/v1/stream",
+            "/v1/federation/capabilities",
+            "/v1/federation/list",
         ] {
             assert_eq!(
                 status_of(&app, uri, None).await,
@@ -573,6 +829,9 @@ mod tests {
             facts: Arc::default(),
             transcripts: TranscriptCache::default(),
             stopped,
+            federate: false,
+            base: query::Query::parse(""),
+            source_filter: Vec::new(),
         });
         let (status, body) = get(&app, "/v1/sessions?q=body:needle").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

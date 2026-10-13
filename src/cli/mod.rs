@@ -122,6 +122,7 @@ pub fn run() -> Result<()> {
                 status_window: std::time::Duration::from_hours(args.status_window),
                 sources: args.sources,
                 query: args.query,
+                federate: args.federate,
             },
         ),
         Some(Command::Doctor(args)) => report::doctor(&home, &args),
