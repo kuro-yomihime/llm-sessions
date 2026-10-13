@@ -98,10 +98,21 @@ pub(super) fn list(home: &Path) {
     }
 }
 
-pub(super) fn add(home: &Path, entry: remote::HostConfig) -> Result<()> {
+/// Add or update a host from the `hosts add` fields, applying the same
+/// rules `Config::load` does so a saved entry always loads.
+pub(super) fn add(home: &Path, args: super::args::AddHostArgs) -> Result<()> {
+    let super::args::AddHostArgs {
+        name,
+        ssh,
+        url,
+        home: remote_home,
+        token_env,
+        sources: wanted,
+        mode,
+    } = args;
     // Unknown agent names cannot match a store, so they are rejected here
     // rather than silently listing nothing.
-    for agent in &entry.sources {
+    for agent in &wanted {
         if SourceId::parse(agent).is_none() {
             return Err(Error::BadArgument {
                 what: "--source",
@@ -109,13 +120,26 @@ pub(super) fn add(home: &Path, entry: remote::HostConfig) -> Result<()> {
             });
         }
     }
-    if entry.name.trim().is_empty() {
+    if name.trim().is_empty() {
         return Err(Error::BadArgument {
             what: "name",
-            got: entry.name.clone(),
+            got: name.clone(),
         });
     }
-    // The same rules `Config::load` applies, so a saved entry always loads.
+    let entry = match remote::Transport::from_parts(ssh, url, remote_home, token_env) {
+        Ok(transport) => remote::HostConfig {
+            name,
+            transport,
+            sources: wanted,
+            mode: mode.unwrap_or_default(),
+        },
+        Err(problem) => {
+            return Err(Error::BadArgument {
+                what: "hosts add",
+                got: problem,
+            });
+        }
+    };
     if let Some(problem) = entry.problem() {
         return Err(Error::BadArgument {
             what: "hosts add",

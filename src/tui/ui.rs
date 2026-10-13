@@ -889,7 +889,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // The end of the message is where typing happens, so a long one
         // loses its head, not the cursor.
         Prompt::Insert { target, text } => {
-            let head = format!("Message to {}: ", target.1);
+            let head = format!("Message to {}: ", target.source);
             let room = width.saturating_sub(Span::raw(head.as_str()).width() + 1);
             (
                 Span::styled(format!("{head}{}_", tail_cells(text, room)), cyan),

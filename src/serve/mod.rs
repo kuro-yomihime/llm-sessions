@@ -120,10 +120,10 @@ async fn serve(home: &Path, config: Config, token: Option<String>) -> Result<()>
     let mut sources = source::all(home);
     wanted(&mut sources);
     let facts = Arc::new(poll::FactsCache::default());
-    let base = Query::parse(config.query.as_deref().unwrap_or_default());
+    let base = Arc::new(Query::parse(config.query.as_deref().unwrap_or_default()));
     let mut poller = poll::Poller::new(
         loader,
-        Query::parse(config.query.as_deref().unwrap_or_default()),
+        base.clone(),
         config.status_window,
         facts.clone(),
         config.federate,
@@ -155,14 +155,14 @@ async fn serve(home: &Path, config: Config, token: Option<String>) -> Result<()>
         token,
         host,
         home: home.to_path_buf(),
-        sources,
+        adapters: sources,
         snapshot: rx,
         facts,
         transcripts: router::TranscriptCache::default(),
         stopped,
         federate: config.federate,
         base,
-        source_filter: config.sources.clone(),
+        sources: config.sources.clone(),
     });
     axum::serve(listener, router::router(app))
         .with_graceful_shutdown(async move {

@@ -438,8 +438,7 @@ fn normalized_shapes_are_stable() {
 fn indexed_corpus_reads_back_for_every_source() {
     let home = scratch_home();
     let home = home.path();
-    let scan =
-        llm_sessions::catalog::scan::scan_with(&llm_sessions::source::all(home), None, None, &[]);
+    let scan = llm_sessions::catalog::scan::scan_with(&llm_sessions::source::all(home), None, None);
     let sources = llm_sessions::source::all(home);
     let dir = tempfile::tempdir().expect("tempdir");
     let mut index = llm_sessions::storage::index::Index::open(&dir.path().join("index.db"))

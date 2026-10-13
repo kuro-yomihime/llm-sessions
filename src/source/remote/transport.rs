@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
-use crate::source::remote::Host;
+use crate::federation::Capabilities;
+use crate::model::normalize_origin;
+use crate::source::remote::{Host, Transport};
 
 /// Newest transcripts considered per source per host. A fleet machine holds
 /// thousands; the interesting ones are the recent ones, and every extra path
@@ -53,12 +55,6 @@ pub(super) struct Probe {
     pub(super) federation: u32,
 }
 
-#[derive(serde::Deserialize)]
-struct Capability {
-    version: u32,
-    origin_id: String,
-}
-
 /// SSH concatenates its command arguments for the remote login shell.
 /// Quote every word once, then pass the entire command as one argument.
 pub(super) fn shell_command<'a>(argv: impl IntoIterator<Item = &'a str>) -> String {
@@ -89,7 +85,7 @@ pub(super) struct Scripted {
 
 impl Host {
     fn probe_script(&self) -> std::borrow::Cow<'static, str> {
-        if let Some(home) = &self.config.home {
+        if let Some(home) = self.configured_home() {
             let environment = home_environment(home);
             let assignments = shell_command(environment.iter().map(String::as_str));
             std::borrow::Cow::Owned(format!("export {assignments}\n{PROBE_SCRIPT}"))
@@ -101,7 +97,7 @@ impl Host {
     /// A configured home selects an account/session namespace consistently for
     /// marker probing, its config, and every guarded binary invocation.
     pub(super) fn ssh_binary(&self, home: &std::path::Path, args: &[&str]) -> Result<String> {
-        if self.config.home.is_some() {
+        if self.configured_home().is_some() {
             let environment = home_environment(home);
             let mut command = Vec::with_capacity(args.len() + environment.len() + 1);
             command.push("env");
@@ -146,13 +142,12 @@ impl Host {
                     } else if let Some(origin) = line.strip_prefix("origin:")
                         && crate::federation::valid_origin(origin)
                     {
-                        origin_id = Some(origin.to_ascii_lowercase());
+                        origin_id = Some(normalize_origin(origin));
                     }
                 }
                 let home = self
-                    .config
-                    .home
-                    .clone()
+                    .configured_home()
+                    .map(std::path::Path::to_path_buf)
                     .or(reported)
                     .ok_or_else(|| "host reported no home directory".to_string())?;
                 let origin_id = origin_id.ok_or_else(|| {
@@ -161,7 +156,7 @@ impl Host {
                 let federation = if let Some(binary) = llm_sessions.as_deref() {
                     match self.ssh_binary(&home, &[binary, "federation", "capabilities"]) {
                         Ok(raw) => {
-                            if let Ok(capability) = serde_json::from_str::<Capability>(&raw) {
+                            if let Ok(capability) = serde_json::from_str::<Capabilities>(&raw) {
                                 if capability.origin_id != origin_id {
                                     return Err("federation capability origin does not match origin marker".to_string());
                                 }
@@ -221,6 +216,9 @@ impl Host {
                 .expect("unexpected remote command")
                 .map_err(|message| self.fail(message));
         }
+        let Transport::Ssh { ssh, .. } = &self.config.transport else {
+            return Err(self.fail("an HTTP peer is not an ssh destination"));
+        };
         let mut command = Command::new("ssh");
         command.args([
             "-o",
@@ -232,7 +230,7 @@ impl Host {
             "-o",
             "ServerAliveCountMax=2",
         ]);
-        command.arg("--").arg(&self.config.ssh);
+        command.arg("--").arg(ssh);
         command.arg(shell_command(argv.iter().copied()));
         command
             .stdin(if stdin.is_some() {
@@ -372,10 +370,10 @@ mod tests {
         let configured_origin = crate::federation::ensure_origin(&configured).unwrap();
         let host = Host::new(crate::source::remote::HostConfig {
             name: "namespace".into(),
-            ssh: "namespace".into(),
-            url: None,
-            token_env: None,
-            home: Some(configured.clone()),
+            transport: crate::source::remote::Transport::Ssh {
+                ssh: "namespace".into(),
+                home: Some(configured.clone()),
+            },
             sources: Vec::new(),
             mode: crate::source::remote::Mode::Auto,
         });

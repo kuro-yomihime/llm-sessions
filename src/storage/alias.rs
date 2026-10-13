@@ -30,6 +30,22 @@ pub struct Bookmark {
     pub focus: char,
 }
 
+impl Bookmark {
+    /// Borrowed canonical identity, matching
+    /// [`crate::model::SessionSummary::key`].
+    /// `None` for legacy bookmarks without an origin: they have no
+    /// canonical identity to resolve against and never match a row.
+    pub fn key(&self) -> Option<crate::model::SessionKeyRef<'_>> {
+        self.origin_id
+            .as_deref()
+            .map(|origin_id| crate::model::SessionKeyRef {
+                origin_id: Some(origin_id),
+                source: self.source,
+                id: self.id.as_str(),
+            })
+    }
+}
+
 /// Letter → bookmark. `BTreeMap` so the file diffs stably.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Store {

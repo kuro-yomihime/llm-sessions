@@ -67,39 +67,12 @@ pub fn run() -> Result<()> {
                 hosts::list(&home);
                 Ok(())
             }
-            Some(HostsCommand::Add { .. } | HostsCommand::Remove { .. }) if cli.read_only => {
+            Some(HostsCommand::Add(_) | HostsCommand::Remove { .. }) if cli.read_only => {
                 Err(Error::ReadOnly {
                     what: "editing hosts.json",
                 })
             }
-            Some(HostsCommand::Add {
-                name,
-                ssh,
-                url,
-                token_env,
-                home: remote_home,
-                sources: wanted,
-                mode,
-            }) => hosts::add(
-                &home,
-                llm_sessions::source::remote::HostConfig {
-                    name,
-                    ssh: ssh.unwrap_or_default(),
-                    url,
-                    token_env,
-                    home: remote_home,
-                    sources: wanted,
-                    mode: match mode {
-                        None | Some(args::HostMode::Auto) => {
-                            llm_sessions::source::remote::Mode::Auto
-                        }
-                        Some(args::HostMode::LlmSessions) => {
-                            llm_sessions::source::remote::Mode::LlmSessions
-                        }
-                        Some(args::HostMode::Shell) => llm_sessions::source::remote::Mode::Shell,
-                    },
-                },
-            ),
+            Some(HostsCommand::Add(args)) => hosts::add(&home, args),
             Some(HostsCommand::Remove { name }) => hosts::remove(&home, &name),
         },
         Some(Command::Index(args)) if cli.read_only && !args.stats => {

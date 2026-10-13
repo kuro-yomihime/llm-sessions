@@ -18,7 +18,7 @@ impl App {
         let mut errors = Vec::new();
 
         for key in &targets {
-            let (_, source_id, id) = key;
+            let SessionKey { source, id, .. } = key;
             let Some(position) = self
                 .sessions
                 .iter()
@@ -27,7 +27,7 @@ impl App {
                 continue;
             };
             let locator = self.sessions[position].locator.clone();
-            let outcome = crate::source::find(&self.sources, *source_id)
+            let outcome = crate::source::find(&self.sources, *source)
                 .map_or(Ok(ArchiveOutcome::Unsupported), |src| {
                     src.archive(&locator, archive)
                 });
@@ -35,11 +35,11 @@ impl App {
             match outcome {
                 Ok(ArchiveOutcome::Native) => native += 1,
                 Ok(ArchiveOutcome::Unsupported) => match &self.overlay {
-                    Some(overlay) => match overlay.set_archived(*source_id, id, archive) {
+                    Some(overlay) => match overlay.set_archived(*source, id, archive) {
                         Ok(()) => overlaid += 1,
                         Err(e) => errors.push(e.to_string()),
                     },
-                    None => errors.push(format!("{source_id}: no overlay store")),
+                    None => errors.push(format!("{source}: no overlay store")),
                 },
                 Err(e) => errors.push(e.to_string()),
             }

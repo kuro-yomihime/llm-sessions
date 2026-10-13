@@ -521,7 +521,7 @@ fn rescan_restores_the_selected_transcript_after_rows_reorder() {
     write_session("older", 100);
     write_session("newer", 200);
     let sources: Vec<Box<dyn Source>> = vec![Box::new(crate::source::omp::Omp::new(dir.path()))];
-    let Scan { sessions, failures } = scan_with(&sources, None, None, &[]);
+    let Scan { sessions, failures } = scan_with(&sources, None, None);
     let mut app = App::new(
         dir.path(),
         sources,
@@ -1249,11 +1249,11 @@ fn only_enter_follows_a_link_including_wrapped_continuations() {
     assert_eq!(app.selected_session().unwrap().id, "child");
     assert!(app.status().is_some_and(|s| s.contains("read-only")));
 
-    assert!(!app.jump_to(&(
-        app.local_origin.clone(),
-        SourceId::Omp,
-        "elsewhere".to_string()
-    )));
+    assert!(!app.jump_to(&SessionKey {
+        origin_id: app.local_origin.clone(),
+        source: SourceId::Omp,
+        id: "elsewhere".to_string(),
+    }));
     assert!(app.status().is_some_and(|s| s.contains("not in this view")));
 }
 
@@ -1995,8 +1995,16 @@ fn initial_tui_merge_deduplicates_canonical_origins_not_observer_labels() {
     assert_eq!(app.total_sessions(), 2);
     let identities: HashSet<_> = app.sessions.iter().map(SessionSummary::identity).collect();
     assert_eq!(identities.len(), 2);
-    assert!(identities.contains(&(Some(ORIGIN_A.into()), SourceId::Omp, "same".into())));
-    assert!(identities.contains(&(Some(ORIGIN_B.into()), SourceId::Omp, "same".into())));
+    assert!(identities.contains(&SessionKey {
+        origin_id: Some(ORIGIN_A.into()),
+        source: SourceId::Omp,
+        id: "same".into()
+    }));
+    assert!(identities.contains(&SessionKey {
+        origin_id: Some(ORIGIN_B.into()),
+        source: SourceId::Omp,
+        id: "same".into()
+    }));
 }
 
 #[test]

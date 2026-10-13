@@ -2,14 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
-use llm_sessions::catalog::loader::{borrow_cached_usage, extend_from_origin};
-use llm_sessions::catalog::merge;
+use llm_sessions::catalog::loader::{guarded_scan, open};
 use llm_sessions::error::Error;
-use llm_sessions::federation::{FederationScan, read_origin, valid_origin};
-use llm_sessions::model::{AccessRoute, RouteHop};
+use llm_sessions::federation::{
+    Capabilities, FederationScan, Guard, read_origin, valid_origin, valid_route,
+};
+use llm_sessions::model::{AccessRoute, RouteHop, normalize_origin};
 use llm_sessions::runtime::live::Fleet;
 use llm_sessions::source::{self, remote};
-use llm_sessions::storage::overlay::Overlay;
 use llm_sessions::{Result, SessionSummary, SourceId, scan_with};
 
 use super::args::FederationCommand;
@@ -18,40 +18,25 @@ use super::emit;
 pub(super) fn run(home: &Path, command: &FederationCommand) -> Result<()> {
     match command {
         FederationCommand::Capabilities => {
-            emit(&serde_json::to_string(&serde_json::json!({
-                "version": llm_sessions::federation::PROTOCOL_VERSION,
-                "origin_id": read_origin(home)?,
-            }))?);
+            emit(&serde_json::to_string(&Capabilities::own(home)?)?);
         }
         FederationCommand::List { path, hops } => {
-            let mut visited: Vec<String> = serde_json::from_str(path)?;
-            if visited.len() > llm_sessions::federation::DEFAULT_HOPS as usize
-                || *hops > llm_sessions::federation::DEFAULT_HOPS
-                || visited.iter().any(|id| !valid_origin(id))
-            {
-                return Err(Error::BadArgument {
-                    what: "federation path",
-                    got: path.clone(),
-                });
-            }
-            for id in &mut visited {
-                id.make_ascii_lowercase();
-            }
+            let guard = Guard::new(path, *hops).map_err(|_| Error::BadArgument {
+                what: "federation path",
+                got: path.clone(),
+            })?;
             let origin = read_origin(home)?;
-            if visited.contains(&origin) {
+            if guard.visited.contains(&origin) {
                 emit(&serde_json::to_string(&FederationScan::default())?);
                 return Ok(());
             }
             let sources = source::all(home);
-            let overlay = Overlay::open(&Overlay::default_path(home)).ok();
-            let fleet = Fleet::probe();
-            let mut scan = scan_with(&sources, overlay.as_ref(), Some(&fleet), &[]);
             let (config, failure) = remote::Config::load(home);
-            scan.failures.extend(failure);
             let hosts: Vec<_> = config.hosts.into_iter().map(remote::Host::new).collect();
-            extend_from_origin(&mut scan, &sources, &hosts, origin, visited, *hops);
-            scan.sessions = merge::merge(scan.sessions);
-            borrow_cached_usage(home, &mut scan);
+            let mut scan = guarded_scan(home, &sources, &hosts, &origin, &guard);
+            if let Some(failure) = failure {
+                scan.failures.push(failure);
+            }
             emit(&serde_json::to_string(&FederationScan {
                 sessions: scan.sessions,
                 failures: scan.failures,
@@ -75,9 +60,9 @@ pub(super) fn run(home: &Path, command: &FederationCommand) -> Result<()> {
                 hop.token_env = None;
             }
             let own = read_origin(home)?;
-            let origin = origin.to_ascii_lowercase();
+            let origin = normalize_origin(origin);
             for hop in &mut hops {
-                hop.origin_id.make_ascii_lowercase();
+                hop.origin_id = normalize_origin(&hop.origin_id);
             }
             validate_route(&own, &origin, &hops)?;
             let transcript = if let Some(first) = hops.first() {
@@ -99,11 +84,7 @@ pub(super) fn run(home: &Path, command: &FederationCommand) -> Result<()> {
                     .into_iter()
                     .filter(|adapter| adapter.id() == source)
                     .collect();
-                let adapter = source::find(&sources, source).ok_or(Error::Unsupported {
-                    agent: source,
-                    what: "reading transcripts",
-                })?;
-                let scan = scan_with(&sources, None, None, &[]);
+                let scan = scan_with(&sources, None, None);
                 let session = scan
                     .sessions
                     .iter()
@@ -112,10 +93,7 @@ pub(super) fn run(home: &Path, command: &FederationCommand) -> Result<()> {
                         db: PathBuf::from("<local source>"),
                         id: id.clone(),
                     })?;
-                let mut transcript = adapter.open(&session.locator)?;
-                transcript.title = transcript.title.or_else(|| session.title.clone());
-                transcript.workspace = session.workspace.clone().or(transcript.workspace);
-                transcript
+                open(home, &sources, session)?
             };
             emit(&serde_json::to_string(&transcript)?);
         }
@@ -123,7 +101,7 @@ pub(super) fn run(home: &Path, command: &FederationCommand) -> Result<()> {
             // A leaf operation: ordinary `top` recursively contacts peers.
             let fleet = Fleet::probe();
             let sources = source::all(home);
-            let scan = scan_with(&sources, None, Some(&fleet), &[]);
+            let scan = scan_with(&sources, None, Some(&fleet));
             let rows: Vec<_> = fleet
                 .processes()
                 .iter()
@@ -154,16 +132,19 @@ pub(super) fn run(home: &Path, command: &FederationCommand) -> Result<()> {
     Ok(())
 }
 
+/// A route this machine received, as the `show` endpoint may travel it.
+///
+/// [`valid_route`] states the protocol's own rule; the receiving endpoint
+/// adds what only it knows: the route must never pass back through this
+/// machine, and an empty route is the local read of this machine's own row.
 fn validate_route(own: &str, target: &str, hops: &[RouteHop]) -> Result<()> {
-    let mut seen = std::collections::HashSet::from([own]);
     let valid = valid_origin(target)
-        && hops.len() <= llm_sessions::federation::DEFAULT_HOPS as usize
-        && hops.iter().all(|hop| {
-            valid_origin(&hop.origin_id) && hop.reachable() && seen.insert(hop.origin_id.as_str())
-        })
-        && hops
-            .last()
-            .map_or(own == target, |hop| hop.origin_id == target);
+        && !hops.iter().any(|hop| hop.origin_id == own)
+        && if hops.is_empty() {
+            own == target
+        } else {
+            valid_route(hops, target)
+        };
     if !valid {
         return Err(Error::BadArgument {
             what: "federation route",

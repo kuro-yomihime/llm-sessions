@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 
 use crate::catalog::query::{Filters, eligible};
 use crate::catalog::workspace;
-use crate::model::{Change, SessionKey, SessionSummary, SourceId, Usage};
+use crate::model::{Change, SessionKey, SessionKeyRef, SessionSummary, SourceId, Usage};
 use crate::runtime::live::Fleet;
 
 /// Half-life of the workspace recency score, in days. Raw counts let `/tmp`
@@ -189,7 +189,7 @@ pub fn candidates<'a>(
     sessions: &'a [SessionSummary],
     filters: &Filters<'_>,
 ) -> impl Iterator<Item = (usize, &'a SessionSummary)> {
-    let visible_parents: HashSet<(Option<&str>, SourceId, &str)> = sessions
+    let visible_parents: HashSet<SessionKeyRef<'_>> = sessions
         .iter()
         .filter(|s| !s.subagent && eligible(s, filters))
         .map(SessionSummary::key)
@@ -197,7 +197,11 @@ pub fn candidates<'a>(
     sessions.iter().enumerate().filter(move |(_, s)| {
         if s.subagent {
             return s.parent.as_deref().is_some_and(|id| {
-                visible_parents.contains(&(s.origin_id.as_deref(), s.source, id))
+                visible_parents.contains(&SessionKeyRef {
+                    origin_id: s.origin_id.as_deref(),
+                    source: s.source,
+                    id,
+                })
             });
         }
         eligible(s, filters)
@@ -223,9 +227,12 @@ fn fleet_pid(session: &SessionSummary, sessions: &[SessionSummary]) -> Option<u3
             return None;
         }
         let parent = current.parent.as_deref()?;
-        current = sessions.iter().find(|s| {
-            s.origin_id == current.origin_id && s.source == current.source && s.id == parent
-        })?;
+        let parent_key = SessionKeyRef {
+            origin_id: current.origin_id.as_deref(),
+            source: current.source,
+            id: parent,
+        };
+        current = sessions.iter().find(|s| s.key() == parent_key)?;
     }
     None
 }
@@ -236,7 +243,7 @@ pub fn group_key(
     sessions: &[SessionSummary],
 ) -> Option<String> {
     // Canonical origins qualify groups; display labels are not identities.
-    let host = session.origin_id.clone().unwrap_or_else(|| {
+    let origin = session.origin_id.clone().unwrap_or_else(|| {
         if session.is_local() {
             "local".into()
         } else {
@@ -246,11 +253,11 @@ pub fn group_key(
     match grouping {
         Grouping::Timeline => None,
         Grouping::Agent => Some(session.source.name().to_string()),
-        Grouping::Host => Some(host),
+        Grouping::Host => Some(origin),
         // A repository plus its branch: the worktree rollup is right, but
         // it hides the only thing that distinguishes a stack of them.
         Grouping::Branch => Some(format!(
-            "{host}\u{1f}{}\u{1f}{}",
+            "{origin}\u{1f}{}\u{1f}{}",
             session
                 .workspace
                 .as_ref()
@@ -263,9 +270,9 @@ pub fn group_key(
         // whole point of the view is "what is this instance doing", and
         // that includes the children it already finished. A remote pid is
         // prefixed with its host, because two machines each have a pid 42.
-        Grouping::Fleet => Some(format!("{host}:{}", fleet_pid(session, sessions)?)),
+        Grouping::Fleet => Some(format!("{origin}:{}", fleet_pid(session, sessions)?)),
         Grouping::Workspace => Some(format!(
-            "{host}\u{1f}{}",
+            "{origin}\u{1f}{}",
             session
                 .workspace
                 .as_ref()
@@ -444,7 +451,7 @@ pub fn tree(
     members: &[usize],
     collapsed: &HashSet<SessionKey>,
 ) -> Vec<Row> {
-    let present: std::collections::HashMap<(Option<&str>, SourceId, &str), usize> =
+    let present: std::collections::HashMap<SessionKeyRef<'_>, usize> =
         members.iter().map(|&i| (sessions[i].key(), i)).collect();
 
     let mut children: std::collections::HashMap<usize, Vec<usize>> =
@@ -457,7 +464,11 @@ pub fn tree(
             .as_deref()
             .and_then(|id| {
                 present
-                    .get(&(session.origin_id.as_deref(), session.source, id))
+                    .get(&SessionKeyRef {
+                        origin_id: session.origin_id.as_deref(),
+                        source: session.source,
+                        id,
+                    })
                     .copied()
             })
             .filter(|&parent| parent != index);

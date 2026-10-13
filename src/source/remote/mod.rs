@@ -28,12 +28,14 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clap::ValueEnum;
 pub use parse::parse_shell_listing;
 use serde::{Deserialize, Serialize};
 use transport::{Probe, files_script, missing_sqlite3_script, open_sql_script, sql_script};
 
+use crate::catalog::scan::Scan;
 use crate::error::{Error, Result};
-use crate::federation::{DiscoveryContext, FederationScan};
+use crate::federation::{DiscoveryContext, FederationScan, valid_route};
 use crate::model::{
     AccessRoute, Locator, RouteHop, SessionKey, SessionSummary, SourceId, Transcript,
     valid_peer_url,
@@ -49,31 +51,15 @@ const REMOTE_BODY_MAX: u64 = 8 * 1024 * 1024;
 /// faster than the eye, and this keeps one `ssh` per host per quarter minute.
 const REFRESH: Duration = Duration::from_secs(15);
 
-/// One configured machine. `name` labels rows; `ssh` is whatever `ssh`
-/// accepts — an alias from `~/.ssh/config` or `user@host`. An HTTP peer
-/// carries `url` instead of `ssh` (exactly one of the two), with an optional
-/// `token_env` naming the environment variable that holds its bearer token.
-/// The token itself never enters this file, a route, or an error.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// One configured machine. `name` labels rows; the [`Transport`] says how
+/// it is reached. The token itself never enters this file, a route, or an
+/// error.
+#[derive(Clone, Debug)]
 pub struct HostConfig {
     pub name: String,
-    /// SSH destination; empty for HTTP peers.
-    #[serde(default)]
-    pub ssh: String,
-    /// Base URL of an HTTP federation peer; `None` for SSH peers.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// Environment variable holding the HTTP peer's bearer token. A name,
-    /// never a secret; resolved only on this machine, at request time.
-    #[serde(default)]
-    pub token_env: Option<String>,
-    /// Remote home. Absent: ask the host with `echo $HOME`. SSH only.
-    #[serde(default)]
-    pub home: Option<PathBuf>,
+    pub transport: Transport,
     /// Agent names ([`SourceId::name`]) to scan. Empty: all of them.
-    #[serde(default)]
     pub sources: Vec<String>,
-    #[serde(default)]
     pub mode: Mode,
 }
 
@@ -81,50 +67,134 @@ impl HostConfig {
     /// One reported line explaining why this entry cannot be used, or `None`
     /// when it is well-formed. Checked at load and again in `hosts add`, so
     /// a hand-edited file and the CLI agree on what a peer looks like.
+    /// Which transport an entry is — and that it states exactly one — is
+    /// settled by construction ([`Transport::from_parts`]); what remains
+    /// are the values an explicit transport can still carry wrongly.
     pub fn problem(&self) -> Option<String> {
-        let url = self.url.as_deref();
-        match (self.ssh.trim().is_empty(), url) {
-            (true, None) => Some("needs one of ssh or url".to_string()),
-            (false, Some(_)) => Some("has both ssh and url".to_string()),
+        let Transport::Http { url, token_env } = &self.transport else {
+            return None;
+        };
+        if !valid_peer_url(url) {
+            return Some(format!(
+                "url {url:?} must be http:// or https:// with a host"
+            ));
+        }
+        if self.mode == Mode::Shell {
+            return Some(
+                "shell transport needs ssh; an HTTP peer always speaks the federation protocol"
+                    .to_string(),
+            );
+        }
+        let name = token_env.as_deref()?;
+        if name.is_empty() || name.contains(['=', '\0']) || name.chars().any(char::is_whitespace) {
+            return Some("token_env must name an environment variable".to_string());
+        }
+        None
+    }
+}
+
+impl Serialize for HostConfig {
+    /// The published flat hosts.json shape, unchanged: `ssh`, `url`,
+    /// `token_env` and `home` sit side by side, an HTTP peer leaving `ssh`
+    /// empty and an SSH peer leaving `url` unset.
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        let mut state = serializer.serialize_struct("HostConfig", 7)?;
+        state.serialize_field("name", &self.name)?;
+        match &self.transport {
+            Transport::Ssh { ssh, home } => {
+                state.serialize_field("ssh", ssh)?;
+                state.serialize_field("url", &None::<String>)?;
+                state.serialize_field("token_env", &None::<String>)?;
+                state.serialize_field("home", home)?;
+            }
+            Transport::Http { url, token_env } => {
+                state.serialize_field("ssh", "")?;
+                state.serialize_field("url", &Some(url.as_str()))?;
+                state.serialize_field("token_env", token_env)?;
+                state.serialize_field("home", &None::<PathBuf>)?;
+            }
+        }
+        state.serialize_field("sources", &self.sources)?;
+        state.serialize_field("mode", &self.mode)?;
+        state.end()
+    }
+}
+
+/// Exactly one way to reach a peer: an `ssh` destination, or the HTTP
+/// federation protocol. `ssh` is whatever `ssh` accepts — an alias from
+/// `~/.ssh/config` or `user@host`. An HTTP peer carries `url` instead
+/// (never both), with an optional `token_env` naming the environment
+/// variable that holds its bearer token.
+#[derive(Clone, Debug)]
+pub enum Transport {
+    /// Reached with the `ssh` command.
+    Ssh {
+        /// Destination `ssh` is invoked with.
+        ssh: String,
+        /// Remote home. Absent: ask the host with `echo $HOME`.
+        home: Option<PathBuf>,
+    },
+    /// Reached over HTTP, as a `llm-sessions serve` peer.
+    Http {
+        /// Base URL of the peer.
+        url: String,
+        /// Environment variable holding the peer's bearer token. A name,
+        /// never a secret; resolved only on this machine, at request time.
+        token_env: Option<String>,
+    },
+}
+
+impl Transport {
+    /// The exactly-one-of pair every construction path states: an optional
+    /// `ssh` or `url`, with the per-transport extras on their own side —
+    /// `home` belongs to ssh, `token_env` to http. A malformed combination
+    /// is refused with the same wording [`HostConfig::problem`] reports,
+    /// so the CLI and a hand-edited file fail alike.
+    pub fn from_parts(
+        ssh: Option<String>,
+        url: Option<String>,
+        home: Option<PathBuf>,
+        token_env: Option<String>,
+    ) -> std::result::Result<Self, String> {
+        match (ssh.as_ref().is_none_or(|ssh| ssh.trim().is_empty()), url) {
+            (true, None) => Err("needs one of ssh or url".to_string()),
+            (false, Some(_)) => Err("has both ssh and url".to_string()),
             (false, None) => {
-                if self.token_env.is_some() {
-                    return Some(
-                        "token_env is an http setting; an ssh peer needs none".to_string(),
-                    );
+                if token_env.is_some() {
+                    return Err("token_env is an http setting; an ssh peer needs none".to_string());
                 }
-                None
+                Ok(Self::Ssh {
+                    ssh: ssh.expect("the match arm checked ssh non-empty"),
+                    home,
+                })
             }
             (true, Some(url)) => {
-                if !valid_peer_url(url) {
-                    return Some(format!(
-                        "url {url:?} must be http:// or https:// with a host"
-                    ));
+                if home.is_some() {
+                    return Err("home is an ssh setting; an HTTP peer owns its own".to_string());
                 }
-                if self.home.is_some() {
-                    return Some("home is an ssh setting; an HTTP peer owns its own".to_string());
-                }
-                if self.mode == Mode::Shell {
-                    return Some(
-                        "shell transport needs ssh; an HTTP peer always speaks the federation protocol"
-                            .to_string(),
-                    );
-                }
-                let name = self.token_env.as_deref()?;
-                if name.is_empty()
-                    || name.contains(['=', '\0'])
-                    || name.chars().any(char::is_whitespace)
-                {
-                    return Some("token_env must name an environment variable".to_string());
-                }
-                None
+                Ok(Self::Http { url, token_env })
             }
+        }
+    }
+
+    /// What rows and `hosts` show for this peer: its URL, or the ssh alias.
+    pub fn destination(&self) -> &str {
+        match self {
+            Self::Ssh { ssh, .. } => ssh,
+            Self::Http { url, .. } => url,
         }
     }
 }
 
 /// Which transport to use. `Auto` probes for a remote `llm-sessions` once per process
-/// and remembers the answer.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+/// and remembers the answer. One enum serves both the command line
+/// (`hosts add --mode`) and hosts.json, whose kebab-case spellings
+/// (`auto`, `llm-sessions`, `shell`) coincide with the CLI's.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
     #[default]
@@ -135,10 +205,44 @@ pub enum Mode {
     Shell,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Config {
-    #[serde(default)]
     pub hosts: Vec<HostConfig>,
+}
+
+/// The wire shape of hosts.json: the historical flat fields, parsed only
+/// inside [`Config::load_at`] and immediately turned into the explicit
+/// [`Transport`]. The flat `ssh`/`url` pair — including the empty `ssh`
+/// an HTTP peer historically wrote — never escapes this boundary.
+mod wire {
+    use std::path::PathBuf;
+
+    use serde::Deserialize;
+
+    use super::Mode;
+
+    #[derive(Deserialize)]
+    pub(super) struct Config {
+        #[serde(default)]
+        pub(super) hosts: Vec<HostConfig>,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct HostConfig {
+        pub(super) name: String,
+        #[serde(default)]
+        pub(super) ssh: String,
+        #[serde(default)]
+        pub(super) url: Option<String>,
+        #[serde(default)]
+        pub(super) token_env: Option<String>,
+        #[serde(default)]
+        pub(super) home: Option<PathBuf>,
+        #[serde(default)]
+        pub(super) sources: Vec<String>,
+        #[serde(default)]
+        pub(super) mode: Mode,
+    }
 }
 
 impl Config {
@@ -179,52 +283,57 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::default(), None),
             Err(e) => return (Self::default(), Some(format!("hosts.json: {e}"))),
         };
-        let parsed: Self = match serde_json::from_str(&text) {
+        let parsed: wire::Config = match serde_json::from_str(&text) {
             Ok(parsed) => parsed,
             Err(e) => return (Self::default(), Some(format!("hosts.json: {e}"))),
         };
 
         let mut hosts: Vec<HostConfig> = Vec::with_capacity(parsed.hosts.len());
         let mut problems: Vec<String> = Vec::new();
-        for host in parsed.hosts {
-            if host.name.trim().is_empty() {
+        for wire::HostConfig {
+            name,
+            ssh,
+            url,
+            token_env,
+            home,
+            sources,
+            mode,
+        } in parsed.hosts
+        {
+            if name.trim().is_empty() {
                 problems.push(format!(
-                    "hosts.json: host {:?} needs a name, entry ignored",
-                    host.name
+                    "hosts.json: host {name:?} needs a name, entry ignored"
                 ));
                 continue;
             }
-            if let Some(problem) = host.problem() {
-                problems.push(format!(
-                    "hosts.json: host {} {problem}, entry ignored",
-                    host.name
-                ));
+            let entry = match Transport::from_parts(Some(ssh), url, home, token_env) {
+                Ok(transport) => HostConfig {
+                    name: name.clone(),
+                    transport,
+                    sources,
+                    mode,
+                },
+                Err(problem) => {
+                    problems.push(format!("hosts.json: host {name} {problem}, entry ignored"));
+                    continue;
+                }
+            };
+            if let Some(problem) = entry.problem() {
+                problems.push(format!("hosts.json: host {name} {problem}, entry ignored"));
                 continue;
             }
-            if hosts.iter().any(|kept| kept.name == host.name) {
+            if hosts.iter().any(|kept| kept.name == entry.name) {
                 problems.push(format!(
                     "hosts.json: duplicate host {}, later entry ignored",
-                    host.name
+                    entry.name
                 ));
                 continue;
             }
-            hosts.push(host);
+            hosts.push(entry);
         }
         let failure = (!problems.is_empty()).then(|| problems.join("; "));
         (Self { hosts }, failure)
     }
-}
-
-/// Rows and per-source problems from one host listing.
-///
-/// A source that cannot be listed without a remote `llm-sessions` is a failure
-/// *entry*, not a failed host: the other sources on that machine still
-/// produce rows.
-#[derive(Debug, Default)]
-pub struct HostScan {
-    pub sessions: Vec<SessionSummary>,
-    /// Self-describing messages: a host-wide problem names the machine.
-    pub failures: Vec<String>,
 }
 
 /// One remote agent process, exactly as `llm-sessions top --json` emits it.
@@ -253,24 +362,8 @@ pub struct Host {
     /// Learned once over HTTP: the peer's origin, from its capabilities.
     #[cfg(feature = "http")]
     http_origin: OnceLock<std::result::Result<String, String>>,
-    /// Canned rows, so the scan's merge path is testable without an ssh.
-    #[cfg(test)]
-    canned: Option<Vec<SessionSummary>>,
     #[cfg(test)]
     scripted: Option<transport::Scripted>,
-}
-
-fn valid_route(hops: &[RouteHop], origin: &str) -> bool {
-    !hops.is_empty()
-        && u32::try_from(hops.len()).is_ok_and(|length| length <= crate::federation::DEFAULT_HOPS)
-        && hops.last().is_some_and(|hop| hop.origin_id == origin)
-        && hops.iter().enumerate().all(|(index, hop)| {
-            crate::federation::valid_origin(&hop.origin_id)
-                && hop.reachable()
-                && !hops[..index]
-                    .iter()
-                    .any(|previous| previous.origin_id == hop.origin_id)
-        })
 }
 
 /// Resume at the actual origin, preserving every SSH shell parsing layer.
@@ -313,8 +406,8 @@ pub fn resume_command(
 }
 
 /// The route a resume travels: among the session's canonical routes, the
-/// deterministic shortest-then-lexical one whose hops are all valid ssh
-/// hops. Selection ignores [`SessionSummary::preferred_route`], which
+/// [`AccessRoute::cmp_preferred`] one whose hops are all valid ssh hops.
+/// Selection ignores [`SessionSummary::preferred_route`], which
 /// legitimately prefers an HTTP hop for reading. An invalid or http-only
 /// route is never a fallback — it is not a candidate at all.
 fn resume_route(session: &SessionSummary) -> Option<&AccessRoute> {
@@ -325,7 +418,7 @@ fn resume_route(session: &SessionSummary) -> Option<&AccessRoute> {
         .filter(|route| {
             valid_route(&route.hops, origin) && route.hops.iter().all(|hop| hop.url.is_none())
         })
-        .min_by(|a, b| a.hops.len().cmp(&b.hops.len()).then_with(|| a.cmp(b)))
+        .min_by(|a, b| a.cmp_preferred(b))
 }
 
 impl Host {
@@ -335,8 +428,6 @@ impl Host {
             probe: OnceLock::new(),
             #[cfg(feature = "http")]
             http_origin: OnceLock::new(),
-            #[cfg(test)]
-            canned: None,
             #[cfg(test)]
             scripted: None,
         }
@@ -349,50 +440,36 @@ impl Host {
     /// hosts.json. A URL this observer never configured is asked nothing
     /// this observer holds.
     pub fn from_route_hop(hop: &RouteHop, home: &Path) -> Self {
-        let url = hop.url.as_deref().map(|url| url.trim_end_matches('/'));
-        let token_env = url.and_then(|url| {
-            Config::load(home)
-                .0
-                .hosts
-                .into_iter()
-                .find(|configured| {
-                    configured
-                        .url
-                        .as_deref()
-                        .map(|url| url.trim_end_matches('/'))
-                        == Some(url)
-                })
-                .and_then(|configured| configured.token_env)
-        });
+        let transport = match hop.url.as_deref() {
+            Some(url) => {
+                let token_env = Config::load(home)
+                    .0
+                    .hosts
+                    .into_iter()
+                    .find(|configured| {
+                        matches!(&configured.transport, Transport::Http { url: bound, .. }
+                            if bound.trim_end_matches('/') == url.trim_end_matches('/'))
+                    })
+                    .and_then(|configured| match configured.transport {
+                        Transport::Http { token_env, .. } => token_env,
+                        Transport::Ssh { .. } => None,
+                    });
+                Transport::Http {
+                    url: url.to_owned(),
+                    token_env,
+                }
+            }
+            None => Transport::Ssh {
+                ssh: hop.ssh.clone(),
+                home: hop.home.clone(),
+            },
+        };
         Self::new(HostConfig {
             name: hop.name.clone(),
-            ssh: hop.ssh.clone(),
-            url: hop.url.clone(),
-            token_env,
-            home: hop.home.clone(),
+            transport,
             sources: Vec::new(),
             mode: Mode::Auto,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fake(name: &str, sessions: Vec<SessionSummary>) -> Self {
-        Self {
-            config: HostConfig {
-                name: name.to_owned(),
-                ssh: name.to_owned(),
-                url: None,
-                token_env: None,
-                home: None,
-                sources: Vec::new(),
-                mode: Mode::Shell,
-            },
-            probe: OnceLock::new(),
-            #[cfg(feature = "http")]
-            http_origin: OnceLock::new(),
-            canned: Some(sessions),
-            scripted: None,
-        }
     }
 
     pub fn name(&self) -> &str {
@@ -401,12 +478,21 @@ impl Host {
 
     /// What rows and `hosts` show for this peer: its URL, or the ssh alias.
     pub fn destination(&self) -> &str {
-        self.config.url.as_deref().unwrap_or(&self.config.ssh)
+        self.config.transport.destination()
     }
 
     /// Whether this peer is reached over HTTP rather than ssh.
     fn is_http(&self) -> bool {
-        self.config.url.is_some()
+        matches!(self.config.transport, Transport::Http { .. })
+    }
+
+    /// The remote home the configuration pins, if it does. An HTTP peer
+    /// owns its own; only the ssh transport has one to pin.
+    fn configured_home(&self) -> Option<&Path> {
+        match &self.config.transport {
+            Transport::Ssh { home, .. } => home.as_deref(),
+            Transport::Http { .. } => None,
+        }
     }
 
     #[cfg(not(feature = "http"))]
@@ -434,15 +520,7 @@ impl Host {
     /// why it cannot be reached.
     pub fn status(&self) -> String {
         if self.is_http() {
-            #[cfg(feature = "http")]
-            {
-                return match &self.http_probed() {
-                    Ok(_) => "http".to_string(),
-                    Err(message) => format!("unreachable: {message}"),
-                };
-            }
-            #[cfg(not(feature = "http"))]
-            return format!("unreachable: {}", self.http_unavailable());
+            return self.http_status();
         }
         match self.probe_once() {
             Err(message) => format!("unreachable: {message}"),
@@ -451,35 +529,15 @@ impl Host {
         }
     }
 
-    /// Discover a peer with a request-local ancestor path. Standalone callers
-    /// read their own marker first; a missing identity never permits recursion.
-    pub fn list(&self, sources: &[Box<dyn Source>]) -> Result<HostScan> {
-        #[cfg(test)]
-        if let Some(rows) = &self.canned {
-            return Ok(HostScan {
-                sessions: rows.clone(),
-                failures: Vec::new(),
-            });
-        }
-        let origin = crate::federation::read_origin(&crate::home()?)?;
-        self.list_with(
-            sources,
-            &DiscoveryContext {
-                visited: vec![origin],
-                ..DiscoveryContext::default()
-            },
-        )
-    }
-
     /// `context.visited` already includes the calling instance. Each branch
     /// borrows that immutable value; only the receiving endpoint extends it.
     pub fn list_with(
         &self,
         sources: &[Box<dyn Source>],
         context: &DiscoveryContext,
-    ) -> Result<HostScan> {
+    ) -> Result<Scan> {
         if context.remaining_hops == 0 {
-            return Ok(HostScan {
+            return Ok(Scan {
                 sessions: Vec::new(),
                 failures: vec![format!(
                     "{}: federation hop limit reached; discovery truncated",
@@ -487,45 +545,12 @@ impl Host {
                 )],
             });
         }
-        #[cfg(test)]
-        if let Some(rows) = &self.canned {
-            return Ok(HostScan {
-                sessions: rows.clone(),
-                failures: Vec::new(),
-            });
-        }
         if self.is_http() {
-            #[cfg(feature = "http")]
-            {
-                let origin = self
-                    .http_probed()
-                    .map_err(|message| self.fail(message.clone()))?;
-                if context
-                    .visited
-                    .iter()
-                    .any(|visited| visited.as_str() == origin)
-                {
-                    return Ok(HostScan::default());
-                }
-                let mut scan = self.http_list(context)?;
-                scan.sessions.retain(|session| self.wants(session.source));
-                for session in &mut scan.sessions {
-                    self.attach_route(session, origin)?;
-                }
-                return Ok(HostScan {
-                    sessions: scan.sessions,
-                    failures: scan.failures,
-                });
-            }
-            #[cfg(not(feature = "http"))]
-            return Ok(HostScan {
-                sessions: Vec::new(),
-                failures: vec![self.http_unavailable().to_string()],
-            });
+            return self.http_list_with(context);
         }
         let probe = self.probed()?;
         if context.visited.contains(&probe.origin_id) {
-            return Ok(HostScan::default());
+            return Ok(Scan::default());
         }
         if !self.use_llm_sessions(probe) {
             let mut scan = self.list_via_shell(sources, probe)?;
@@ -574,25 +599,18 @@ impl Host {
                 .fail("invalid access route: malformed, cyclic, over-depth, or incorrect target"));
         }
         if first.url.is_some() {
-            #[cfg(feature = "http")]
-            {
-                let probed = self
-                    .http_probed()
-                    .map_err(|message| self.fail(message.clone()))?;
-                if first.url.as_ref() != self.config.url.as_ref()
-                    || first.origin_id != probed
-                    || !self.config.ssh.is_empty()
-                {
-                    return Err(self.fail("access route does not match the probed peer origin"));
-                }
-                return self.http_transcript(session);
-            }
-            #[cfg(not(feature = "http"))]
-            return Err(self.http_unavailable());
+            return self.http_open(session, first);
         }
         let probe = self.probed()?;
-        if first.ssh != self.config.ssh
-            || first.home != self.config.home
+        let Transport::Ssh {
+            ssh,
+            home: peer_home,
+        } = &self.config.transport
+        else {
+            return Err(self.fail("access route does not match the probed peer origin"));
+        };
+        if first.ssh != *ssh
+            || first.home.as_deref() != peer_home.as_deref()
             || first.origin_id != probe.origin_id
         {
             return Err(self.fail("access route does not match the probed peer origin"));
@@ -634,16 +652,7 @@ impl Host {
     /// would be a fabrication, so HTTP peers refuse.
     pub fn top(&self) -> Result<Vec<RemoteProcess>> {
         if self.is_http() {
-            #[cfg(feature = "http")]
-            {
-                self.http_probed()
-                    .map_err(|message| self.fail(message.clone()))?;
-                return Err(
-                    self.fail("the HTTP federation protocol does not expose live processes")
-                );
-            }
-            #[cfg(not(feature = "http"))]
-            return Err(self.http_unavailable());
+            return self.http_top();
         }
         let probe = self.probed()?;
         if !self.use_llm_sessions(probe) {
@@ -668,14 +677,7 @@ impl Host {
     /// used this host pays nothing extra.
     pub fn origin_id(&self) -> Result<&str> {
         if self.is_http() {
-            #[cfg(feature = "http")]
-            {
-                return self
-                    .http_probed()
-                    .map_err(|message| self.fail(message.clone()));
-            }
-            #[cfg(not(feature = "http"))]
-            return Err(self.http_unavailable());
+            return self.http_origin_id();
         }
         Ok(&self.probed()?.origin_id)
     }
@@ -692,7 +694,7 @@ impl Host {
 
     // ---- transports ----
 
-    fn list_via_llm_sessions(&self, probe: &Probe, context: &DiscoveryContext) -> Result<HostScan> {
+    fn list_via_llm_sessions(&self, probe: &Probe, context: &DiscoveryContext) -> Result<Scan> {
         let path = serde_json::to_string(&context.visited)?;
         let hops = (context.remaining_hops - 1).to_string();
         let raw = self.ssh_binary(
@@ -714,7 +716,7 @@ impl Host {
         for session in &mut scan.sessions {
             self.attach_route(session, &probe.origin_id)?;
         }
-        Ok(HostScan {
+        Ok(Scan {
             sessions: scan.sessions,
             failures: scan.failures,
         })
@@ -728,16 +730,22 @@ impl Host {
             .as_deref()
             .filter(|origin| crate::federation::valid_origin(origin))
             .ok_or_else(|| self.fail("received session has no valid canonical origin identity"))?;
-        let hop = RouteHop {
-            origin_id: peer.to_owned(),
-            name: self.config.name.clone(),
-            ssh: self.config.ssh.clone(),
-            url: self.config.url.clone(),
-            token_env: self.config.token_env.clone(),
-            home: if self.is_http() {
-                None
-            } else {
-                self.config.home.clone()
+        let hop = match &self.config.transport {
+            Transport::Ssh { ssh, home } => RouteHop {
+                origin_id: peer.to_owned(),
+                name: self.config.name.clone(),
+                ssh: ssh.clone(),
+                url: None,
+                token_env: None,
+                home: home.clone(),
+            },
+            Transport::Http { url, token_env } => RouteHop {
+                origin_id: peer.to_owned(),
+                name: self.config.name.clone(),
+                ssh: String::new(),
+                url: Some(url.clone()),
+                token_env: token_env.clone(),
+                home: None,
             },
         };
         if session.routes.is_empty() {
@@ -765,7 +773,7 @@ impl Host {
         Ok(())
     }
 
-    fn list_via_shell(&self, sources: &[Box<dyn Source>], probe: &Probe) -> Result<HostScan> {
+    fn list_via_shell(&self, sources: &[Box<dyn Source>], probe: &Probe) -> Result<Scan> {
         let mut script = String::new();
         let mut failures: Vec<String> = Vec::new();
         let home = probe.home.to_string_lossy().into_owned();
@@ -797,7 +805,7 @@ impl Host {
         }
 
         if script.is_empty() {
-            return Ok(HostScan {
+            return Ok(Scan {
                 sessions: Vec::new(),
                 failures,
             });
@@ -817,7 +825,7 @@ impl Host {
             self.attach_route(session, &probe.origin_id)?;
         }
         failures.extend(unscanned(&raw, self.name()));
-        Ok(HostScan { sessions, failures })
+        Ok(Scan { sessions, failures })
     }
 
     /// Open a database-row session by running its per-session queries on
@@ -897,6 +905,32 @@ impl Host {
             host: self.config.name.clone(),
             message: message.into(),
         }
+    }
+}
+
+/// The HTTP half of [`Host`], for builds without the `http` feature: every
+/// method the `http` module provides, answering with the missing-transport
+/// report so an HTTP peer is always reported, never silently skipped.
+#[cfg(not(feature = "http"))]
+impl Host {
+    fn http_status(&self) -> String {
+        format!("unreachable: {}", self.http_unavailable())
+    }
+
+    fn http_list_with(&self, _context: &DiscoveryContext) -> Result<Scan> {
+        Err(self.http_unavailable())
+    }
+
+    fn http_open(&self, _session: &SessionSummary, _first: &RouteHop) -> Result<Transcript> {
+        Err(self.http_unavailable())
+    }
+
+    fn http_top(&self) -> Result<Vec<RemoteProcess>> {
+        Err(self.http_unavailable())
+    }
+
+    fn http_origin_id(&self) -> Result<&str> {
+        Err(self.http_unavailable())
     }
 }
 
@@ -1137,19 +1171,16 @@ fn refresh(hosts: &[HostConfig], home: &Path) -> (Vec<SessionSummary>, Vec<Strin
                 scope.spawn(move || Host::new(config.clone()).list_with(sources, context))
             })
             .collect();
-        let mut sessions = Vec::new();
-        let mut failures = Vec::new();
+        let mut scan = Scan::default();
         for handle in handles {
             match handle.join() {
-                Ok(Ok(mut scan)) => {
-                    sessions.append(&mut scan.sessions);
-                    failures.append(&mut scan.failures);
-                }
-                Ok(Err(e)) => failures.push(e.to_string()),
-                Err(_) => failures.push("a host listing panicked".to_string()),
+                Ok(Ok(branch)) => scan.extend(branch),
+                Ok(Err(e)) => scan.failures.push(e.to_string()),
+                Err(_) => scan.failures.push("a host listing panicked".to_string()),
             }
         }
-        (crate::catalog::merge::merge(sessions), failures)
+        scan.assemble();
+        (scan.sessions, scan.failures)
     })
 }
 
@@ -1266,12 +1297,15 @@ mod tests {
         });
         let scan = host.list_with(&[], &DiscoveryContext::default()).unwrap();
         assert_eq!(scan.sessions[0].routes[0].hops[0], route_hop);
-        assert_eq!(
-            Host::from_route_hop(&scan.sessions[0].routes[0].hops[0], Path::new("/local"))
-                .config
-                .home,
-            Some(home.clone())
-        );
+        let reopened =
+            Host::from_route_hop(&scan.sessions[0].routes[0].hops[0], Path::new("/local"));
+        assert!(matches!(
+            &reopened.config.transport,
+            Transport::Ssh {
+                home: configured,
+                ..
+            } if configured.as_deref() == Some(home.as_path())
+        ));
         assert_eq!(
             host.open(&scan.sessions[0], Path::new("/local"))
                 .unwrap()
@@ -1359,10 +1393,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let config = HostConfig {
             name: "must-not-contact".into(),
-            ssh: "must-not-contact".into(),
-            url: None,
-            token_env: None,
-            home: None,
+            transport: Transport::Ssh {
+                ssh: "must-not-contact".into(),
+                home: None,
+            },
             sources: Vec::new(),
             mode: Mode::Auto,
         };
@@ -1786,7 +1820,13 @@ mod tests {
 
         let (config, failure) = Config::load_at(&path);
         assert_eq!(config.hosts.len(), 1);
-        assert_eq!(config.hosts[0].ssh, "a", "the first entry wins");
+        assert!(
+            matches!(
+                &config.hosts[0].transport,
+                Transport::Ssh { ssh, .. } if ssh == "a"
+            ),
+            "the first entry wins"
+        );
         let failure = failure.expect("a duplicate must be reported");
         assert!(failure.contains("duplicate host a"), "{failure}");
     }
@@ -1812,9 +1852,12 @@ mod tests {
         let (config, failure) = Config::load_at(&path);
         assert_eq!(config.hosts.len(), 1, "{failure:?}");
         let leaf = &config.hosts[0];
-        assert_eq!(leaf.ssh, "");
-        assert_eq!(leaf.url.as_deref(), Some("http://127.0.0.1:8787/"));
-        assert_eq!(leaf.token_env.as_deref(), Some("LLMS_PEER_TOKEN"));
+        assert!(matches!(
+            &leaf.transport,
+            Transport::Http { url, token_env }
+                if url == "http://127.0.0.1:8787/"
+                    && token_env.as_deref() == Some("LLMS_PEER_TOKEN")
+        ));
 
         let failure = failure.expect("every malformed entry is reported");
         for (name, why) in [
@@ -1955,10 +1998,10 @@ mod tests {
         {
             let host = Host::new(HostConfig {
                 name: "gateway".into(),
-                ssh: String::new(),
-                url: Some("http://127.0.0.1:8001".into()),
-                token_env: Some("LLMS_LOCAL_PEER_TOKEN".into()),
-                home: None,
+                transport: Transport::Http {
+                    url: "http://127.0.0.1:8001".into(),
+                    token_env: Some("LLMS_LOCAL_PEER_TOKEN".into()),
+                },
                 sources: Vec::new(),
                 mode: Mode::Auto,
             });
@@ -1999,10 +2042,10 @@ mod tests {
         let config = Config {
             hosts: vec![HostConfig {
                 name: "nx-1".into(),
-                ssh: "p1g3-nx-1".into(),
-                url: None,
-                token_env: None,
-                home: Some(PathBuf::from("/var/lib/hermes")),
+                transport: Transport::Ssh {
+                    ssh: "p1g3-nx-1".into(),
+                    home: Some(PathBuf::from("/var/lib/hermes")),
+                },
                 sources: vec!["hermes".into()],
                 mode: Mode::Shell,
             }],
@@ -2011,7 +2054,11 @@ mod tests {
         let (loaded, failure) = Config::load_at(&path);
         assert_eq!(failure, None);
         assert_eq!(loaded.hosts.len(), 1);
-        assert_eq!(loaded.hosts[0].ssh, "p1g3-nx-1");
+        assert!(matches!(
+            &loaded.hosts[0].transport,
+            Transport::Ssh { ssh, home }
+                if ssh == "p1g3-nx-1" && home.as_deref() == Some(Path::new("/var/lib/hermes"))
+        ));
         assert_eq!(loaded.hosts[0].mode, Mode::Shell);
         assert_eq!(loaded.hosts[0].sources, vec!["hermes".to_string()]);
     }

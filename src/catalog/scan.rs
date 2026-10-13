@@ -8,9 +8,9 @@
 //!
 //! Sources run on separate threads so a slow or broken store cannot stall the
 //! rest, and a failing source degrades to a reported error rather than an
-//! empty list. Configured remote hosts join the same fan-out, one thread
-//! each, so a machine that has gone away cannot delay the local listing
-//! either.
+//! empty list. Peers join the same listing through [`Scan::extend`] in the
+//! discovery pipeline, one thread each there, so a machine that has gone
+//! away cannot delay a local listing either.
 
 use std::collections::HashSet;
 use std::thread;
@@ -21,7 +21,6 @@ use crate::catalog::workspace::Resolver;
 use crate::model::{SessionKey, SessionSummary, SourceId};
 use crate::runtime::live::Fleet;
 use crate::source::Source;
-use crate::source::remote;
 use crate::storage::overlay::Overlay;
 
 #[derive(Debug, Default)]
@@ -32,46 +31,68 @@ pub struct Scan {
     pub failures: Vec<String>,
 }
 
+impl Scan {
+    /// Attribute this machine's own rows to its origin. `None` is a
+    /// statement too — identity unavailable — so a local row is never
+    /// left looking unstamped.
+    pub fn attribute(&mut self, origin: Option<&str>) {
+        for session in &mut self.sessions {
+            if session.is_local() {
+                session.origin_id = origin.map(str::to_owned);
+            }
+        }
+    }
+
+    /// Fold one independently observed branch into this scan: rows and
+    /// failures both, so a failure on one route never suppresses another.
+    /// A branch's rows keep the workspace and liveness their own origin
+    /// established; nothing here inspects this machine's filesystem for
+    /// them.
+    pub fn extend(&mut self, mut branch: Scan) {
+        self.sessions.append(&mut branch.sessions);
+        self.failures.append(&mut branch.failures);
+    }
+
+    /// Contribute rows this observation already holds — a cache's
+    /// snapshot, rows saved from an earlier poll — with no failures of
+    /// their own to add.
+    pub fn append(&mut self, mut sessions: Vec<SessionSummary>) {
+        self.sessions.append(&mut sessions);
+    }
+
+    /// Assemble the whole observation: every contributed branch merged
+    /// under canonical identity — routes combine, metadata comes from one
+    /// complete, shortest-route observation — in a deterministic order.
+    pub fn assemble(&mut self) {
+        self.sessions = crate::catalog::merge::merge(std::mem::take(&mut self.sessions));
+    }
+}
+
 /// `overlay` supplies archive state for agents that have no such concept of
 /// their own; without it those sessions simply never look archived.
 ///
 /// `fleet` attributes running processes to sessions. Without it every session
 /// falls back to mtime-based liveness, which is still correct, just coarser.
 ///
-/// `hosts` are machines reached over SSH or HTTP. Their rows retain origin
-/// identity and explicit access routes. The TUI passes none: it reads a
-/// background cache instead of paying a transport round trip per two-second
-/// tick.
+/// This is the local tier only: every row a source lists is this machine's
+/// own. Peers join through the catalog's assembly, never here, so a remote
+/// path is never resolved against a filesystem it did not come from.
 pub fn scan_with(
     sources: &[Box<dyn Source>],
     overlay: Option<&Overlay>,
     fleet: Option<&Fleet>,
-    hosts: &[remote::Host],
 ) -> Scan {
-    let (results, remotes) = thread::scope(|scope| {
+    // A panicking adapter is a failed source, not an absent one: the
+    // contract is a warning line, never a silently shorter list.
+    let results = thread::scope(|scope| {
         let handles: Vec<_> = sources
             .iter()
             .map(|src| (src.id(), scope.spawn(move || src.list())))
             .collect();
-        let reaches: Vec<_> = hosts
-            .iter()
-            .map(|host| (host.name(), scope.spawn(move || host.list(sources))))
-            .collect();
-        // A panicking adapter is a failed source, not an absent one: the
-        // contract is a warning line, never a silently shorter list.
-        let results: Vec<_> = handles
+        handles
             .into_iter()
             .map(|(id, handle)| (id, handle.join().map_err(|_| "reader panicked".to_owned())))
-            .collect();
-        let remotes: Vec<_> = reaches
-            .into_iter()
-            .map(|(name, handle)| {
-                handle
-                    .join()
-                    .map_err(|_| format!("{name}: remote listing panicked"))
-            })
-            .collect();
-        (results, remotes)
+            .collect::<Vec<_>>()
     });
 
     let mut sessions = Vec::new();
@@ -83,20 +104,6 @@ pub fn scan_with(
             Err(panic) => failures.push(format!("{id}: {panic}")),
         }
     }
-    // A host-wide failure (probe, ssh) has no source of its own; its message
-    // names the machine instead.
-    for result in remotes {
-        match result {
-            Ok(Ok(mut scan)) => {
-                sessions.append(&mut scan.sessions);
-                failures.append(&mut scan.failures);
-            }
-            Ok(Err(e)) => failures.push(e.to_string()),
-            Err(panic) => failures.push(panic),
-        }
-    }
-
-    sessions = crate::catalog::merge::merge(sessions);
 
     if let Some(overlay) = overlay {
         match overlay.archived() {
@@ -120,13 +127,9 @@ pub fn scan_with(
     for session in &mut sessions {
         // A remote path must never be resolved here: `Resolver` stats the
         // local filesystem, so it would either fail or — worse — match an
-        // unrelated local directory of the same name. A host that ran its own
-        // `llm-sessions` already sent a resolved workspace; the shell transport can
-        // only offer what the agent recorded.
+        // unrelated local directory of the same name. Rows that arrive
+        // already attributed keep whatever their own origin established.
         if !session.is_local() {
-            if session.workspace.is_none() {
-                session.workspace = session.recorded_cwd.clone();
-            }
             continue;
         }
         session.workspace = session
@@ -154,7 +157,11 @@ pub fn scan_with(
         let orphan = session.subagent
             && (session.origin_id.is_none() && !session.is_local()
                 || session.parent.as_ref().is_none_or(|id| {
-                    !present.contains(&(session.origin_id.clone(), session.source, id.clone()))
+                    !present.contains(&SessionKey {
+                        origin_id: session.origin_id.clone(),
+                        source: session.source,
+                        id: id.clone(),
+                    })
                 }));
         if orphan {
             session.subagent = false;
@@ -271,7 +278,7 @@ mod tests {
             Box::new(Panics),
             Box::new(Fake(vec![row("kept", None, false)])),
         ];
-        let scan = scan_with(&sources, None, None, &[]);
+        let scan = scan_with(&sources, None, None);
         assert_eq!(scan.sessions.len(), 1);
         assert_eq!(scan.failures, ["codex: reader panicked"]);
     }
@@ -287,7 +294,7 @@ mod tests {
             row("kept-child", Some("parent"), true),
             row("orphan", Some("vanished"), true),
         ]))];
-        let scan = scan_with(&sources, None, None, &[]);
+        let scan = scan_with(&sources, None, None);
         let of = |id: &str| {
             scan.sessions
                 .iter()
@@ -314,13 +321,18 @@ mod tests {
         local.recorded_cwd = Some(dir.path().to_path_buf());
 
         let mut far = row("far", None, false);
+        far.origin_id = Some("00000000-0000-4000-8000-0000000000aa".into());
         far.origin_label = Some("nx-1".into());
         far.recorded_cwd = Some(PathBuf::from("/var/lib/hermes/work"));
         far.liveness = Liveness::Live { pid: 9 };
 
         let sources: Vec<Box<dyn Source>> = vec![Box::new(Fake(vec![local]))];
-        let hosts = vec![crate::source::remote::Host::fake("nx-1", vec![far])];
-        let scan = scan_with(&sources, None, Some(&Fleet::default()), &hosts);
+        let mut scan = scan_with(&sources, None, Some(&Fleet::default()));
+        scan.extend(Scan {
+            sessions: vec![far],
+            failures: Vec::new(),
+        });
+        scan.assemble();
 
         let of = |id: &str| {
             scan.sessions
@@ -329,7 +341,12 @@ mod tests {
                 .expect(id)
         };
         assert_eq!(
-            of("far").workspace.as_deref(),
+            of("far").workspace,
+            None,
+            "a remote row is never resolved against this machine"
+        );
+        assert_eq!(
+            of("far").recorded_cwd.as_deref(),
             Some(Path::new("/var/lib/hermes/work")),
             "a remote row keeps what its agent recorded"
         );
@@ -361,7 +378,7 @@ mod tests {
             wrong_source,
             child,
         ]))];
-        let scan = scan_with(&sources, None, None, &[]);
+        let scan = scan_with(&sources, None, None);
         let of = |id: &str| {
             scan.sessions
                 .iter()
@@ -391,7 +408,7 @@ mod tests {
             local_child,
             remote_child,
         ]))];
-        let scan = scan_with(&sources, None, None, &[]);
+        let scan = scan_with(&sources, None, None);
         assert!(scan.sessions.iter().all(|session| !session.subagent));
         assert!(scan.sessions.iter().all(|session| session.parent.is_none()));
     }
@@ -419,7 +436,7 @@ mod tests {
             }],
         });
         let sources: Vec<Box<dyn Source>> = vec![Box::new(Fake(vec![local, remote, route_only]))];
-        let scan = scan_with(&sources, Some(&overlay), None, &[]);
+        let scan = scan_with(&sources, Some(&overlay), None);
         assert_eq!(scan.sessions.len(), 3);
         for session in scan.sessions {
             assert_eq!(

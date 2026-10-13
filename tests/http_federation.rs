@@ -322,13 +322,8 @@ fn guarded_http_discovery_stops_cycles_and_preserves_depth_endpoint_rows() {
     );
     assert_eq!(scan.0, 200);
     assert_eq!(scan.1["sessions"][0]["id"], "a");
-    assert!(
-        scan.1["failures"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|f| f.as_str().unwrap().contains("truncat"))
-    );
+    // A self-edge is cyclic, not unfinished discovery, even at zero hops.
+    assert_eq!(scan.1["failures"], json!([]));
     let cycle = get(
         &server,
         "/v1/federation/list",

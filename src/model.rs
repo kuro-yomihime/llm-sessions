@@ -202,8 +202,49 @@ pub enum PathTrust {
     Decoded,
 }
 
-/// Origin-qualified identity; an absent origin is not a canonical identity.
-pub type SessionKey = (Option<String>, SourceId, String);
+/// Origin-qualified identity of a session: where it was created, which
+/// agent wrote it, and its ID there. An absent origin is not a canonical
+/// identity; remote rows always carry one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionKey {
+    /// Canonical origin identity, already passed through
+    /// [`normalize_origin`]; `None` for rows observed locally.
+    pub origin_id: Option<String>,
+    pub source: SourceId,
+    pub id: String,
+}
+
+/// Borrowed view of a [`SessionKey`]: the same three fields, without
+/// owning them. Used for map probes and ordering against stored owned
+/// keys, so lookups never allocate. Compares equal to its owned form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionKeyRef<'a> {
+    pub origin_id: Option<&'a str>,
+    pub source: SourceId,
+    pub id: &'a str,
+}
+
+impl PartialEq<SessionKey> for SessionKeyRef<'_> {
+    fn eq(&self, other: &SessionKey) -> bool {
+        self.origin_id == other.origin_id.as_deref()
+            && self.source == other.source
+            && self.id == other.id
+    }
+}
+
+impl PartialEq<SessionKeyRef<'_>> for SessionKey {
+    fn eq(&self, other: &SessionKeyRef<'_>) -> bool {
+        other == self
+    }
+}
+
+/// Canonical form of an origin identity. Peer UUIDs are case-insensitive,
+/// but identity comparisons and map keys are exact, so every origin is
+/// normalized exactly once, at the trust boundary where it enters this
+/// process — and nowhere else.
+pub fn normalize_origin(origin: &str) -> String {
+    origin.to_ascii_lowercase()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct RouteHop {
@@ -282,6 +323,16 @@ impl AccessRoute {
         for hop in &mut self.hops {
             hop.token_env = None;
         }
+    }
+
+    /// Deterministic route preference shared by every route selection:
+    /// fewest hops first — local access wins over remote alternatives —
+    /// then structural order as the tiebreaker.
+    pub fn cmp_preferred(&self, other: &Self) -> std::cmp::Ordering {
+        self.hops
+            .len()
+            .cmp(&other.hops.len())
+            .then_with(|| self.cmp(other))
     }
 }
 
@@ -364,13 +415,23 @@ impl SessionSummary {
         }
     }
 
-    /// Borrowed origin-qualified identity.
-    pub fn key(&self) -> (Option<&str>, SourceId, &str) {
-        (self.origin_id.as_deref(), self.source, self.id.as_str())
+    /// Borrowed origin-qualified identity: comparisons, map probes and
+    /// ordering without allocating.
+    pub fn key(&self) -> SessionKeyRef<'_> {
+        SessionKeyRef {
+            origin_id: self.origin_id.as_deref(),
+            source: self.source,
+            id: self.id.as_str(),
+        }
     }
 
+    /// Owned identity, for keys stored beyond the row's borrow.
     pub fn identity(&self) -> SessionKey {
-        (self.origin_id.clone(), self.source, self.id.clone())
+        SessionKey {
+            origin_id: self.origin_id.clone(),
+            source: self.source,
+            id: self.id.clone(),
+        }
     }
 
     /// Local access remains preferred even when a merged row also carries
@@ -384,9 +445,7 @@ impl SessionSummary {
     }
 
     pub fn preferred_route(&self) -> Option<&AccessRoute> {
-        self.routes
-            .iter()
-            .min_by(|a, b| a.hops.len().cmp(&b.hops.len()).then_with(|| a.cmp(b)))
+        self.routes.iter().min_by(|a, b| a.cmp_preferred(b))
     }
 
     pub fn display_title(&self) -> &str {
@@ -760,10 +819,13 @@ mod tests {
         assert!(restored.routes.is_empty());
         assert!(restored.is_local());
         restored.origin_id = Some("origin".into());
-        assert_eq!(restored.key(), (Some("origin"), SourceId::Omp, "agent-id"));
         assert_eq!(
             restored.identity(),
-            (Some("origin".into()), SourceId::Omp, "agent-id".into())
+            SessionKey {
+                origin_id: Some("origin".into()),
+                source: SourceId::Omp,
+                id: "agent-id".into()
+            }
         );
         assert!(
             restored.is_local(),

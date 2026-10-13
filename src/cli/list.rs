@@ -176,9 +176,13 @@ fn filter(home: &Path, scan: &Scan, args: &FilterArgs, limit: usize) -> Vec<Sess
         .filter(|s| wanted.is_empty() || wanted.contains(&s.source.to_string()))
         .filter(|s| {
             args.hosts.is_empty()
-                || args
-                    .hosts
-                    .contains(&s.origin_label.clone().unwrap_or_else(|| "local".into()))
+                || args.hosts.iter().any(|host| {
+                    if host == "local" {
+                        s.is_local()
+                    } else {
+                        s.origin_label.as_ref() == Some(host)
+                    }
+                })
         })
         .filter(|s| match (&prefix, &s.workspace) {
             (None, _) => true,
@@ -188,4 +192,57 @@ fn filter(home: &Path, scan: &Scan, args: &FilterArgs, limit: usize) -> Vec<Sess
         .take(if limit == 0 { usize::MAX } else { limit })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_host_filter_excludes_unlabelled_forwarded_sessions() {
+        let local = SessionSummary::new(
+            "local-session".into(),
+            SourceId::Omp,
+            time::OffsetDateTime::UNIX_EPOCH,
+            llm_sessions::model::Locator::File {
+                path: "/store/local.jsonl".into(),
+            },
+        );
+        let mut forwarded = local.clone();
+        forwarded.id = "forwarded-session".into();
+        forwarded.origin_id = Some("00000000-0000-4000-8000-00000000000a".into());
+        forwarded.routes = serde_json::from_value(serde_json::json!([{
+            "hops": [{
+                "origin_id": "00000000-0000-4000-8000-00000000000a",
+                "name": "peer",
+                "ssh": "peer.example"
+            }]
+        }]))
+        .unwrap();
+        let scan = Scan {
+            sessions: vec![local, forwarded],
+            ..Scan::default()
+        };
+        let mut args = FilterArgs {
+            sources: Vec::new(),
+            hosts: vec!["local".into()],
+            workspace: None,
+            archived: false,
+            live: false,
+            query: None,
+        };
+        let home = Path::new("/nonexistent-home");
+        let by_flag = filter(home, &scan, &args, 0);
+        args.hosts.clear();
+        args.query = Some("host:local".into());
+        let by_query = filter(home, &scan, &args, 0);
+        assert_eq!(
+            by_flag.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["local-session"]
+        );
+        assert_eq!(
+            by_query.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["local-session"]
+        );
+    }
 }

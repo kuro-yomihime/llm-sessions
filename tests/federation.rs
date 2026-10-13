@@ -345,6 +345,56 @@ fn defensive_guard_and_depth_limit_do_not_hide_endpoint_local_sessions() {
     assert!(graph.queries().is_empty());
 }
 
+/// A spent hop budget is not a truncation claim by itself. When every
+/// configured peer's origin is already on the request's branch, the
+/// budget cut off nothing: those peers would have answered nothing even
+/// with budget to spend, so the listing is complete, not truncated. A
+/// peer outside the branch is genuinely cut off, and is reported.
+#[test]
+fn zero_hop_budget_claims_truncation_only_when_a_peer_was_cut_off() {
+    let graph = Graph::new();
+    graph.host("A", &[("B", "B", "auto")]);
+    graph.host("B", &[]);
+    graph.session("A", "a-session");
+
+    // B's origin is on the branch: A probes B to learn that, reports no
+    // truncation, and never asks B to list.
+    let visited = json!([Graph::origin("B")]).to_string();
+    let complete = graph.command(
+        "A",
+        &["federation", "list", "--path", &visited, "--hops", "0"],
+    );
+    assert!(
+        complete.status.success(),
+        "{}",
+        String::from_utf8_lossy(&complete.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&complete.stdout).expect("complete JSON");
+    assert_eq!(payload["sessions"][0]["id"], "a-session");
+    assert_eq!(
+        payload["failures"],
+        json!([]),
+        "every peer was already on the branch: nothing was cut off"
+    );
+    assert!(
+        graph.queries().is_empty(),
+        "a probe is a diagnosis, never a discovery"
+    );
+
+    // With B outside the branch, the same spent budget did cut a peer off.
+    let truncated = graph.command("A", &["federation", "list", "--path", "[]", "--hops", "0"]);
+    assert!(truncated.status.success());
+    let payload: Value = serde_json::from_slice(&truncated.stdout).expect("truncated JSON");
+    assert_eq!(payload["sessions"][0]["id"], "a-session");
+    let failures = payload["failures"].as_array().expect("failures");
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.as_str().unwrap().contains("truncated")),
+        "{failures:?}"
+    );
+}
+
 #[test]
 fn shell_observers_share_origin_and_missing_marker_is_not_initialized() {
     let graph = Graph::new();

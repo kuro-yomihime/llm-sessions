@@ -1,4 +1,5 @@
-//! Stable origin identity and request-local federation discovery state.
+//! Stable origin identity, the guarded-request wire contract, and
+//! request-local federation discovery state.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -6,9 +7,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, io};
-use crate::model::SessionSummary;
+use crate::model::{RouteHop, SessionSummary, normalize_origin};
 
-pub const DEFAULT_HOPS: u32 = 8;
+/// The hop budget every guarded request starts with, and the most any
+/// request may ever claim: the default is the limit, so no caller can
+/// widen discovery past it.
+pub const MAX_HOPS: u32 = 8;
 
 /// The federation protocol version this binary speaks on every transport.
 /// Version 2 is the mixed-route contract: an access route may interleave
@@ -30,7 +34,7 @@ impl Default for DiscoveryContext {
     fn default() -> Self {
         Self {
             visited: Vec::new(),
-            remaining_hops: DEFAULT_HOPS,
+            remaining_hops: MAX_HOPS,
         }
     }
 }
@@ -39,6 +43,123 @@ impl Default for DiscoveryContext {
 pub struct FederationScan {
     pub sessions: Vec<SessionSummary>,
     pub failures: Vec<String>,
+}
+
+/// The capabilities handshake, identical on every transport: the protocol
+/// version a peer speaks and the stable origin identity it claims.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Capabilities {
+    pub version: u32,
+    pub origin_id: String,
+}
+
+impl Capabilities {
+    /// This instance's own handshake: the version this binary speaks and
+    /// this account's origin identity. A missing or malformed marker is
+    /// an explicit error — never an invented identity.
+    pub fn own(home: &Path) -> Result<Self> {
+        Ok(Self {
+            version: PROTOCOL_VERSION,
+            origin_id: read_origin(home)?,
+        })
+    }
+}
+
+/// A guarded request's own branch, as every transport states it: the
+/// ancestors the request has already visited, and the hop budget left to
+/// it. Both endpoints of the guarded listing — `federation list` over SSH
+/// and `/v1/federation/list` over HTTP — bound it here, so the two
+/// cannot drift apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Guard {
+    /// Ancestor origin ids: lowercased, well-formed, at most [`MAX_HOPS`].
+    pub visited: Vec<String>,
+    /// Remaining budget, at most [`MAX_HOPS`].
+    pub hops: u32,
+}
+
+impl Default for Guard {
+    fn default() -> Self {
+        Self {
+            visited: Vec::new(),
+            hops: MAX_HOPS,
+        }
+    }
+}
+
+/// Which half of a guarded request failed validation. The rule is the
+/// protocol's; each endpoint reports the failure in its own voice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Invalid {
+    /// Not a JSON array of at most [`MAX_HOPS`] well-formed origin ids.
+    Path,
+    /// Not a hop budget of at most [`MAX_HOPS`].
+    Hops,
+}
+
+impl Guard {
+    /// Validate already-typed values, as the CLI's argument parser
+    /// produces them.
+    pub fn new(path: &str, hops: u32) -> Result<Self, Invalid> {
+        Ok(Self {
+            visited: visited(path)?,
+            hops: bounded(hops)?,
+        })
+    }
+
+    /// Parse the wire form: `path` a JSON array of ancestor origins,
+    /// `hops` the remaining budget, absent meaning the default. The path
+    /// is judged first, exactly as the endpoints always have.
+    pub fn parse(path: &str, hops: Option<&str>) -> Result<Self, Invalid> {
+        let visited = visited(path)?;
+        let hops = match hops {
+            None => MAX_HOPS,
+            Some(raw) => raw.parse().map_err(|_| Invalid::Hops)?,
+        };
+        Ok(Self {
+            visited,
+            hops: bounded(hops)?,
+        })
+    }
+}
+
+/// The path half of a guarded request: a JSON array of ancestor origins,
+/// each well-formed, at most [`MAX_HOPS`] of them, lowercased.
+fn visited(path: &str) -> Result<Vec<String>, Invalid> {
+    let mut visited: Vec<String> = serde_json::from_str(path).map_err(|_| Invalid::Path)?;
+    if visited.len() > MAX_HOPS as usize || visited.iter().any(|id| !valid_origin(id)) {
+        return Err(Invalid::Path);
+    }
+    for id in &mut visited {
+        *id = normalize_origin(id);
+    }
+    Ok(visited)
+}
+
+/// The budget half of a guarded request: at most [`MAX_HOPS`].
+fn bounded(hops: u32) -> Result<u32, Invalid> {
+    if hops > MAX_HOPS {
+        Err(Invalid::Hops)
+    } else {
+        Ok(hops)
+    }
+}
+
+/// Whether a received access route can be travelled to `origin`: it names
+/// a way to reach every hop, never repeats an origin, stays within
+/// [`MAX_HOPS`], and ends at the origin it claims. One rule for the
+/// transport that forwards routes and the endpoints that receive them.
+pub fn valid_route(hops: &[RouteHop], origin: &str) -> bool {
+    !hops.is_empty()
+        && u32::try_from(hops.len()).is_ok_and(|length| length <= MAX_HOPS)
+        && hops.last().is_some_and(|hop| hop.origin_id == origin)
+        && hops.iter().enumerate().all(|(index, hop)| {
+            valid_origin(&hop.origin_id)
+                && hop.reachable()
+                && !hops[..index]
+                    .iter()
+                    .any(|previous| previous.origin_id == hop.origin_id)
+        })
 }
 
 fn marker(home: &Path) -> PathBuf {
@@ -72,7 +193,7 @@ pub fn read_origin(home: &Path) -> Result<String> {
             "canonical origin identity unavailable: malformed UUID marker",
         )));
     }
-    Ok(origin.to_ascii_lowercase())
+    Ok(normalize_origin(origin))
 }
 
 /// Initialize this local account atomically, without replacing an existing ID.
@@ -164,5 +285,58 @@ mod tests {
         );
         assert!(!valid_origin("00000000-0000-0000-0000-00000000000g"));
         assert!(!valid_origin("00000000000000000000000000000000000000"));
+    }
+
+    #[test]
+    fn a_guard_bounds_and_normalizes_its_path_and_budget() {
+        let guard = Guard::new(r#"["00000000-0000-4000-8000-00000000000A"]"#, 3).unwrap();
+        assert_eq!(guard.visited, ["00000000-0000-4000-8000-00000000000a"]);
+        assert_eq!(guard.hops, 3);
+
+        assert_eq!(Guard::new("[]", MAX_HOPS).unwrap(), Guard::default());
+        assert_eq!(Guard::parse("[]", None).unwrap(), Guard::default());
+        assert_eq!(Guard::parse("[]", Some("3")).unwrap().hops, 3);
+
+        assert_eq!(Guard::new("not json", 3).unwrap_err(), Invalid::Path);
+        assert_eq!(
+            Guard::new(r#"["not-a-uuid"]"#, 3).unwrap_err(),
+            Invalid::Path
+        );
+        let full = format!(
+            "[{}]",
+            (0..=MAX_HOPS)
+                .map(|index| format!("\"00000000-0000-4000-8000-{index:012}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(Guard::new(&full, 3).unwrap_err(), Invalid::Path);
+        assert_eq!(Guard::new("[]", MAX_HOPS + 1).unwrap_err(), Invalid::Hops);
+        assert_eq!(Guard::parse("[]", Some("nine")).unwrap_err(), Invalid::Hops);
+        // The path is judged first, as the endpoints always have.
+        assert_eq!(
+            Guard::parse("not json", Some("nine")).unwrap_err(),
+            Invalid::Path
+        );
+    }
+
+    #[test]
+    fn a_route_must_reach_its_origin_without_repeating_one() {
+        let hop = |origin: &str| RouteHop {
+            origin_id: origin.into(),
+            name: origin.into(),
+            ssh: origin.into(),
+            url: None,
+            token_env: None,
+            home: None,
+        };
+        let a = "00000000-0000-4000-8000-00000000000a";
+        let b = "00000000-0000-4000-8000-00000000000b";
+        assert!(valid_route(&[hop(a), hop(b)], b));
+        assert!(!valid_route(&[], b), "an empty route reaches nothing");
+        assert!(
+            !valid_route(&[hop(b), hop(a)], b),
+            "it must end at the origin it claims"
+        );
+        assert!(!valid_route(&[hop(a), hop(a)], a), "an origin repeats");
     }
 }

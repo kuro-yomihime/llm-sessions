@@ -6,8 +6,13 @@
 //! A [`Loader`] owns those inputs, so a one-shot command builds it, scans
 //! once and exits, while a long-running server keeps it and rescans on a
 //! timer without rebuilding anything.
+//!
+//! Assembly lives here too: a listing is a local scan, stamped with this
+//! machine's origin, extended through peers under a guarded request's own
+//! branch, and merged — the one sequence behind `list`, the TUI's refresh
+//! and both federation endpoints.
 
-use crate::federation::DiscoveryContext;
+use crate::federation::{DiscoveryContext, Guard};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -85,26 +90,21 @@ impl Loader {
             Remote::Inline => &self.hosts,
             Remote::Skip => &[],
         };
-        let mut scan = scan_with(&self.sources, self.overlay.as_ref(), fleet, &[]);
+        let mut scan = scan_with(&self.sources, self.overlay.as_ref(), fleet);
         match crate::federation::read_origin(&self.home) {
-            Ok(origin) => extend_from_origin(
-                &mut scan,
-                &self.sources,
-                hosts,
-                origin,
-                Vec::new(),
-                crate::federation::DEFAULT_HOPS,
-            ),
+            Ok(origin) => {
+                extend_from_origin(&mut scan, &self.sources, hosts, origin, &Guard::default());
+            }
             Err(error) => scan.failures.push(format!(
                 "origin identity unavailable; federation disabled: {error}"
             )),
         }
-        scan.sessions = crate::catalog::merge::merge(scan.sessions);
-        if let Some(failure) = &self.config_failure {
-            scan.failures.push(failure.clone());
-        }
+        scan.assemble();
         if cached == Cached::Borrow {
             borrow_cached_usage(&self.home, &mut scan);
+        }
+        if let Some(failure) = &self.config_failure {
+            scan.failures.push(failure.clone());
         }
         scan
     }
@@ -115,10 +115,34 @@ impl Loader {
     }
 }
 
+/// One guarded federation listing, the pipeline behind both endpoints of
+/// the protocol — `federation list` over SSH and `/v1/federation/list`
+/// over HTTP: a fresh scan of this machine, fleet-probed and overlaid for
+/// the request, stamped with this origin and extended through the given
+/// peers under the caller's own ancestors and hop budget, then assembled
+/// with the index cache's help. The caller decides how an unreadable
+/// local identity fails, contributes its peers, and publishes the result
+/// under its own policy.
+pub fn guarded_scan(
+    home: &Path,
+    sources: &[Box<dyn Source>],
+    hosts: &[remote::Host],
+    origin: &str,
+    guard: &Guard,
+) -> Scan {
+    let fleet = Fleet::probe();
+    let overlay = Overlay::open(&Overlay::default_path(home)).ok();
+    let mut scan = scan_with(sources, overlay.as_ref(), Some(&fleet));
+    extend_from_origin(&mut scan, sources, hosts, origin.to_owned(), guard);
+    scan.assemble();
+    borrow_cached_usage(home, &mut scan);
+    scan
+}
+
 /// OMP and Claude only record spend inside the transcript, so tier 1 cannot
 /// price them. `llm-sessions index` already parsed those bodies; borrow its answer
 /// rather than reparsing 280 MB to fill a column.
-pub fn borrow_cached_usage(home: &Path, scan: &mut Scan) {
+fn borrow_cached_usage(home: &Path, scan: &mut Scan) {
     let Ok(index) = Index::open(&Index::default_path(home)) else {
         return;
     };
@@ -176,13 +200,24 @@ pub enum Resolved<'a> {
 }
 
 /// Resolve an id or unique prefix. An exact id wins over longer ids it
-/// prefixes; ids repeated across agents are ambiguous.
-pub fn resolve<'a>(sessions: &'a [SessionSummary], needle: &str) -> Resolved<'a> {
-    let exact: Vec<&SessionSummary> = sessions.iter().filter(|s| s.id == needle).collect();
+/// prefixes; ids repeated across agents are ambiguous. The pool arrives
+/// as an iterator so a caller can qualify first — by origin and source,
+/// say — without copying the rows it narrows to.
+pub fn resolve<'a>(
+    sessions: impl IntoIterator<Item = &'a SessionSummary>,
+    needle: &str,
+) -> Resolved<'a> {
+    let sessions: Vec<&SessionSummary> = sessions.into_iter().collect();
+    let exact: Vec<&SessionSummary> = sessions
+        .iter()
+        .filter(|s| s.id == needle)
+        .copied()
+        .collect();
     let mut candidates = if exact.is_empty() {
         sessions
             .iter()
             .filter(|s| s.id.starts_with(needle))
+            .copied()
             .collect::<Vec<_>>()
     } else {
         exact
@@ -227,7 +262,45 @@ fn extend_scan(
     context: &DiscoveryContext,
 ) {
     if context.remaining_hops == 0 {
-        if !hosts.is_empty() {
+        // The budget is spent, and "truncated" is a claim about what it
+        // cut off. A peer whose origin this branch already visited would
+        // have answered nothing anyway — budget or not — so only a peer
+        // outside the branch makes the claim true. Learning a peer's
+        // origin costs the same probe a budgeted scan pays, in parallel
+        // like one, and a probe never recurses. A peer that cannot even
+        // answer its probe is reported for that, not claimed as truncated.
+        let mut truncated = false;
+        let probes = thread::scope(|scope| {
+            let handles: Vec<_> = hosts
+                .iter()
+                .map(|host| {
+                    (
+                        host.name(),
+                        scope.spawn(move || host.origin_id().map(str::to_owned)),
+                    )
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|(name, handle)| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(Error::Remote {
+                            host: name.to_owned(),
+                            message: "origin probe panicked".into(),
+                        })
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        for probe in probes {
+            match probe {
+                Ok(origin) => {
+                    truncated |= !context.visited.contains(&origin);
+                }
+                Err(error) => scan.failures.push(error.to_string()),
+            }
+        }
+        if truncated {
             scan.failures
                 .push("federation discovery truncated at hop limit".into());
         }
@@ -254,35 +327,27 @@ fn extend_scan(
     });
     for result in results {
         match result {
-            Ok(Ok(mut remote)) => {
-                scan.sessions.append(&mut remote.sessions);
-                scan.failures.append(&mut remote.failures);
-            }
+            Ok(Ok(branch)) => scan.extend(branch),
             Ok(Err(error)) => scan.failures.push(error.to_string()),
             Err(error) => scan.failures.push(error),
         }
     }
 }
 
-/// The shared discovery step of every guarded entry point: stamp the local
-/// scan with this instance's origin, then extend it through the given peers
-/// under the request's own ancestors and remaining depth. Both callers merge
-/// the result themselves, so a federation request can borrow cached usage
-/// between the two steps.
-pub fn extend_from_origin(
+/// The shared discovery step of every listing: stamp the local scan with
+/// this instance's origin, then extend it through the given peers under
+/// the request's own branch and remaining depth.
+fn extend_from_origin(
     scan: &mut Scan,
     sources: &[Box<dyn Source>],
     hosts: &[remote::Host],
     origin: String,
-    ancestors: Vec<String>,
-    remaining_hops: u32,
+    guard: &Guard,
 ) {
-    for session in &mut scan.sessions {
-        session.origin_id = Some(origin.clone());
-    }
+    scan.attribute(Some(&origin));
     let mut context = DiscoveryContext {
-        visited: ancestors,
-        remaining_hops,
+        visited: guard.visited.clone(),
+        remaining_hops: guard.hops,
     };
     context.visited.push(origin);
     extend_scan(scan, sources, hosts, &context);

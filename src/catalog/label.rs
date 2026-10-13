@@ -98,10 +98,7 @@ fn disambiguate(sessions: &[SessionSummary], labels: &mut HashMap<Key, Label>) {
             continue;
         }
         for key in keys {
-            let Some(session) = sessions
-                .iter()
-                .find(|s| s.key() == (key.0.as_deref(), key.1, key.2.as_str()))
-            else {
+            let Some(session) = sessions.iter().find(|s| s.key() == key) else {
                 continue;
             };
             let suffix = session

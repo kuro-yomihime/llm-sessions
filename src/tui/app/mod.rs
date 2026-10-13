@@ -256,8 +256,8 @@ impl App {
     pub fn new_with_mode(
         home: &Path,
         sources: Vec<Box<dyn Source>>,
-        mut sessions: Vec<SessionSummary>,
-        mut failures: Vec<String>,
+        sessions: Vec<SessionSummary>,
+        failures: Vec<String>,
         overlay: Option<Overlay>,
         index: Option<Index>,
         fleet: Fleet,
@@ -276,10 +276,9 @@ impl App {
             Ok(origin) => (Some(origin), None),
             Err(error) => (None, Some(format!("local origin: {error}"))),
         };
-        failures.extend(local_origin_failure.iter().cloned());
-        for session in sessions.iter_mut().filter(|session| session.is_local()) {
-            session.origin_id.clone_from(&local_origin);
-        }
+        let mut scan = Scan { sessions, failures };
+        scan.failures.extend(local_origin_failure.iter().cloned());
+        scan.attribute(local_origin.as_deref());
         // The index already caches every session's first prompt for the
         // digest; labelling reuses it rather than opening a single body.
         let cached = index
@@ -306,11 +305,11 @@ impl App {
                 failure,
             )
         };
-        failures.extend(problems);
-        failures.extend(alias_failure);
+        scan.failures.extend(problems);
+        scan.failures.extend(alias_failure);
         cache.poll(true);
-        sessions.extend(cache.sessions().iter().cloned());
-        sessions = crate::catalog::merge::merge(sessions);
+        scan.append(cache.sessions().to_vec());
+        scan.assemble();
         let mut app = Self {
             home: home.to_path_buf(),
             sources,
@@ -323,8 +322,8 @@ impl App {
             bookmarks,
             bookmark_path,
             offset: clock::offset(),
-            sessions,
-            failures,
+            sessions: scan.sessions,
+            failures: scan.failures,
             cached_usage: cached.usage,
             prompts: cached.prompts,
             labels: HashMap::new(),
@@ -614,24 +613,17 @@ impl App {
         self.fleet.refresh();
         // No hosts here: the cache owns remote rows precisely so this
         // two-second cadence never waits on a socket.
-        let Scan { sessions, failures } =
-            scan_with(&self.sources, self.overlay.as_ref(), Some(&self.fleet), &[]);
+        let mut scan = scan_with(&self.sources, self.overlay.as_ref(), Some(&self.fleet));
         // Selection is by identity, not position: a rescan reorders rows when
         // a session goes live, and the cursor must not jump to a stranger.
         let group = self.groups.get(self.group_sel).and_then(|g| g.key.clone());
         let selected = self.selected_session().map(owned_key);
 
-        self.sessions = sessions;
-        for session in self
-            .sessions
-            .iter_mut()
-            .filter(|session| session.is_local())
-        {
-            session.origin_id.clone_from(&self.local_origin);
-        }
-        self.sessions.extend(self.remote.sessions().iter().cloned());
-        self.sessions = crate::catalog::merge::merge(std::mem::take(&mut self.sessions));
-        self.failures = failures;
+        scan.attribute(self.local_origin.as_deref());
+        scan.append(self.remote.sessions().to_vec());
+        scan.assemble();
+        self.sessions = scan.sessions;
+        self.failures = scan.failures;
         self.failures
             .extend(self.local_origin_failure.iter().cloned());
         self.failures.extend(self.remote.failures().iter().cloned());
@@ -995,11 +987,10 @@ impl App {
         // The grouping is restored first so the group lookup below sees the
         // same axis the bookmark was saved under.
         self.show(Grouping::from_label(&bookmark.view));
-        let Some(index) = self.sessions.iter().position(|session| {
-            bookmark.origin_id.is_some()
-                && session.origin_id == bookmark.origin_id
-                && session.source == bookmark.source
-                && session.id == bookmark.id
+        let Some(index) = bookmark.key().and_then(|key| {
+            self.sessions
+                .iter()
+                .position(|session| session.key() == key)
         }) else {
             self.status = Some(format!(
                 "bookmark '{letter}: that session is gone (archived away, or its host is down)"
@@ -1330,8 +1321,15 @@ impl App {
         else {
             return false;
         };
-        let origin = self.transcript_key.as_ref().and_then(|key| key.0.clone());
-        self.jump_to(&(origin, target.0, target.1));
+        let origin = self
+            .transcript_key
+            .as_ref()
+            .and_then(|key| key.origin_id.clone());
+        self.jump_to(&SessionKey {
+            origin_id: origin,
+            source: target.0,
+            id: target.1,
+        });
         true
     }
 
@@ -1345,7 +1343,10 @@ impl App {
             .iter()
             .position(|row| owned_key(&self.sessions[row.index]) == *target)
         else {
-            self.status = Some(format!("{} {} is not in this view", target.1, target.2));
+            self.status = Some(format!(
+                "{} {} is not in this view",
+                target.source, target.id
+            ));
             return false;
         };
         self.session_sel = position;
@@ -1422,10 +1423,11 @@ impl App {
     fn close_all_folds(&mut self) {
         self.collapsed
             .extend(self.sessions.iter().filter_map(|session| {
-                session
-                    .parent
-                    .as_ref()
-                    .map(|parent| (session.origin_id.clone(), session.source, parent.clone()))
+                session.parent.as_ref().map(|parent| SessionKey {
+                    origin_id: session.origin_id.clone(),
+                    source: session.source,
+                    id: parent.clone(),
+                })
             }));
         self.refilter();
     }

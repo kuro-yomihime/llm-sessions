@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 
 use crate::model::{AccessRoute, Locator, PathTrust, SessionSummary, Usage};
 
-pub fn merge(mut sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
+pub(crate) fn merge(mut sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
     for session in &mut sessions {
         session.routes.sort_unstable();
         session.routes.dedup();
@@ -34,9 +34,7 @@ pub fn merge(mut sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
         }
     });
     for session in &mut sessions {
-        session
-            .routes
-            .sort_unstable_by(|a, b| a.hops.len().cmp(&b.hops.len()).then_with(|| a.cmp(b)));
+        session.routes.sort_unstable_by(AccessRoute::cmp_preferred);
         session.routes.dedup();
     }
     sessions

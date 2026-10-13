@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use llm_sessions::output::usage::Axis;
+use llm_sessions::source::remote::Mode;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -161,41 +162,35 @@ pub struct HostsArgs {
 #[derive(Debug, Clone, Subcommand)]
 pub enum HostsCommand {
     /// Add a host, or update an existing one of the same name.
-    Add {
-        /// Display name: what rows, groups and queries show.
-        name: String,
-        /// Anything `ssh` accepts — an ~/.ssh/config alias or `user@host`.
-        /// Omit for an HTTP peer (`--url`).
-        ssh: Option<String>,
-        /// Base URL of a peer running `llm-sessions serve`, e.g.
-        /// `https://fleet.example.net`. Exactly one of ssh or --url.
-        #[arg(long, value_name = "URL", conflicts_with = "ssh")]
-        url: Option<String>,
-        /// Environment variable holding this peer's bearer token. The token
-        /// itself is never written to hosts.json.
-        #[arg(long, value_name = "VAR", requires = "url")]
-        token_env: Option<String>,
-        /// Remote home directory. Omit to ask the host at probe time.
-        #[arg(long, value_name = "PATH")]
-        home: Option<PathBuf>,
-        /// Agent names to scan. Repeatable; omit for all.
-        #[arg(long = "source", value_name = "AGENT")]
-        sources: Vec<String>,
-        /// Transport: auto (default), llm-sessions, or shell. SSH only.
-        #[arg(long, value_enum)]
-        mode: Option<HostMode>,
-    },
+    Add(AddHostArgs),
     /// Remove a host by name.
     Remove { name: String },
 }
 
-/// Clap-facing mirror of [`llm_sessions::source::remote::Mode`], whose
-/// serialized spellings remain independent of the command-line interface.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum HostMode {
-    Auto,
-    LlmSessions,
-    Shell,
+#[derive(Debug, Clone, clap::Args)]
+pub struct AddHostArgs {
+    /// Display name: what rows, groups and queries show.
+    pub name: String,
+    /// Anything `ssh` accepts — an ~/.ssh/config alias or `user@host`.
+    /// Omit for an HTTP peer (`--url`).
+    pub ssh: Option<String>,
+    /// Base URL of a peer running `llm-sessions serve`, e.g.
+    /// `https://fleet.example.net`. Exactly one of ssh or --url.
+    #[arg(long, value_name = "URL", conflicts_with = "ssh")]
+    pub url: Option<String>,
+    /// Environment variable holding this peer's bearer token. The token
+    /// itself is never written to hosts.json.
+    #[arg(long, value_name = "VAR", requires = "url")]
+    pub token_env: Option<String>,
+    /// Remote home directory. Omit to ask the host at probe time.
+    #[arg(long, value_name = "PATH")]
+    pub home: Option<PathBuf>,
+    /// Agent names to scan. Repeatable; omit for all.
+    #[arg(long = "source", value_name = "AGENT")]
+    pub sources: Vec<String>,
+    /// Transport: auto (default), llm-sessions, or shell. SSH only.
+    #[arg(long, value_enum)]
+    pub mode: Option<Mode>,
 }
 
 #[derive(Debug, Clone, clap::Args)]

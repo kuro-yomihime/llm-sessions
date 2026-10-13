@@ -23,15 +23,11 @@ use tokio::sync::watch;
 use super::auth;
 use super::poll::{FactsCache, Key, Snapshot, lock, policy_filter, status_now};
 use super::stream;
-use crate::catalog::loader::{self, body_hits, borrow_cached_usage, extend_from_origin};
-use crate::catalog::merge;
+use crate::catalog::loader::{self, Resolved, body_hits, guarded_scan};
 use crate::catalog::query::{self, Filters};
-use crate::catalog::scan::scan_with;
-use crate::federation::{DEFAULT_HOPS, valid_origin};
-use crate::model::{SessionSummary, SourceId};
-use crate::runtime::live::Fleet;
+use crate::federation::{Guard, Invalid, MAX_HOPS, valid_origin};
+use crate::model::{SessionSummary, SourceId, normalize_origin};
 use crate::source::{Source, remote};
-use crate::storage::overlay::Overlay;
 
 /// Rows `/v1/sessions` returns without `limit`, as `list` prints.
 const DEFAULT_LIMIT: usize = 50;
@@ -46,7 +42,7 @@ pub(super) struct App {
     pub host: String,
     pub home: PathBuf,
     /// Local adapters, for opening what the snapshot lists.
-    pub sources: Vec<Box<dyn Source>>,
+    pub adapters: Vec<Box<dyn Source>>,
     pub snapshot: watch::Receiver<Arc<Snapshot>>,
     pub facts: Arc<FactsCache>,
     pub transcripts: TranscriptCache,
@@ -57,9 +53,9 @@ pub(super) struct App {
     /// whatever the peer configuration says.
     pub federate: bool,
     /// The base query every published row matches, as on the command line.
-    pub base: query::Query,
+    pub base: Arc<query::Query>,
     /// The `--source` allow-list; empty for all.
-    pub source_filter: Vec<SourceId>,
+    pub sources: Vec<SourceId>,
 }
 
 pub(super) fn router(app: Arc<App>) -> Router {
@@ -217,19 +213,10 @@ fn find(
         .filter(|s| origin.is_none_or(|want| s.origin_id.as_deref() == Some(want)))
         .filter(|s| source.is_none_or(|want| s.source == want))
         .collect();
-    let exact: Vec<&SessionSummary> = pool.iter().filter(|s| s.id == id).copied().collect();
-    let candidates: Vec<&SessionSummary> = if exact.is_empty() {
-        pool.iter()
-            .filter(|s| s.id.starts_with(id))
-            .copied()
-            .collect()
-    } else {
-        exact
-    };
-    match candidates.len() {
-        0 => Err(ApiError::new(StatusCode::NOT_FOUND, "no such session")),
-        1 => Ok(candidates[0].clone()),
-        _ => Err(ApiError::new(
+    match loader::resolve(pool, id) {
+        Resolved::One(session) => Ok(session.clone()),
+        Resolved::Missing => Err(ApiError::new(StatusCode::NOT_FOUND, "no such session")),
+        Resolved::Ambiguous(candidates) => Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             format!(
                 "{id:?} matches {} sessions; send the origin and source, or more of the id",
@@ -250,7 +237,7 @@ struct SessionQuery {
 fn qualifiers(params: &SessionQuery) -> Result<(Option<String>, Option<SourceId>), ApiError> {
     let origin = match &params.origin {
         Some(text) => {
-            let id = text.to_ascii_lowercase();
+            let id = normalize_origin(text);
             if valid_origin(&id) {
                 Some(id)
             } else {
@@ -300,11 +287,10 @@ async fn resolve(
             // answers on its own terms — its misses read exactly like the
             // snapshot's, and an ambiguity it introduced is an ambiguity
             // the client must see.
-            let scan =
-                tokio::task::spawn_blocking(move || discover(&worker, Vec::new(), DEFAULT_HOPS))
-                    .await
-                    .map_err(|e| ApiError::internal(format!("federation discovery panicked: {e}")))
-                    .and_then(|scan| scan)?;
+            let scan = tokio::task::spawn_blocking(move || discover(&worker, &Guard::default()))
+                .await
+                .map_err(|e| ApiError::internal(format!("federation discovery panicked: {e}")))
+                .and_then(|scan| scan)?;
             find(&scan.sessions, &id, Some(&origin), source)
         }
     }
@@ -325,7 +311,7 @@ async fn session(
         let summary = session.clone();
         let facts = tokio::task::spawn_blocking(move || {
             worker.facts.get(&summary, || {
-                loader::open(&worker.home, &worker.sources, &summary)
+                loader::open(&worker.home, &worker.adapters, &summary)
             })
         })
         .await
@@ -357,7 +343,7 @@ async fn transcript(
         let summary = session.clone();
         let body = tokio::task::spawn_blocking(move || {
             let transcript =
-                loader::open(&worker.home, &worker.sources, &summary).map_err(|e| {
+                loader::open(&worker.home, &worker.adapters, &summary).map_err(|e| {
                     // The error carries the session's path on this machine.
                     eprintln!("llm-sessions: opening {} failed: {e}", summary.id);
                     "transcript unreadable".to_owned()
@@ -380,25 +366,21 @@ async fn transcript(
 /// never an invented identity.
 async fn federation_capabilities(
     State(app): State<Arc<App>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<crate::federation::Capabilities>, ApiError> {
     let home = app.home.clone();
-    let origin = tokio::task::spawn_blocking(move || crate::federation::read_origin(&home))
-        .await
-        .map_err(|e| ApiError::internal(format!("reading the origin identity panicked: {e}")))?;
-    match origin {
-        Ok(origin) => Ok(Json(json!({
-            "version": crate::federation::PROTOCOL_VERSION,
-            "origin_id": origin
-        }))),
-        Err(e) => {
-            // The error names this machine's state directory; that stays here.
-            eprintln!("llm-sessions: federation identity unavailable: {e}");
-            Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "federation identity unavailable on this server",
-            ))
-        }
-    }
+    let capabilities =
+        tokio::task::spawn_blocking(move || crate::federation::Capabilities::own(&home))
+            .await
+            .map_err(|e| ApiError::internal(format!("reading the origin identity panicked: {e}")))?
+            .map_err(|e| {
+                // The error names this machine's state directory; that stays here.
+                eprintln!("llm-sessions: federation identity unavailable: {e}");
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "federation identity unavailable on this server",
+                )
+            })?;
+    Ok(Json(capabilities))
 }
 
 #[derive(Deserialize)]
@@ -421,41 +403,31 @@ async fn federation_list(
         ApiError::new(
             StatusCode::BAD_REQUEST,
             format!(
-                "invalid {what}: use a JSON array of origin ids and hops of at most {DEFAULT_HOPS}"
+                "invalid {what}: use a JSON array of origin ids and hops of at most {MAX_HOPS}"
             ),
         )
     };
-    let mut visited: Vec<String> = serde_json::from_str(params.path.as_deref().unwrap_or("[]"))
-        .map_err(|_| bad("federation path"))?;
-    if visited.len() > DEFAULT_HOPS as usize || visited.iter().any(|id| !valid_origin(id)) {
-        return Err(bad("federation path"));
-    }
-    for id in &mut visited {
-        id.make_ascii_lowercase();
-    }
-    let hops: u32 = params
-        .hops
-        .as_deref()
-        .unwrap_or(&DEFAULT_HOPS.to_string())
-        .parse()
-        .map_err(|_| bad("hops"))?;
-    if hops > DEFAULT_HOPS {
-        return Err(bad("hops"));
-    }
+    let guard = Guard::parse(
+        params.path.as_deref().unwrap_or("[]"),
+        params.hops.as_deref(),
+    )
+    .map_err(|invalid| match invalid {
+        Invalid::Path => bad("federation path"),
+        Invalid::Hops => bad("hops"),
+    })?;
     let worker = app.clone();
-    let scan = tokio::task::spawn_blocking(move || discover(&worker, visited, hops))
+    let scan = tokio::task::spawn_blocking(move || discover(&worker, &guard))
         .await
         .map_err(|e| ApiError::internal(format!("federation discovery panicked: {e}")))?;
     Ok(Json(scan?))
 }
 
 /// One request-local discovery: a fresh scan under the caller's own branch
-/// context, stamped and merged exactly as the SSH endpoint does, then
-/// narrowed to what this server's publication policy allows.
+/// context, assembled by the same guarded pipeline as the SSH endpoint,
+/// then narrowed to what this server's publication policy allows.
 fn discover(
     app: &Arc<App>,
-    visited: Vec<String>,
-    hops: u32,
+    guard: &Guard,
 ) -> std::result::Result<crate::federation::FederationScan, ApiError> {
     let origin = crate::federation::read_origin(&app.home).map_err(|e| {
         // The error names this machine's state directory; that stays here.
@@ -465,40 +437,21 @@ fn discover(
             "federation identity unavailable on this server",
         )
     })?;
-    if visited.contains(&origin) {
+    if guard.visited.contains(&origin) {
         return Ok(crate::federation::FederationScan::default());
     }
-    let fleet = Fleet::probe();
-    let overlay = Overlay::open(&Overlay::default_path(&app.home)).ok();
-    let mut scan = scan_with(&app.sources, overlay.as_ref(), Some(&fleet), &[]);
-    let hosts: Vec<remote::Host> = if app.federate {
-        let (hosts, failure) = configured_hosts(app);
-        if let Some(failure) = failure {
-            // A broken hosts.json is part of the answer, not only the log:
-            // the caller learns why this branch contributed no peers.
-            scan.failures.push(failure);
-        }
-        hosts
+    let (hosts, failure) = if app.federate {
+        configured_hosts(app)
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
-    extend_from_origin(
-        &mut scan,
-        &app.sources,
-        &hosts,
-        origin.clone(),
-        visited,
-        hops,
-    );
-    scan.sessions = merge::merge(scan.sessions);
-    borrow_cached_usage(&app.home, &mut scan);
-    let sessions = policy_filter(
-        &app.home,
-        &app.base,
-        &app.source_filter,
-        Some(&origin),
-        &mut scan,
-    );
+    let mut scan = guarded_scan(&app.home, &app.adapters, &hosts, &origin, guard);
+    if let Some(failure) = failure {
+        // A broken hosts.json is part of the answer, not only the log:
+        // the caller learns why this branch contributed no peers.
+        scan.failures.push(failure);
+    }
+    let sessions = policy_filter(&app.home, &app.base, &app.sources, &mut scan);
     Ok(crate::federation::FederationScan {
         sessions,
         failures: scan.failures,
@@ -633,7 +586,14 @@ mod tests {
         };
         Snapshot {
             sessions: vec![live, row("dead-2"), archived, child],
-            statuses: HashMap::from([((None, SourceId::Codex, "live-1".to_owned()), block)]),
+            statuses: HashMap::from([(
+                crate::model::SessionKey {
+                    origin_id: None,
+                    source: SourceId::Codex,
+                    id: "live-1".to_owned(),
+                },
+                block,
+            )]),
             watched: watched.to_owned(),
         }
     }
@@ -662,7 +622,7 @@ mod tests {
             token,
             host: "golden".into(),
             home: FsPath::new("/nonexistent-home").into(),
-            sources: vec![Box::new(Fake {
+            adapters: vec![Box::new(Fake {
                 opened: opened.clone(),
             })],
             snapshot: rx,
@@ -670,8 +630,8 @@ mod tests {
             transcripts: TranscriptCache::default(),
             stopped,
             federate: false,
-            base: query::Query::parse(""),
-            source_filter: Vec::new(),
+            base: Arc::new(query::Query::parse("")),
+            sources: Vec::new(),
         });
         Harness {
             app,
@@ -824,14 +784,14 @@ mod tests {
             token: Some(TOKEN.into()),
             host: "golden".into(),
             home: home.clone(),
-            sources: Vec::new(),
+            adapters: Vec::new(),
             snapshot: rx,
             facts: Arc::default(),
             transcripts: TranscriptCache::default(),
             stopped,
             federate: false,
-            base: query::Query::parse(""),
-            source_filter: Vec::new(),
+            base: Arc::new(query::Query::parse("")),
+            sources: Vec::new(),
         });
         let (status, body) = get(&app, "/v1/sessions?q=body:needle").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

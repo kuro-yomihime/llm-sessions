@@ -17,13 +17,15 @@ use std::io::Read;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::catalog::scan::Scan;
 use crate::error::Result;
-use crate::federation::{DiscoveryContext, FederationScan, valid_origin};
-use crate::model::{SessionSummary, Transcript};
-use crate::source::remote::{Host, REMOTE_BODY_MAX};
+use crate::federation::{Capabilities, DiscoveryContext, FederationScan, valid_origin};
+use crate::model::{RouteHop, SessionSummary, Transcript, normalize_origin};
+use crate::source::remote::{
+    Host, REMOTE_BODY_MAX, RemoteProcess, Transport, strip_received_credentials,
+};
 
 /// Connection budget, matching the ssh transport's `ConnectTimeout`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -73,13 +75,16 @@ fn encode_path_segment(value: &str) -> String {
     encoded
 }
 
-#[derive(Deserialize)]
-struct Capabilities {
-    version: u32,
-    origin_id: String,
-}
-
 impl Host {
+    /// `status` for an HTTP peer: the transport name when the probe
+    /// answers, or why it does not.
+    pub(super) fn http_status(&self) -> String {
+        match self.http_probed() {
+            Ok(_) => "http".to_string(),
+            Err(message) => format!("unreachable: {message}"),
+        }
+    }
+
     /// This peer's origin identity, learned from its capabilities once per
     /// process. The probe doubles as the reachability check `status` and
     /// `hosts list` report, exactly as the ssh probe does.
@@ -98,10 +103,67 @@ impl Host {
                 if !valid_origin(&capabilities.origin_id) {
                     return Err("capabilities carry no valid origin identity".to_string());
                 }
-                Ok(capabilities.origin_id.to_ascii_lowercase())
+                Ok(normalize_origin(&capabilities.origin_id))
             })
             .as_deref()
             .map_err(String::clone)
+    }
+
+    /// `list_with` for an HTTP peer: one guarded listing filtered to the
+    /// configured sources, each row qualified with this peer as its first hop.
+    pub(super) fn http_list_with(&self, context: &DiscoveryContext) -> Result<Scan> {
+        let origin = self
+            .http_probed()
+            .map_err(|message| self.fail(message.clone()))?;
+        if context
+            .visited
+            .iter()
+            .any(|visited| visited.as_str() == origin)
+        {
+            return Ok(Scan::default());
+        }
+        let mut scan = self.http_list(context)?;
+        scan.sessions.retain(|session| self.wants(session.source));
+        for session in &mut scan.sessions {
+            self.attach_route(session, origin)?;
+        }
+        Ok(Scan {
+            sessions: scan.sessions,
+            failures: scan.failures,
+        })
+    }
+
+    /// `open` for a route whose first hop is HTTP: the hop must name this
+    /// peer's URL and probed origin before the origin-qualified read.
+    pub(super) fn http_open(
+        &self,
+        session: &SessionSummary,
+        first: &RouteHop,
+    ) -> Result<Transcript> {
+        let probed = self
+            .http_probed()
+            .map_err(|message| self.fail(message.clone()))?;
+        let Transport::Http { url, .. } = &self.config.transport else {
+            return Err(self.fail("access route does not match the probed peer origin"));
+        };
+        if first.url.as_deref() != Some(url.as_str()) || first.origin_id != probed {
+            return Err(self.fail("access route does not match the probed peer origin"));
+        }
+        self.http_transcript(session)
+    }
+
+    /// `top` for an HTTP peer: the protocol exposes no live-process view,
+    /// and inventing one from rows would be a fabrication.
+    pub(super) fn http_top(&self) -> Result<Vec<RemoteProcess>> {
+        self.http_probed()
+            .map_err(|message| self.fail(message.clone()))?;
+        Err(self.fail("the HTTP federation protocol does not expose live processes"))
+    }
+
+    /// `origin_id` for an HTTP peer: the identity its capabilities named.
+    pub(super) fn http_origin_id(&self) -> Result<&str> {
+        self.http_probed()
+            .map_err(|message| self.fail(message.clone()))
     }
 
     /// One guarded listing, mirroring the ssh `federation list` call: the
@@ -116,11 +178,7 @@ impl Host {
                 ("hops", (context.remaining_hops - 1).to_string()),
             ],
         )?;
-        for session in &mut scan.sessions {
-            for route in &mut session.routes {
-                route.strip_credentials();
-            }
-        }
+        strip_received_credentials(&mut scan);
         Ok(scan)
     }
 
@@ -161,12 +219,10 @@ impl Host {
     }
 
     fn http_get(&self, path: &str, query: &[(&str, String)]) -> Result<String> {
-        let base = self
-            .config
-            .url
-            .as_deref()
-            .unwrap_or_default()
-            .trim_end_matches('/');
+        let Transport::Http { url, .. } = &self.config.transport else {
+            return Err(self.fail("an HTTP request needs an HTTP peer"));
+        };
+        let base = url.trim_end_matches('/');
         let token = self.bearer()?;
         let client = client().map_err(|message| {
             self.fail(brief(format!("cannot build the HTTP client: {message}")))
@@ -250,7 +306,10 @@ impl Host {
     /// variable the local configuration names. Only the variable's name can
     /// appear in a message; its value goes into the header and nowhere else.
     fn bearer(&self) -> Result<Option<String>> {
-        let Some(name) = &self.config.token_env else {
+        let Transport::Http { token_env, .. } = &self.config.transport else {
+            return Ok(None);
+        };
+        let Some(name) = token_env else {
             return Ok(None);
         };
         match std::env::var(name) {
@@ -387,10 +446,10 @@ mod tests {
     fn host(url: &str, token_env: Option<&str>) -> Host {
         Host::new(crate::source::remote::HostConfig {
             name: "gateway".into(),
-            ssh: String::new(),
-            url: Some(url.into()),
-            token_env: token_env.map(str::to_owned),
-            home: None,
+            transport: crate::source::remote::Transport::Http {
+                url: url.into(),
+                token_env: token_env.map(str::to_owned),
+            },
             sources: Vec::new(),
             mode: crate::source::remote::Mode::Auto,
         })

@@ -147,7 +147,7 @@ pub(super) fn status_now(live: bool, facts: Facts, session: &SessionSummary) -> 
 pub(super) struct Poller {
     loader: Loader,
     fleet: Fleet,
-    base: Query,
+    base: Arc<Query>,
     window: Duration,
     facts: Arc<FactsCache>,
     /// Gateway mode: each tick also lists the configured peers, under the
@@ -156,7 +156,7 @@ pub(super) struct Poller {
     federate: bool,
     /// The `--source` allow-list, applied to local and federated rows alike
     /// before any status, cache entry or watched row exists.
-    allowed: Vec<SourceId>,
+    sources: Vec<SourceId>,
     /// The published (debounced) status per watched session.
     settled: HashMap<Key, Settled>,
     /// Failure lines already printed; a broken store is reported once, not
@@ -167,11 +167,11 @@ pub(super) struct Poller {
 impl Poller {
     pub fn new(
         loader: Loader,
-        base: Query,
+        base: Arc<Query>,
         window: Duration,
         facts: Arc<FactsCache>,
         federate: bool,
-        allowed: Vec<SourceId>,
+        sources: Vec<SourceId>,
     ) -> Self {
         Self {
             loader,
@@ -180,7 +180,7 @@ impl Poller {
             window,
             facts,
             federate,
-            allowed,
+            sources,
             settled: HashMap::new(),
             warned: HashSet::new(),
         }
@@ -219,14 +219,7 @@ impl Poller {
         for failure in scan.failures.drain(..) {
             self.warn(failure);
         }
-        let own = crate::federation::read_origin(self.loader.home()).ok();
-        let sessions = policy_filter(
-            self.loader.home(),
-            &self.base,
-            &self.allowed,
-            own.as_deref(),
-            &mut scan,
-        );
+        let sessions = policy_filter(self.loader.home(), &self.base, &self.sources, &mut scan);
 
         let window = time::Duration::try_from(self.window).unwrap_or(time::Duration::MAX);
         let mut statuses = HashMap::new();
@@ -249,11 +242,7 @@ impl Poller {
             // The local fleet says nothing about another machine: a remote
             // row keeps whatever liveness its own origin reported, and a
             // coincidentally equal pid is never attributed to it.
-            let local = session
-                .origin_id
-                .as_deref()
-                .is_none_or(|origin| Some(origin) == own.as_deref());
-            let activity = if local {
+            let activity = if session.is_local() {
                 session
                     .liveness
                     .pid()
@@ -302,8 +291,7 @@ impl Poller {
 pub(super) fn policy_filter(
     home: &std::path::Path,
     base: &Query,
-    allowed: &[SourceId],
-    own: Option<&str>,
+    sources: &[SourceId],
     scan: &mut crate::catalog::scan::Scan,
 ) -> Vec<SessionSummary> {
     let hits = match body_hits(home, base) {
@@ -314,13 +302,9 @@ pub(super) fn policy_filter(
     let indexed = hits.is_some();
     scan.sessions
         .drain(..)
-        .filter(|session| allowed.is_empty() || allowed.contains(&session.source))
+        .filter(|session| sources.is_empty() || sources.contains(&session.source))
         .filter(|session| {
-            let local = session
-                .origin_id
-                .as_deref()
-                .is_none_or(|origin| Some(origin) == own);
-            (!indexed || local)
+            (!indexed || session.is_local())
                 && hits
                     .as_ref()
                     .is_none_or(|hits| hits.contains(&(session.source, session.id.clone())))
@@ -385,7 +369,11 @@ mod tests {
         };
         let mut snapshot = Snapshot::default();
         snapshot.statuses.insert(
-            (Some(ORIGIN_A.to_owned()), SourceId::Codex, "shared".into()),
+            SessionKey {
+                origin_id: Some(ORIGIN_A.to_owned()),
+                source: SourceId::Codex,
+                id: "shared".into(),
+            },
             waiting,
         );
         let federated = summary(Some(ORIGIN_A), "shared");
@@ -416,7 +404,6 @@ mod tests {
             std::path::Path::new("/nonexistent-home"),
             &Query::parse(""),
             &[SourceId::Omp],
-            None,
             &mut scan,
         );
         let ids: Vec<&str> = kept.iter().map(|session| session.id.as_str()).collect();
