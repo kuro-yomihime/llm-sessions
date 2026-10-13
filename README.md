@@ -92,6 +92,7 @@ sessions that happen to have no display label.
 ```sh
 llm-sessions hosts                                            # list + probe
 llm-sessions hosts add nx-1 nx-1.example.net --source hermes  # repeatable --source
+llm-sessions hosts refresh nx-1                             # enroll/reset UUID
 llm-sessions hosts remove nx-1
 ```
 
@@ -101,6 +102,7 @@ variable holding the peer's bearer token:
 ```sh
 export WORKER_TOKEN='<server token>'
 llm-sessions hosts add http-worker --url https://worker.example.net --token-env WORKER_TOKEN
+llm-sessions hosts refresh http-worker
 ```
 
 HTTP peers support discovery and transcript reads, not terminal resume,
@@ -161,6 +163,16 @@ edges. Probe failures remain visible in the discovery failures.
 Preserve the marker across upgrades and restores of the same instance.
 Independent clones must get a new UUID; copied identities cause false
 deduplication and false cycle detection.
+
+Unpinned or UUID-mismatched peers are excluded with a warning. Enroll or reset:
+
+```sh
+llm-sessions hosts refresh worker
+```
+
+No prompt: saves the peer's current UUID and prints old → new; failed reads
+leave the pin unchanged. Verify the destination first—this explicitly resets
+trust. Forwarded origins remain trusted gateway claims.
 
 ### Serve
 

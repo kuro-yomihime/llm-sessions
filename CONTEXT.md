@@ -8,6 +8,8 @@ line here when a module is named after a concept not yet listed.
   grouped by the workspace it ran in.
 - **Origin** — the host/account session namespace where a session lives.
   Its stable identity is shared by every observer and access method.
+- **Origin pin** — a configured peer's explicitly enrolled UUID. Remote access
+  rejects missing or mismatched pins; `hosts refresh` deliberately resets trust.
 - **Origin display label** — human-readable attribution for an origin;
   different observers may use different labels for the same origin.
 - **Access route** — an ordered path through SSH or HTTP peers to a session's
