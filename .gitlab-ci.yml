@@ -76,8 +76,8 @@ test:
   stage: test
   extends: .non_tag
   script:
-    # The golden corpus builds SQLite fixtures, so the runner needs a writable
-    # temporary directory; nothing else is required.
+    # The HTTPS proxy regression uses isolated Python/OpenSSL fixtures.
+    - apt-get update && apt-get install -y --no-install-recommends python3 openssl ca-certificates
     - cargo test --all-targets
 
 # Non-blocking: a new RustSec advisory can land against an unchanged lockfile,
