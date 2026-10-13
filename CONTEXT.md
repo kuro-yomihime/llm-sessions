@@ -14,6 +14,10 @@ line here when a module is named after a concept not yet listed.
   origin. Multiple routes can reach the same session.
 - **Discovery path** — origins already visited by one traversal branch.
   A repeated origin is a cycle; a separate branch can visit it independently.
+- **Federation** (`federation`) — origin identity and guarded discovery across
+  peers; each traversal branch carries its own discovery path and hop budget.
+- **Merge** (`catalog::merge`) — catalog assembly by origin-qualified session
+  key, preserving alternative access routes without duplicating session rows.
 - **Transcript** — the opened body of a session: turns of blocks (text,
   thinking, tool use/result, changed files, unknown raw JSON).
 - **Workspace** — the repository a session's recorded cwd canonicalizes to;

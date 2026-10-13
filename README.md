@@ -86,6 +86,8 @@ lists only its local stores (`mode`: `"auto"`, `"llm-sessions"`, or `"shell"`).
 Older binaries are shell-only leaves, with a diagnostic; they never receive
 an unguarded recursive `list`. Connections use `BatchMode=yes`, so
 passphrase-protected hosts fail fast.
+`--host local` and `host:local` select genuinely local access, not forwarded
+sessions that happen to have no display label.
 
 ```sh
 llm-sessions hosts                                            # list + probe
@@ -150,8 +152,11 @@ llm-sessions show shared --origin <origin-uuid> --source omp
 
 Discovery skips an already-visited origin before querying its sessions.
 Paths are branch-local: independent routes may query the same origin and
-their results merge. Traversal is bounded to eight SSH/HTTP hops; endpoint local
-sessions remain visible and truncation is reported.
+their results merge. Eight SSH/HTTP hops is both the default budget and the
+maximum. At zero remaining hops, endpoint local sessions remain visible;
+identity-only probes distinguish already-visited peers from unexplored ones.
+Truncation is reported only when an unexplored peer is cut off, not for cyclic
+edges. Probe failures remain visible in the discovery failures.
 
 Preserve the marker across upgrades and restores of the same instance.
 Independent clones must get a new UUID; copied identities cause false
@@ -342,13 +347,15 @@ are treated as free text — a typo narrows results, never fails.
 
 ### Source layout
 
-- `src/catalog/` — scan, query grammar, labels, workspace identity.
-- `src/source/` — agent adapters, schema decoding, `remote/` SSH transport.
+- `src/catalog/` — scan assembly, origin-qualified merge, query grammar, labels, workspace identity.
+- `src/source/` — agent adapters, schema decoding, `remote/` SSH and HTTP transports.
 - `src/storage/` — index, archive overlay, bookmarks, SQLite access.
 - `src/runtime/` — process facts, liveness, tmux, resume, diagnostics.
 - `src/output/` — reader, exports, list rows, digests, usage reports.
 - `src/tui/` — `app/` state and effects, `view.rs`, `ui.rs`, `keymap.rs`.
 - `src/cli/` — argument definitions, one file per command group.
+- `src/federation.rs` — origin identity, protocol capabilities, guarded discovery context.
+- `src/serve/` — authenticated HTTP/WebSocket API, local snapshots and opt-in federation gateway.
 
 Development: toolchain pinned (1.96.0); CI runs fmt, pedantic clippy,
 rustdoc with `-D warnings`, tests, and a non-blocking `cargo audit`.
