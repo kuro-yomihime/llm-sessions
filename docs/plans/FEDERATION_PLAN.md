@@ -269,10 +269,11 @@ Probe capability support before using recursive federation.
   <JSON origin array> --hops <remaining count>` returns sessions and failures.
 - Delegated reads: `federation show --origin <UUID> --source <agent> --id
   <session ID> --route <JSON hop array>`; `federation top` is local-only.
-- Routes: ordered origin/name/SSH/home hops, ranked by hop count then lexical
-  order. Merge retains every successful route and selects one whole observation.
-- Discovery depth: eight SSH hops by default; caller-side identity check plus
-  receiving-side guard. Older peers remain shell leaves.
+- Routes: ordered origin/name/SSH-or-HTTP/home hops, ranked by hop count then
+  lexical order. Merge retains every successful route and selects one whole
+  observation. HTTP routes are read-only and carry no credentials.
+- Discovery depth: eight SSH/HTTP hops by default; caller-side identity check
+  plus receiving-side guard. Older SSH peers remain shell leaves.
 - `federation top` is local-only; `llm-sessions top --json` remote rows carry
   both the configured display name and the peer's `origin_id`.
 - Configured home: the marker and guarded binary commands share the supplied
@@ -281,4 +282,33 @@ Probe capability support before using recursive federation.
   scenarios. An isolated CLI/TUI smoke graph exercised duplicate direct and
   gateway routes, a cyclic edge, origin attribution, matching single-session
   counts, and remote transcript rendering with and without a direct route.
+
+## HTTP peers and opt-in gateways
+
+- HTTP peers are configured with `url` and optional `token_env` instead of
+  `ssh`; each observer or gateway binds credentials locally by configured URL.
+  Forwarded route metadata cannot select environment secrets.
+- Authenticated `/v1/federation/capabilities` and `/v1/federation/list`
+  implement the origin handshake and request-local path/hop protocol.
+  Protocol version 2 permits HTTP hops; version-1 SSH peers are downgraded
+  to shell leaves and never receive mixed routes or chained discovery.
+- `serve` remains local-only by default. `serve --federate` publishes its
+  merged catalog through HTTP and WebSocket; its token authorizes that catalog.
+- HTTP detail/transcript reads accept `origin` and `source` qualifiers.
+  A fully qualified snapshot miss runs one fresh policy-filtered discovery;
+  its errors propagate. Publication source/query restrictions apply to every
+  read and discovery response. Gateway caches key on the full identity.
+- Resume selects the shortest valid SSH-only route independently of the
+  read-preferred route; HTTP-only sessions offer none.
+- HTTP peer reads refuse redirects, verify HTTPS certificates against web and
+  platform roots, bound response bodies, and redact bearer values before
+  truncating diagnostics.
+- Real CLI/server regressions cover leaf/gateway scope, SSH-to-HTTP and
+  HTTP-to-SSH reads, multi-node mixed-transport cycles, diamond
+  deduplication, origin collisions, credential rebinding, authorization and
+  publication policy, missing identity, depth, configuration failures,
+  immediate reads after discovery, legacy v1 downgrade, resume over an SSH
+  alternate, and HTTPS through a path-prefixed TLS proxy (untrusted CA
+  rejected). Standalone smoke also exercised a live gateway WebSocket
+  snapshot containing both origins without credential metadata.
 

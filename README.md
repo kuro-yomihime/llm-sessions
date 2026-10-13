@@ -37,8 +37,9 @@ cargo install llm-sessions   # or `cargo install --path .` from a checkout
 ```
 
 Requires Rust 1.96+ (pinned in `rust-toolchain.toml`). Linux only: liveness
-reads `/proc`. `--no-default-features` builds without `serve` and its
-tokio/axum dependencies.
+reads `/proc`. `--no-default-features` builds an SSH-only CLI/TUI without the
+server or HTTP client. Enable `serve` or `http` independently with `--features`;
+both are enabled by default.
 
 ## TUI basics
 
@@ -73,7 +74,8 @@ Configure in `$XDG_CONFIG_HOME/llm-sessions/hosts.json`:
 
 ```json
 { "hosts": [
-  { "name": "nx-1", "ssh": "nx-1.example.net", "home": "/var/lib/hermes", "sources": ["hermes"] }
+  { "name": "nx-1", "ssh": "nx-1.example.net", "home": "/var/lib/hermes", "sources": ["hermes"] },
+  { "name": "http-worker", "url": "https://worker.example.net", "token_env": "WORKER_TOKEN", "sources": ["omp"] }
 ] }
 ```
 
@@ -90,6 +92,30 @@ llm-sessions hosts                                            # list + probe
 llm-sessions hosts add nx-1 nx-1.example.net --source hermes  # repeatable --source
 llm-sessions hosts remove nx-1
 ```
+
+HTTP peers use `url` instead of `ssh`; `token_env` names a local environment
+variable holding the peer's bearer token:
+
+```sh
+export WORKER_TOKEN='<server token>'
+llm-sessions hosts add http-worker --url https://worker.example.net --token-env WORKER_TOKEN
+```
+
+HTTP peers support discovery and transcript reads, not terminal resume,
+insert delivery, or process `top`. Mixed SSH/HTTP routes use the same origin
+identity and merge rules. HTTP clients verify HTTPS certificates against both
+bundled web roots and the platform trust store (`SSL_CERT_FILE` /
+`SSL_CERT_DIR` work for a private CA), refuse redirects, and use finite
+connection/request timeouts. Base URLs may include a reverse-proxy path
+prefix, but not credentials, queries, or fragments.
+Token values and credential references are never forwarded in session routes;
+each gateway resolves its own peer credentials from its local configuration.
+
+The federation protocol is version 2: it allows HTTP hops in routes. A
+version-1 peer (an earlier SSH-only release) is downgraded to a shell leaf
+with a diagnostic: its local sessions still list, but it is never asked to
+discover further or to forward a route. Upgrade such peers for chained
+discovery.
 
 Initialize each originating account once, on that machine:
 
@@ -113,8 +139,10 @@ filters. The agent-assigned `id` stays unchanged. A session reached directly
 and through a gateway appears once under its origin, not the gateway. JSON
 includes `origin_id` and `routes`; display names are not identity keys.
 The shortest successful route wins, with a lexical tie-break. Transcript
-opening and resume also work when an origin is reachable only through a
-gateway. Disambiguate colliding IDs when opening:
+opening also works when an origin is reachable only through a gateway.
+Resume uses the shortest valid SSH-only route, independently of the
+preferred read route, so adding an HTTP path never removes a working SSH
+resume; an HTTP-only session has none. Disambiguate colliding IDs when opening:
 
 ```sh
 llm-sessions show shared --origin <origin-uuid> --source omp
@@ -122,7 +150,7 @@ llm-sessions show shared --origin <origin-uuid> --source omp
 
 Discovery skips an already-visited origin before querying its sessions.
 Paths are branch-local: independent routes may query the same origin and
-their results merge. Traversal is bounded to eight SSH hops; endpoint local
+their results merge. Traversal is bounded to eight SSH/HTTP hops; endpoint local
 sessions remain visible and truncation is reported.
 
 Preserve the marker across upgrades and restores of the same instance.
@@ -145,7 +173,19 @@ curl -H "Authorization: Bearer $LLMS_TOKEN" 'http://host:8787/v1/sessions?q=live
 | `/v1/sessions?q=<query>&limit=N` | `{"serverTime","sessions":[row…]}`: `list --json` rows, same query language, `limit` 50 by default, 0 for all |
 | `/v1/sessions/<id>` | one row; a unique id prefix works, as with `show` |
 | `/v1/sessions/<id>/transcript` | exactly what `show <id> --json` prints |
+| `/v1/federation/capabilities` | authenticated protocol handshake: `{"version":2,"origin_id":"<UUID>"}` |
+| `/v1/federation/list?path=<JSON array>&hops=N` | request-local guarded discovery: `{"sessions":[row…],"failures":[…]}` |
 | `/v1/stream` | WebSocket: `{"type":"snapshot",…}` on connect and when a watched row changes, `{"type":"ping"}` every 20 s |
+
+Detail and transcript routes accept `?origin=<UUID>&source=<agent>` to
+resolve IDs shared by different origins or agents. Ambiguous unqualified
+IDs return HTTP 400 rather than selecting one. A fully qualified read the
+poll snapshot has not seen yet triggers one fresh, policy-filtered discovery,
+so a row returned by `/v1/federation/list` is readable immediately; hidden
+rows stay 404 and discovery failures are returned, not masked as 404.
+Federation capabilities/list require the same bearer authentication as
+sessions; missing canonical origin identity returns HTTP 503. Provision the
+marker before read-only startup.
 
 A row is a `list --json` row plus `status`: `{"status","waitingReason",
 "statusSince"}` with status `running`, `idle`, `waiting` (`approval` or
@@ -166,7 +206,22 @@ WebSocket connects, so `--no-auth` (loopback only) answers just requests
 whose `Host` header names the loopback. There is no TLS: off loopback, put a
 TLS reverse proxy in front. `--source` and `-q` restrict
 what is published at all; `--poll-secs` (default 3) sets the rescan interval.
-Only local sessions are served, not those of configured remote hosts.
+Local-only is the default, even when `hosts.json` contains peers. Enable a
+federated gateway explicitly:
+
+```sh
+llm-sessions serve --federate --token "$GATEWAY_TOKEN"
+```
+
+Gateway mode publishes the merged local/remote catalog through the regular
+HTTP and WebSocket routes. Its token grants access to that catalog, including
+sessions reached through other hosts. `--source` and the base `-q` query
+restrict every published session, including qualified transcript reads and
+federation discovery. `body:` is local-index-only and excludes remote rows.
+Each federation request carries its own visited-origin path and hop budget;
+it does not reuse the gateway's cached full catalog. Status and transcript
+caches use origin-qualified identity, and local process activity is never
+attributed to a remote process with the same PID.
 
 ## Commands
 

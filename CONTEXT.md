@@ -10,7 +10,7 @@ line here when a module is named after a concept not yet listed.
   Its stable identity is shared by every observer and access method.
 - **Origin display label** — human-readable attribution for an origin;
   different observers may use different labels for the same origin.
-- **Access route** — an ordered path through remote hosts to a session's
+- **Access route** — an ordered path through SSH or HTTP peers to a session's
   origin. Multiple routes can reach the same session.
 - **Discovery path** — origins already visited by one traversal branch.
   A repeated origin is a cycle; a separate branch can visit it independently.
@@ -52,9 +52,13 @@ line here when a module is named after a concept not yet listed.
   CPU activity joined with the transcript tail, debounced by `settle`. Needs
   a tier-2 read, so it is derived for watched sessions, never for a listing.
 - **Serve** (`serve`, feature `serve`) — the read-only HTTP/WebSocket API:
-  a poller owns a `Loader`, rescans on a timer and publishes immutable
-  snapshots; handlers only read them. GET routes and one WebSocket, nothing
+  a poller publishes local-only snapshots by default, or a merged remote
+  catalog in explicit gateway mode. Guarded federation requests discover
+  under their own branch context. GET routes and one WebSocket, nothing
   else, so read-only holds by construction rather than by a flag.
+- **Federation gateway** — an observer that publishes sessions reached
+  through its configured peers as well as its own origin. Access to the
+  gateway's catalog is authorized by its server token.
 - **Overlay** — `llm-sessions`-owned store of archive state for agents without
   native archiving.
 - **Index** — the disposable FTS5 body-search cache plus derived usage/prompt
