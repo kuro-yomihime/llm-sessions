@@ -158,7 +158,9 @@ fn summary_from_sql(
     Some(SessionSummary {
         id: id.clone(),
         source,
-        host: Some(host.to_owned()),
+        origin_label: Some(host.to_owned()),
+        origin_id: None,
+        routes: Vec::new(),
         workspace: None,
         recorded_cwd: text(row.get("cwd")).map(PathBuf::from),
         trust: PathTrust::Recorded,
@@ -222,7 +224,9 @@ fn summary_from_head(row: &FileRow, host: &str, path: &str) -> Option<SessionSum
     Some(SessionSummary {
         id: id.unwrap_or_else(|| stem(path)),
         source: row.source,
-        host: Some(host.to_owned()),
+        origin_label: Some(host.to_owned()),
+        origin_id: None,
+        routes: Vec::new(),
         workspace: None,
         recorded_cwd: cwd.map(PathBuf::from),
         trust: PathTrust::Recorded,
@@ -397,7 +401,7 @@ mod tests {
         assert_eq!(row.id, "01a0");
         assert_eq!(row.title.as_deref(), Some("Fix the thing"));
         assert_eq!(row.recorded_cwd.as_deref(), Some(Path::new("/work/thing")));
-        assert_eq!(row.host.as_deref(), Some("nx-1"));
+        assert_eq!(row.origin_label.as_deref(), Some("nx-1"));
         assert_eq!(row.updated.unix_timestamp(), EPOCH);
         assert_eq!(row.source, SourceId::Omp);
     }

@@ -19,19 +19,23 @@ const REMOTE_FILES_PER_SOURCE: usize = 200;
 /// header record plus its optional title slot.
 const REMOTE_HEAD_BYTES: usize = 8 * 1024;
 /// Run over SSH on stdin, where a non-login shell may have a restricted PATH.
-const PROBE_SCRIPT: &str = "echo \"home:$HOME\"
+const PROBE_SCRIPT: &str = r#"echo "home:$HOME"
+marker="${XDG_STATE_HOME:-$HOME/.local/state}/llm-sessions/origin-id"
+if [ -r "$marker" ]; then
+    IFS= read -r origin < "$marker"
+    printf 'origin:%s\n' "$origin"
+fi
 if path=$(command -v llm-sessions); then
-    printf 'llm-sessions:%s\n' \"$path\"
-elif [ -x \"$HOME/.local/bin/llm-sessions\" ]; then
-    printf 'llm-sessions:%s\n' \"$HOME/.local/bin/llm-sessions\"
-elif [ -x \"$HOME/.cargo/bin/llm-sessions\" ]; then
-    printf 'llm-sessions:%s\n' \"$HOME/.cargo/bin/llm-sessions\"
+    printf 'llm-sessions:%s\n' "$path"
+elif [ -x "$HOME/.local/bin/llm-sessions" ]; then
+    printf 'llm-sessions:%s\n' "$HOME/.local/bin/llm-sessions"
+elif [ -x "$HOME/.cargo/bin/llm-sessions" ]; then
+    printf 'llm-sessions:%s\n' "$HOME/.cargo/bin/llm-sessions"
 fi
 command -v sqlite3 >/dev/null && echo sqlite3:yes
-# A missing sqlite3 must not fail the probe: the script's exit status
-# becomes ssh's exit status.
+# A missing sqlite3 must not fail the probe.
 exit 0
-";
+"#;
 
 /// What probing a host learned, once per process.
 #[derive(Clone, Debug)]
@@ -41,9 +45,70 @@ pub(super) struct Probe {
     /// `~/.local/bin` and `~/.cargo/bin`.
     pub(super) llm_sessions: Option<String>,
     pub(super) sqlite3: bool,
+    pub(super) origin_id: String,
+    pub(super) federation: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct Capability {
+    version: u32,
+    origin_id: String,
+}
+
+/// SSH concatenates its command arguments for the remote login shell.
+/// Quote every word once, then pass the entire command as one argument.
+pub(super) fn shell_command<'a>(argv: impl IntoIterator<Item = &'a str>) -> String {
+    argv.into_iter()
+        .map(crate::runtime::resume::shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(super) fn home_environment(home: &std::path::Path) -> [String; 5] {
+    [
+        format!("HOME={}", home.display()),
+        format!("XDG_CONFIG_HOME={}", home.join(".config").display()),
+        format!("XDG_STATE_HOME={}", home.join(".local/state").display()),
+        format!("XDG_CACHE_HOME={}", home.join(".cache").display()),
+        format!("XDG_DATA_HOME={}", home.join(".local/share").display()),
+    ]
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct Scripted {
+    pub(super) replies:
+        std::sync::Mutex<std::collections::VecDeque<std::result::Result<String, String>>>,
+    pub(super) calls: std::sync::Mutex<Vec<Vec<String>>>,
+    pub(super) scripts: std::sync::Mutex<Vec<String>>,
 }
 
 impl Host {
+    fn probe_script(&self) -> std::borrow::Cow<'static, str> {
+        if let Some(home) = &self.config.home {
+            let environment = home_environment(home);
+            let assignments = shell_command(environment.iter().map(String::as_str));
+            std::borrow::Cow::Owned(format!("export {assignments}\n{PROBE_SCRIPT}"))
+        } else {
+            std::borrow::Cow::Borrowed(PROBE_SCRIPT)
+        }
+    }
+
+    /// A configured home selects an account/session namespace consistently for
+    /// marker probing, its config, and every guarded binary invocation.
+    pub(super) fn ssh_binary(&self, home: &std::path::Path, args: &[&str]) -> Result<String> {
+        if self.config.home.is_some() {
+            let environment = home_environment(home);
+            let mut command = Vec::with_capacity(args.len() + environment.len() + 1);
+            command.push("env");
+            command.extend(environment.iter().map(String::as_str));
+            command.extend_from_slice(args);
+            self.ssh(&command)
+        } else {
+            self.ssh(args)
+        }
+    }
+
     pub(super) fn probed(&self) -> Result<&Probe> {
         self.probe_once().map_err(|message| self.fail(message))
     }
@@ -54,13 +119,14 @@ impl Host {
                 // The probe travels on stdin like the listing script: ssh
                 // hands argv to the remote login shell for re-parsing, and
                 // this script's quoting would not survive that round trip.
-                let raw = self.ssh_script(PROBE_SCRIPT).map_err(|e| match e {
+                let raw = self.ssh_script(&self.probe_script()).map_err(|e| match e {
                     Error::Remote { message, .. } => message,
                     other => other.to_string(),
                 })?;
                 let mut reported = None;
                 let mut llm_sessions = None;
                 let mut sqlite3 = false;
+                let mut origin_id = None;
                 for line in raw.lines() {
                     let line = line.trim();
                     if let Some(path) = line.strip_prefix("llm-sessions:")
@@ -73,6 +139,10 @@ impl Host {
                         && !home.is_empty()
                     {
                         reported = Some(PathBuf::from(home));
+                    } else if let Some(origin) = line.strip_prefix("origin:")
+                        && crate::federation::valid_origin(origin)
+                    {
+                        origin_id = Some(origin.to_ascii_lowercase());
                     }
                 }
                 let home = self
@@ -81,10 +151,32 @@ impl Host {
                     .clone()
                     .or(reported)
                     .ok_or_else(|| "host reported no home directory".to_string())?;
+                let origin_id = origin_id.ok_or_else(|| {
+                    "canonical origin identity unavailable: missing or malformed origin-id marker under $XDG_STATE_HOME (default ~/.local/state)/llm-sessions".to_string()
+                })?;
+                let federation = if let Some(binary) = llm_sessions.as_deref() {
+                    match self.ssh_binary(&home, &[binary, "federation", "capabilities"]) {
+                        Ok(raw) => {
+                            if let Ok(capability) = serde_json::from_str::<Capability>(&raw) {
+                                if capability.version == 1 && capability.origin_id != origin_id {
+                                    return Err("federation capability origin does not match origin marker".to_string());
+                                }
+                                capability.version == 1
+                            } else {
+                                false
+                            }
+                        }
+                        Err(_) => false,
+                    }
+                } else {
+                    false
+                };
                 Ok(Probe {
                     home,
                     llm_sessions,
                     sqlite3,
+                    origin_id,
+                    federation,
                 })
             })
             .as_ref()
@@ -103,6 +195,28 @@ impl Host {
     }
 
     fn run(&self, argv: &[&str], stdin: Option<&str>) -> Result<String> {
+        #[cfg(test)]
+        if let Some(scripted) = &self.scripted {
+            scripted
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(argv.iter().map(|part| (*part).to_owned()).collect());
+            if let Some(script) = stdin {
+                scripted
+                    .scripts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(script.to_owned());
+            }
+            return scripted
+                .replies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .expect("unexpected remote command")
+                .map_err(|message| self.fail(message));
+        }
         let mut command = Command::new("ssh");
         command.args([
             "-o",
@@ -114,8 +228,8 @@ impl Host {
             "-o",
             "ServerAliveCountMax=2",
         ]);
-        command.arg(&self.config.ssh);
-        command.args(argv);
+        command.arg("--").arg(&self.config.ssh);
+        command.arg(shell_command(argv.iter().copied()));
         command
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -247,6 +361,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn configured_home_probe_reads_its_marker_not_the_login_account_marker() {
+        let login = tempfile::tempdir().unwrap();
+        let configured = login.path().join("another namespace with ' spaces");
+        let login_origin = crate::federation::ensure_origin(login.path()).unwrap();
+        let configured_origin = crate::federation::ensure_origin(&configured).unwrap();
+        let host = Host::new(crate::source::remote::HostConfig {
+            name: "namespace".into(),
+            ssh: "namespace".into(),
+            home: Some(configured.clone()),
+            sources: Vec::new(),
+            mode: crate::source::remote::Mode::Auto,
+        });
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(host.probe_script().as_ref())
+            .env("HOME", login.path())
+            .env("PATH", login.path())
+            .env("XDG_CONFIG_HOME", "/wrong/config")
+            .env("XDG_STATE_HOME", "/wrong/state")
+            .env("XDG_CACHE_HOME", "/wrong/cache")
+            .env("XDG_DATA_HOME", "/wrong/data")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let raw = String::from_utf8(output.stdout).unwrap();
+        assert!(raw.contains(&format!("origin:{configured_origin}")));
+        assert!(!raw.contains(&format!("origin:{login_origin}")));
+        assert!(
+            raw.lines()
+                .any(|line| line == format!("home:{}", configured.display()))
+        );
+    }
+
+    #[test]
+    fn shell_command_preserves_json_paths_and_hostile_ids() {
+        let words = [
+            "/home/o'neil/bin/llm-sessions",
+            "federation",
+            "show",
+            "--id",
+            "spaces ' $(false); echo wrong",
+            "--route",
+            r#"[{"origin_id":"id","name":"a b","ssh":"u@a"}]"#,
+            "",
+        ];
+        let line = shell_command(words);
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -- {line}; printf '%s\\0' \"$@\""))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let actual: Vec<_> = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .take(words.len())
+            .map(|word| std::str::from_utf8(word).unwrap())
+            .collect();
+        assert_eq!(actual, words);
+    }
+
+    #[test]
+    fn shell_probe_reads_the_same_provisioned_marker_without_a_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = crate::federation::ensure_origin(dir.path()).unwrap();
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(PROBE_SCRIPT)
+            .env("HOME", dir.path())
+            .env("PATH", dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let raw = String::from_utf8(output.stdout).unwrap();
+        assert!(raw.lines().any(|line| line == format!("origin:{origin}")));
+        assert!(!raw.contains("llm-sessions:"));
+        assert_eq!(crate::federation::read_origin(dir.path()).unwrap(), origin);
+    }
+
+    #[test]
     fn a_glob_is_rooted_at_its_literal_prefix() {
         assert_eq!(
             literal_prefix(".omp/agent/sessions/*/*.jsonl"),
@@ -267,11 +461,15 @@ mod tests {
         let binary = cargo_bin.join("llm-sessions");
         std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(dir.path().join("empty-path")).unwrap();
 
-        let mut child = Command::new("sh")
+        let mut child = Command::new("/bin/sh")
             .arg("-s")
             .env("HOME", dir.path())
-            .env("PATH", "/usr/bin:/bin")
+            // An llm-sessions on this workstation's PATH (including /usr/bin
+            // and /bin) would satisfy the first branch; the fixture is about
+            // the cargo fallback, so no directory may resolve it.
+            .env("PATH", dir.path().join("empty-path"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
