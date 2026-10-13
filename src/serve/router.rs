@@ -215,7 +215,7 @@ async fn session(
         let summary = session.clone();
         let facts = tokio::task::spawn_blocking(move || {
             worker.facts.get(&summary, || {
-                loader::open(&worker.home, &worker.sources, &[], &summary)
+                loader::open(&worker.home, &worker.sources, &summary)
             })
         })
         .await
@@ -245,7 +245,7 @@ async fn transcript(
         let summary = session.clone();
         let body = tokio::task::spawn_blocking(move || {
             let transcript =
-                loader::open(&worker.home, &worker.sources, &[], &summary).map_err(|e| {
+                loader::open(&worker.home, &worker.sources, &summary).map_err(|e| {
                     // The error carries the session's path on this machine.
                     eprintln!("llm-sessions: opening {} failed: {e}", summary.id);
                     "transcript unreadable".to_owned()

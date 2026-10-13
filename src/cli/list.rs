@@ -45,9 +45,16 @@ pub(super) fn workspaces(home: &Path, args: &WorkspacesArgs) -> Result<()> {
     let Loaded { scan, .. } = scan_all(home, Liveliness::Needed);
     let rows = filter(home, &scan, &args.filters, 0);
 
-    let mut groups: BTreeMap<Option<&PathBuf>, Vec<&SessionSummary>> = BTreeMap::new();
+    let mut groups: BTreeMap<_, Vec<&SessionSummary>> = BTreeMap::new();
     for row in &rows {
-        groups.entry(row.workspace.as_ref()).or_default().push(row);
+        groups
+            .entry((
+                row.origin_id.as_deref(),
+                row.origin_label.as_deref(),
+                row.workspace.as_ref(),
+            ))
+            .or_default()
+            .push(row);
     }
     let mut ordered: Vec<_> = groups.into_iter().collect();
     // Somewhere with an agent attached comes first; then plain recency.
@@ -64,12 +71,14 @@ pub(super) fn workspaces(home: &Path, args: &WorkspacesArgs) -> Result<()> {
     }
     let summaries: Vec<_> = ordered
         .into_iter()
-        .map(|(path, rows)| {
+        .map(|((origin_id, host, path), rows)| {
             let mut agents: Vec<_> = rows.iter().map(|r| r.source.to_string()).collect();
             agents.sort_unstable();
             agents.dedup();
             WorkspaceSummary {
                 workspace: path.map(PathBuf::as_path),
+                origin_id,
+                host,
                 count: rows.len(),
                 live: rows.iter().filter(|r| r.liveness.is_running()).count(),
                 agents,
@@ -88,11 +97,16 @@ pub(super) fn workspaces(home: &Path, args: &WorkspacesArgs) -> Result<()> {
                 live,
                 agents,
                 cost,
+                host,
+                ..
             } = summary;
-            let label = path.map_or_else(
+            let mut label = path.map_or_else(
                 || "(unattributed)".to_string(),
                 |p| workspace::display(p, home),
             );
+            if let Some(host) = host {
+                label = format!("{host}: {label}");
+            }
             emit(&format!(
                 "{} {:>4}  {:<50}  {:<28}{}",
                 if live > 0 { "●" } else { " " },
@@ -114,6 +128,8 @@ pub(super) fn workspaces(home: &Path, args: &WorkspacesArgs) -> Result<()> {
 #[derive(serde::Serialize)]
 struct WorkspaceSummary<'a> {
     workspace: Option<&'a Path>,
+    origin_id: Option<&'a str>,
+    host: Option<&'a str>,
     count: usize,
     live: usize,
     agents: Vec<String>,
@@ -162,7 +178,7 @@ fn filter(home: &Path, scan: &Scan, args: &FilterArgs, limit: usize) -> Vec<Sess
             args.hosts.is_empty()
                 || args
                     .hosts
-                    .contains(&s.host.clone().unwrap_or_else(|| "local".into()))
+                    .contains(&s.origin_label.clone().unwrap_or_else(|| "local".into()))
         })
         .filter(|s| match (&prefix, &s.workspace) {
             (None, _) => true,

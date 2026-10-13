@@ -1,6 +1,7 @@
 //! Command dispatch: shared scan plumbing here, one file per command group.
 
 mod args;
+mod federation;
 mod hosts;
 mod index;
 mod list;
@@ -23,9 +24,38 @@ use self::args::{Cli, Command, HostsCommand};
 pub fn run() -> Result<()> {
     let home = home()?;
     let cli = Cli::parse();
+    if !cli.read_only
+        && !matches!(
+            &cli.command,
+            Some(
+                Command::Federation { .. }
+                    | Command::Origin { .. }
+                    | Command::Completions(_)
+                    | Command::Man
+            )
+        )
+        && let Err(error) = llm_sessions::federation::ensure_origin(&home)
+    {
+        eprintln!("llm-sessions: origin identity unavailable: {error}");
+    }
     match cli.command {
         None => tui::run(&home, cli.read_only),
         Some(Command::List(args)) => list::run(&home, &args),
+        Some(Command::Federation { command }) => federation::run(&home, &command),
+        Some(Command::Origin { init }) => {
+            if init && cli.read_only {
+                return Err(Error::ReadOnly {
+                    what: "initializing origin identity",
+                });
+            }
+            let origin = if init {
+                llm_sessions::federation::ensure_origin(&home)?
+            } else {
+                llm_sessions::federation::read_origin(&home)?
+            };
+            emit(&origin);
+            Ok(())
+        }
         Some(Command::Workspaces(args)) => list::workspaces(&home, &args),
         Some(Command::Show(args)) => session::show(&home, &args),
         Some(Command::Sources) => {

@@ -7,8 +7,10 @@
 //! once and exits, while a long-running server keeps it and rescans on a
 //! timer without rebuilding anything.
 
+use crate::federation::DiscoveryContext;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use crate::catalog::query::Query;
 use crate::catalog::scan::{Scan, scan_with};
@@ -83,7 +85,21 @@ impl Loader {
             Remote::Inline => &self.hosts,
             Remote::Skip => &[],
         };
-        let mut scan = scan_with(&self.sources, self.overlay.as_ref(), fleet, hosts);
+        let mut scan = scan_with(&self.sources, self.overlay.as_ref(), fleet, &[]);
+        match crate::federation::read_origin(&self.home) {
+            Ok(origin) => extend_from_origin(
+                &mut scan,
+                &self.sources,
+                hosts,
+                origin,
+                Vec::new(),
+                crate::federation::DEFAULT_HOPS,
+            ),
+            Err(error) => scan.failures.push(format!(
+                "origin identity unavailable; federation disabled: {error}"
+            )),
+        }
+        scan.sessions = crate::catalog::merge::merge(scan.sessions);
         if let Some(failure) = &self.config_failure {
             scan.failures.push(failure.clone());
         }
@@ -95,14 +111,14 @@ impl Loader {
 
     /// Open a session this loader's scan listed.
     pub fn open(&self, session: &SessionSummary) -> Result<Transcript> {
-        open(&self.home, &self.sources, &self.hosts, session)
+        open(&self.home, &self.sources, session)
     }
 }
 
 /// OMP and Claude only record spend inside the transcript, so tier 1 cannot
 /// price them. `llm-sessions index` already parsed those bodies; borrow its answer
 /// rather than reparsing 280 MB to fill a column.
-fn borrow_cached_usage(home: &Path, scan: &mut Scan) {
+pub fn borrow_cached_usage(home: &Path, scan: &mut Scan) {
     let Ok(index) = Index::open(&Index::default_path(home)) else {
         return;
     };
@@ -110,35 +126,34 @@ fn borrow_cached_usage(home: &Path, scan: &mut Scan) {
     cached.fill(&mut scan.sessions);
 }
 
-/// Open a session wherever it lives: locally through its adapter, remotely
-/// through the host that listed it, with the scan's title and workspace.
+/// Open a session through its local adapter or preferred access route, with
+/// the scan's title and workspace.
 ///
 /// Only a [`SessionSummary`] a scan produced can be opened: its locator is
 /// the adapter's own, never built from a caller's input.
 pub fn open(
     home: &Path,
     sources: &[Box<dyn Source>],
-    hosts: &[remote::Host],
     session: &SessionSummary,
 ) -> Result<Transcript> {
-    let mut transcript = match &session.host {
-        None => {
-            let reader = source::find(sources, session.source).ok_or(Error::Unsupported {
-                agent: session.source,
-                what: "reading transcripts",
+    let mut transcript = if session.is_local() {
+        let reader = source::find(sources, session.source).ok_or(Error::Unsupported {
+            agent: session.source,
+            what: "reading transcripts",
+        })?;
+        reader.open(&session.locator)?
+    } else {
+        let hop = session
+            .preferred_route()
+            .and_then(|route| route.hops.first())
+            .ok_or_else(|| Error::Remote {
+                host: session
+                    .origin_label
+                    .clone()
+                    .unwrap_or_else(|| "remote".into()),
+                message: "session has no access route".into(),
             })?;
-            reader.open(&session.locator)?
-        }
-        Some(name) => {
-            let host = hosts
-                .iter()
-                .find(|host| host.name() == name)
-                .ok_or_else(|| Error::Remote {
-                    host: name.clone(),
-                    message: "no host with this name in hosts.json".into(),
-                })?;
-            host.open(session, home)?
-        }
+        remote::Host::from_route_hop(hop).open(session, home)?
     };
     // Tier 1 already resolved title and workspace authoritatively (Codex
     // titles live in `state_5.sqlite`, not in the rollout; the scan also
@@ -202,6 +217,75 @@ pub fn body_hits(home: &Path, query: &Query) -> Option<Result<HashSet<(SourceId,
             .and_then(|index| index.search(&expression, 5000))
             .map(|hits| hits.into_iter().map(|h| (h.source, h.session_id)).collect()),
     )
+}
+
+/// Merge independent branches. A failure on one route never suppresses another.
+fn extend_scan(
+    scan: &mut Scan,
+    sources: &[Box<dyn Source>],
+    hosts: &[remote::Host],
+    context: &DiscoveryContext,
+) {
+    if context.remaining_hops == 0 {
+        if !hosts.is_empty() {
+            scan.failures
+                .push("federation discovery truncated at hop limit".into());
+        }
+        return;
+    }
+    let results = thread::scope(|scope| {
+        let handles: Vec<_> = hosts
+            .iter()
+            .map(|host| {
+                (
+                    host.name(),
+                    scope.spawn(move || host.list_with(sources, context)),
+                )
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|(name, handle)| {
+                handle
+                    .join()
+                    .map_err(|_| format!("{name}: remote listing panicked"))
+            })
+            .collect::<Vec<_>>()
+    });
+    for result in results {
+        match result {
+            Ok(Ok(mut remote)) => {
+                scan.sessions.append(&mut remote.sessions);
+                scan.failures.append(&mut remote.failures);
+            }
+            Ok(Err(error)) => scan.failures.push(error.to_string()),
+            Err(error) => scan.failures.push(error),
+        }
+    }
+}
+
+/// The shared discovery step of every guarded entry point: stamp the local
+/// scan with this instance's origin, then extend it through the given peers
+/// under the request's own ancestors and remaining depth. Both callers merge
+/// the result themselves, so a federation request can borrow cached usage
+/// between the two steps.
+pub fn extend_from_origin(
+    scan: &mut Scan,
+    sources: &[Box<dyn Source>],
+    hosts: &[remote::Host],
+    origin: String,
+    ancestors: Vec<String>,
+    remaining_hops: u32,
+) {
+    for session in &mut scan.sessions {
+        session.origin_id = Some(origin.clone());
+    }
+    let mut context = DiscoveryContext {
+        visited: ancestors,
+        remaining_hops,
+    };
+    context.visited.push(origin);
+    extend_scan(scan, sources, hosts, &context);
 }
 
 #[cfg(test)]

@@ -78,6 +78,40 @@ pub enum Command {
     /// Print the roff man page.
     #[command(display_order = 14)]
     Man,
+    /// Print this instance's stable federation identity.
+    Origin {
+        /// Create the marker if it does not exist.
+        #[arg(long)]
+        init: bool,
+    },
+    /// Internal, guarded federation transport.
+    #[command(hide = true)]
+    Federation {
+        #[command(subcommand)]
+        command: FederationCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum FederationCommand {
+    Capabilities,
+    List {
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        hops: u32,
+    },
+    Show {
+        #[arg(long)]
+        origin: String,
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        route: String,
+    },
+    Top,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -160,8 +194,8 @@ pub struct FilterArgs {
     /// Only sessions from this agent. Repeatable.
     #[arg(long = "source", value_name = "AGENT")]
     pub sources: Vec<String>,
-    /// Only sessions on this host, by its name in hosts.json. Repeatable.
-    /// `local` selects this machine.
+    /// Only sessions with this origin display label. Repeatable.
+    /// Direct origins use their hosts.json name; `local` selects this machine.
     #[arg(long = "host", value_name = "NAME")]
     pub hosts: Vec<String>,
 
@@ -187,6 +221,13 @@ pub struct FilterArgs {
 pub struct ShowArgs {
     /// Session id, or a unique prefix of one.
     pub id: String,
+    /// Restrict resolution to this stable origin ID.
+    #[arg(long)]
+    pub origin: Option<String>,
+
+    /// Restrict resolution to this agent.
+    #[arg(long)]
+    pub source: Option<String>,
 
     /// Emit the transcript as JSON.
     #[arg(long, conflicts_with = "format")]

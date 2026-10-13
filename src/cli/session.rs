@@ -13,14 +13,43 @@ use super::args::{ArchiveArgs, ShowArgs, ShowFormat};
 use super::{Liveliness, Loaded, emit, scan_all};
 
 /// Resolve `id` and open its transcript, with tier-1 title and workspace.
-fn load(home: &Path, id: &str) -> Result<(Transcript, SessionSummary)> {
+fn load(home: &Path, args: &ShowArgs) -> Result<(Transcript, SessionSummary)> {
     let Loaded { loader, scan, .. } = scan_all(home, Liveliness::Skip);
-    let session = resolve_one(&scan.sessions, id)?;
+    let rows: Vec<_> = scan
+        .sessions
+        .into_iter()
+        .filter(|session| {
+            args.origin
+                .as_deref()
+                .is_none_or(|origin| session.origin_id.as_deref() == Some(origin))
+                && args
+                    .source
+                    .as_deref()
+                    .is_none_or(|source| session.source.name() == source)
+        })
+        .collect();
+    let session = resolve_one(&rows, &args.id)?;
     Ok((loader.open(session)?, session.clone()))
 }
 
 pub(super) fn show(home: &Path, args: &ShowArgs) -> Result<()> {
-    let (transcript, session) = load(home, &args.id)?;
+    if let Some(origin) = &args.origin
+        && !llm_sessions::federation::valid_origin(origin)
+    {
+        return Err(Error::BadArgument {
+            what: "--origin",
+            got: origin.clone(),
+        });
+    }
+    if let Some(source) = &args.source
+        && llm_sessions::SourceId::parse(source).is_none()
+    {
+        return Err(Error::BadArgument {
+            what: "--source",
+            got: source.clone(),
+        });
+    }
+    let (transcript, session) = load(home, args)?;
 
     if let Some(format) = args.format
         && !matches!(format, ShowFormat::Text)
@@ -74,9 +103,12 @@ pub(super) fn archive(home: &Path, args: &ArchiveArgs) -> Result<()> {
         // The overlay is local state and the remote store is someone
         // else's; writing a local row for a remote id would lie about
         // where the archive state lives.
-        if let Some(host) = &session.host {
+        if !session.is_local() {
             return Err(Error::Remote {
-                host: host.clone(),
+                host: session
+                    .origin_label
+                    .clone()
+                    .unwrap_or_else(|| "remote".into()),
                 message: "archiving a remote session is not supported".into(),
             });
         }
@@ -116,7 +148,13 @@ fn resolve_one<'a>(sessions: &'a [SessionSummary], needle: &str) -> Result<&'a S
                 candidates.len()
             );
             for c in candidates.iter().take(10) {
-                eprintln!("  {} {}", c.source, c.id);
+                eprintln!(
+                    "  {} {} origin={} host={}",
+                    c.source,
+                    c.id,
+                    c.origin_id.as_deref().unwrap_or("<unknown>"),
+                    c.origin_label.as_deref().unwrap_or("local")
+                );
             }
             Err(Error::MissingRow {
                 db: PathBuf::from("<ambiguous>"),
@@ -125,3 +163,4 @@ fn resolve_one<'a>(sessions: &'a [SessionSummary], needle: &str) -> Result<&'a S
         }
     }
 }
+

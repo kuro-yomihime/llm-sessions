@@ -28,7 +28,7 @@ pub(super) fn run(home: &Path, args: &TopArgs) -> Result<()> {
             let session = scan
                 .sessions
                 .iter()
-                .find(|s| s.liveness.pid() == Some(process.pid));
+                .find(|s| s.is_local() && s.liveness.pid() == Some(process.pid));
             (process, session)
         })
         .collect();
@@ -55,10 +55,12 @@ pub(super) fn run(home: &Path, args: &TopArgs) -> Result<()> {
             .collect();
         let mut remote_rows: Vec<_> = Vec::new();
         for host in hosts {
+            let origin = host.origin_id().ok();
             match host.top() {
                 Ok(processes) => remote_rows.extend(processes.iter().map(|process| {
                     serde_json::json!({
                         "host": host.name(),
+                        "origin_id": origin,
                         "pid": process.pid,
                         "agent": process.agent.name(),
                         "pane": process.pane,

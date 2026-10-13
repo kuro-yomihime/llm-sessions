@@ -53,7 +53,7 @@ pub(super) fn build(home: &Path, args: &IndexArgs) -> Result<()> {
     let local: Vec<SessionSummary> = scan
         .sessions
         .iter()
-        .filter(|session| session.host.is_none())
+        .filter(|session| session.is_local())
         .cloned()
         .collect();
     let mut index = Index::open(&path)?;

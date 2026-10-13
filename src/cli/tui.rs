@@ -18,7 +18,7 @@ pub(super) fn run(home: &Path, read_only: bool) -> Result<()> {
         scan,
     } = scan_all_with(home, Liveliness::Needed, Cached::Borrow, Remote::Skip);
     let index = Index::open(&Index::default_path(home)).ok();
-    let mut app = App::new(
+    let mut app = App::new_with_mode(
         home,
         loader.sources,
         scan.sessions,
@@ -26,8 +26,8 @@ pub(super) fn run(home: &Path, read_only: bool) -> Result<()> {
         loader.overlay,
         index,
         fleet,
+        read_only,
     );
-    app.set_read_only(read_only);
     if let Some(command) = tui::run(&mut app)? {
         emit(&resume::shell_line(&command));
     }
