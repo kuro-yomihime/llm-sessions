@@ -2,7 +2,7 @@
 //! (`hosts`).
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use llm_sessions::catalog::workspace;
@@ -10,7 +10,6 @@ use llm_sessions::error::Error;
 use llm_sessions::source::{self, remote};
 use llm_sessions::{Result, SourceId};
 
-use super::args::HostMode;
 use super::emit;
 
 pub(super) fn sources(home: &Path) {
@@ -70,7 +69,7 @@ pub(super) fn list(home: &Path) {
     if config.hosts.is_empty() {
         let path = remote::Config::default_path(home);
         emit(&format!(
-            "no remote hosts; add one with `llm-sessions hosts add <name> <ssh>` ({})",
+            "no remote hosts; add one with `llm-sessions hosts add <name> <ssh>` or `hosts add <name> --url <URL>` ({})",
             workspace::display(&path, home)
         ));
         if let Some(failure) = failure {
@@ -99,17 +98,10 @@ pub(super) fn list(home: &Path) {
     }
 }
 
-pub(super) fn add(
-    home: &Path,
-    name: String,
-    ssh: String,
-    remote_home: Option<PathBuf>,
-    sources: Vec<String>,
-    mode: Option<HostMode>,
-) -> Result<()> {
+pub(super) fn add(home: &Path, entry: remote::HostConfig) -> Result<()> {
     // Unknown agent names cannot match a store, so they are rejected here
     // rather than silently listing nothing.
-    for agent in &sources {
+    for agent in &entry.sources {
         if SourceId::parse(agent).is_none() {
             return Err(Error::BadArgument {
                 what: "--source",
@@ -117,21 +109,23 @@ pub(super) fn add(
             });
         }
     }
+    if entry.name.trim().is_empty() {
+        return Err(Error::BadArgument {
+            what: "name",
+            got: entry.name.clone(),
+        });
+    }
+    // The same rules `Config::load` applies, so a saved entry always loads.
+    if let Some(problem) = entry.problem() {
+        return Err(Error::BadArgument {
+            what: "hosts add",
+            got: problem,
+        });
+    }
     let (mut config, failure) = remote::Config::load(home);
     if let Some(failure) = failure {
         eprintln!("llm-sessions: {failure} (rewriting the file)");
     }
-    let entry = remote::HostConfig {
-        name,
-        ssh,
-        home: remote_home,
-        sources,
-        mode: match mode {
-            None | Some(HostMode::Auto) => remote::Mode::Auto,
-            Some(HostMode::LlmSessions) => remote::Mode::LlmSessions,
-            Some(HostMode::Shell) => remote::Mode::Shell,
-        },
-    };
     let updated = config.hosts.iter().any(|kept| kept.name == entry.name);
     config.hosts.retain(|kept| kept.name != entry.name);
     let name = entry.name.clone();

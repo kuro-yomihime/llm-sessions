@@ -75,10 +75,31 @@ pub fn run() -> Result<()> {
             Some(HostsCommand::Add {
                 name,
                 ssh,
+                url,
+                token_env,
                 home: remote_home,
                 sources: wanted,
                 mode,
-            }) => hosts::add(&home, name, ssh, remote_home, wanted, mode),
+            }) => hosts::add(
+                &home,
+                llm_sessions::source::remote::HostConfig {
+                    name,
+                    ssh: ssh.unwrap_or_default(),
+                    url,
+                    token_env,
+                    home: remote_home,
+                    sources: wanted,
+                    mode: match mode {
+                        None | Some(args::HostMode::Auto) => {
+                            llm_sessions::source::remote::Mode::Auto
+                        }
+                        Some(args::HostMode::LlmSessions) => {
+                            llm_sessions::source::remote::Mode::LlmSessions
+                        }
+                        Some(args::HostMode::Shell) => llm_sessions::source::remote::Mode::Shell,
+                    },
+                },
+            ),
             Some(HostsCommand::Remove { name }) => hosts::remove(&home, &name),
         },
         Some(Command::Index(args)) if cli.read_only && !args.stats => {
