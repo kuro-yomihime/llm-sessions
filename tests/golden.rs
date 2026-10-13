@@ -573,7 +573,7 @@ fn remote_listing_sql_round_trips_every_sql_source() {
             source.id()
         );
         for session in sessions {
-            assert_eq!(session.host.as_deref(), Some("nx-1"));
+            assert_eq!(session.origin_label.as_deref(), Some("nx-1"));
             assert_eq!(session.source, source.id());
             assert_eq!(
                 session.locator,
