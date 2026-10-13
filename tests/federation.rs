@@ -384,10 +384,10 @@ fn older_peer_is_a_shell_leaf_and_failed_route_does_not_suppress_working_route()
     graph.session("old", "old-session");
     graph.session("B", "b-session");
     let bin = graph.root.path().join("old-bin");
-    fs::create_dir_all(&bin).expect("old bin");
+    fs::create_dir_all(&bin).expect("old binary directory");
     fs::write(
         bin.join("llm-sessions"),
-        "#!/bin/sh\ncase \"$1\" in list|show|top) printf 'legacy-unguarded-query\\n' >> \"$FIXTURE_ROOT/queries\";; esac\nprintf 'old binary lacks guarded federation\\n' >&2\nexit 2\n",
+        "#!/bin/sh\nif [ \"$1 $2\" = 'federation capabilities' ]; then\n  origin=$(cat \"$HOME/.local/state/llm-sessions/origin-id\")\n  printf '{\"version\":1,\"origin_id\":\"%s\"}\\n' \"$origin\"\n  exit 0\nfi\ncase \"$1\" in list|show|top) printf 'legacy-unguarded-query\\n' >> \"$FIXTURE_ROOT/queries\";; esac\nprintf 'legacy binary speaks federation version 1 only\\n' >&2\nexit 2\n",
     ).expect("old binary");
     fs::set_permissions(bin.join("llm-sessions"), fs::Permissions::from_mode(0o755))
         .expect("old executable");
@@ -397,10 +397,19 @@ fn older_peer_is_a_shell_leaf_and_failed_route_does_not_suppress_working_route()
     assert!(rows.iter().any(|r| r.id == "b-session"));
     assert!(failures.contains("unreachable"), "{failures}");
     assert!(failures.contains("shell"), "{failures}");
+    assert!(
+        failures.contains("version 1") && failures.contains("downgraded to a shell leaf"),
+        "the legacy handshake is answered, then safely downgraded: {failures}"
+    );
     let log = fs::read_to_string(graph.root.path().join("queries")).expect("query log");
     assert!(
         !log.lines().any(|line| line.starts_with("old ->")),
         "old peer must remain a leaf"
+    );
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with("L -> old") && line.contains("capabilities")),
+        "the legacy handshake is answered before the downgrade: {log}"
     );
     assert!(
         !log.contains("legacy-unguarded-query"),

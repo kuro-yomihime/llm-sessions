@@ -40,7 +40,7 @@ pub enum Remote {
     Inline,
     /// Local rows only. The TUI's `remote::Cache` refreshes hosts
     /// off-thread so no frame ever blocks on a socket; `serve` publishes
-    /// this machine's sessions and nothing it reaches over SSH.
+    /// this machine's sessions and nothing it reaches over the network.
     Skip,
 }
 
@@ -153,7 +153,7 @@ pub fn open(
                     .unwrap_or_else(|| "remote".into()),
                 message: "session has no access route".into(),
             })?;
-        remote::Host::from_route_hop(hop).open(session, home)?
+        remote::Host::from_route_hop(hop, home).open(session, home)?
     };
     // Tier 1 already resolved title and workspace authoritatively (Codex
     // titles live in `state_5.sqlite`, not in the rollout; the scan also

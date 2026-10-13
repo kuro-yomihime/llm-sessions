@@ -46,7 +46,11 @@ pub(super) struct Probe {
     pub(super) llm_sessions: Option<String>,
     pub(super) sqlite3: bool,
     pub(super) origin_id: String,
-    pub(super) federation: bool,
+    /// The federation protocol version the peer's binary speaks: `0` when
+    /// it answers no capabilities handshake, `1` for the legacy SSH-only
+    /// contract, and [`crate::federation::PROTOCOL_VERSION`] when it can
+    /// take this observer's mixed ssh/http routes.
+    pub(super) federation: u32,
 }
 
 #[derive(serde::Deserialize)]
@@ -158,18 +162,18 @@ impl Host {
                     match self.ssh_binary(&home, &[binary, "federation", "capabilities"]) {
                         Ok(raw) => {
                             if let Ok(capability) = serde_json::from_str::<Capability>(&raw) {
-                                if capability.version == 1 && capability.origin_id != origin_id {
+                                if capability.origin_id != origin_id {
                                     return Err("federation capability origin does not match origin marker".to_string());
                                 }
-                                capability.version == 1
+                                capability.version
                             } else {
-                                false
+                                0
                             }
                         }
-                        Err(_) => false,
+                        Err(_) => 0,
                     }
                 } else {
-                    false
+                    0
                 };
                 Ok(Probe {
                     home,
@@ -369,6 +373,8 @@ mod tests {
         let host = Host::new(crate::source::remote::HostConfig {
             name: "namespace".into(),
             ssh: "namespace".into(),
+            url: None,
+            token_env: None,
             home: Some(configured.clone()),
             sources: Vec::new(),
             mode: crate::source::remote::Mode::Auto,

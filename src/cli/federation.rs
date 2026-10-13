@@ -19,7 +19,7 @@ pub(super) fn run(home: &Path, command: &FederationCommand) -> Result<()> {
     match command {
         FederationCommand::Capabilities => {
             emit(&serde_json::to_string(&serde_json::json!({
-                "version": 1,
+                "version": llm_sessions::federation::PROTOCOL_VERSION,
                 "origin_id": read_origin(home)?,
             }))?);
         }
@@ -68,6 +68,12 @@ pub(super) fn run(home: &Path, command: &FederationCommand) -> Result<()> {
                 got: source.clone(),
             })?;
             let mut hops: Vec<RouteHop> = serde_json::from_str(route)?;
+            // A route may name this machine's own token bindings; a peer
+            // forwarding one may not. Credential references never cross the
+            // wire: local configuration re-binds them at open time.
+            for hop in &mut hops {
+                hop.token_env = None;
+            }
             let own = read_origin(home)?;
             let origin = origin.to_ascii_lowercase();
             for hop in &mut hops {
@@ -75,7 +81,7 @@ pub(super) fn run(home: &Path, command: &FederationCommand) -> Result<()> {
             }
             validate_route(&own, &origin, &hops)?;
             let transcript = if let Some(first) = hops.first() {
-                let host = remote::Host::from_route_hop(first);
+                let host = remote::Host::from_route_hop(first, home);
                 let mut session = SessionSummary::new(
                     id.clone(),
                     source,
@@ -153,10 +159,7 @@ fn validate_route(own: &str, target: &str, hops: &[RouteHop]) -> Result<()> {
     let valid = valid_origin(target)
         && hops.len() <= llm_sessions::federation::DEFAULT_HOPS as usize
         && hops.iter().all(|hop| {
-            valid_origin(&hop.origin_id)
-                && !hop.ssh.is_empty()
-                && !hop.ssh.starts_with('-')
-                && seen.insert(hop.origin_id.as_str())
+            valid_origin(&hop.origin_id) && hop.reachable() && seen.insert(hop.origin_id.as_str())
         })
         && hops
             .last()

@@ -34,11 +34,15 @@ name = "llm-sessions"
 path = "src/main.rs"
 
 [features]
-default = ["serve"]
+default = ["serve", "http"]
 # `llm-sessions serve`: the read-only HTTP/WebSocket API. Pulls in tokio and
 # axum; `--no-default-features` builds the TUI and CLI without them, and CI
 # keeps that lean build green.
 serve = ["dep:axum", "dep:tokio", "clap/env"]
+# The HTTP federation client: `url` peers in hosts.json and `serve
+# --federate` gateway reads. Independent of `serve`, so the CLI can reach
+# HTTP peers in builds without the server.
+http = ["dep:reqwest"]
 
 [dependencies]
 axum = { version = "0.8", optional = true, default-features = false, features = [
@@ -53,6 +57,12 @@ clap_complete = "4.6"
 clap_mangen = "0.2"
 crossterm = "0.29"
 ratatui = { version = "0.30", features = ["crossterm"] }
+reqwest = { version = "0.12", optional = true, default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+    "rustls-tls-native-roots",
+] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1908,12 +1908,16 @@ fn indirect_resume_uses_route_hops_even_without_a_matching_host_label() {
                 origin_id: ORIGIN_A.into(),
                 name: "gateway".into(),
                 ssh: "user@gateway".into(),
+                url: None,
+                token_env: None,
                 home: None,
             },
             RouteHop {
                 origin_id: ORIGIN_B.into(),
                 name: "destination".into(),
                 ssh: "user@destination".into(),
+                url: None,
+                token_env: None,
                 home: None,
             },
         ],
@@ -1924,6 +1928,60 @@ fn indirect_resume_uses_route_hops_even_without_a_matching_host_label() {
     assert!(argv[4].contains("user@destination"));
     assert!(argv[4].contains("--resume"));
     assert!(!argv.iter().any(|arg| arg == "same display label"));
+    assert!(app.should_quit());
+}
+
+#[test]
+fn resume_picks_the_ssh_alternate_when_the_preferred_read_route_is_http() {
+    use crate::model::{AccessRoute, RouteHop};
+    let home = Path::new("/home/u");
+    let mut app = App::new(
+        home,
+        vec![Box::new(crate::source::omp::Omp::new(home))],
+        vec![federated(ORIGIN_B, "it's")],
+        Vec::new(),
+        None,
+        None,
+        Fleet::default(),
+    );
+    // The same origin over both transports: the shorter, lexically-first
+    // route is the http one a read prefers, but the TUI's resume goes
+    // through the same shared helper as the CLI and must travel ssh.
+    app.sessions[0].routes = vec![
+        AccessRoute {
+            hops: vec![RouteHop {
+                origin_id: ORIGIN_B.into(),
+                name: "api".into(),
+                ssh: String::new(),
+                url: Some("http://127.0.0.1:8001".into()),
+                token_env: None,
+                home: None,
+            }],
+        },
+        AccessRoute {
+            hops: vec![RouteHop {
+                origin_id: ORIGIN_B.into(),
+                name: "worker".into(),
+                ssh: "user@worker".into(),
+                url: None,
+                token_env: None,
+                home: None,
+            }],
+        },
+    ];
+    assert!(
+        app.sessions[0]
+            .preferred_route()
+            .unwrap()
+            .hops
+            .iter()
+            .any(|hop| hop.url.is_some()),
+        "the fixture must prefer the http route for reads"
+    );
+    app.handle(Action::Resume);
+    let argv = app.resume_command().unwrap();
+    assert_eq!(&argv[..4], &["ssh", "-t", "--", "user@worker"]);
+    assert!(argv[4].contains("--resume"));
     assert!(app.should_quit());
 }
 

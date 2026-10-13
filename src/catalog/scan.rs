@@ -38,9 +38,10 @@ pub struct Scan {
 /// `fleet` attributes running processes to sessions. Without it every session
 /// falls back to mtime-based liveness, which is still correct, just coarser.
 ///
-/// `hosts` are machines reached over SSH. Their rows retain origin identity
-/// and explicit access routes. The TUI passes none: it reads a background
-/// cache instead of paying an `ssh` per two-second tick.
+/// `hosts` are machines reached over SSH or HTTP. Their rows retain origin
+/// identity and explicit access routes. The TUI passes none: it reads a
+/// background cache instead of paying a transport round trip per two-second
+/// tick.
 pub fn scan_with(
     sources: &[Box<dyn Source>],
     overlay: Option<&Overlay>,
@@ -412,6 +413,8 @@ mod tests {
                 origin_id: "origin-c".into(),
                 name: "gamma".into(),
                 ssh: "gamma".into(),
+                url: None,
+                token_env: None,
                 home: None,
             }],
         });

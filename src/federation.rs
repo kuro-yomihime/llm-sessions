@@ -10,6 +10,15 @@ use crate::model::SessionSummary;
 
 pub const DEFAULT_HOPS: u32 = 8;
 
+/// The federation protocol version this binary speaks on every transport.
+/// Version 2 is the mixed-route contract: an access route may interleave
+/// SSH and HTTP hops, and a peer names this version in its capabilities
+/// before this observer sends it any guarded request. A peer answering
+/// version 1 speaks the older SSH-only contract — it must never receive
+/// mixed routes or chained discovery, so this observer treats it as a
+/// shell leaf rather than negotiating a downgrade.
+pub const PROTOCOL_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiscoveryContext {

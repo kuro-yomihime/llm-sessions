@@ -209,10 +209,59 @@ pub type SessionKey = (Option<String>, SourceId, String);
 pub struct RouteHop {
     pub origin_id: String,
     pub name: String,
+    /// SSH destination. Empty for HTTP peers, which carry `url` instead.
+    #[serde(default)]
     pub ssh: String,
+    /// Base URL of an HTTP federation peer; `None` on SSH hops.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Environment variable that locally holds this peer's bearer token.
+    /// A name, never the secret. Local metadata only: never serialized, so
+    /// a received route cannot point this observer at one of its own
+    /// environment secrets — credential bindings are resolved against local
+    /// hosts.json (see [`crate::source::remote`]).
+    #[serde(default, skip_serializing)]
+    pub token_env: Option<String>,
     /// Configured remote account home; preserved when constructing delegated hosts.
     #[serde(default)]
     pub home: Option<PathBuf>,
+}
+
+impl RouteHop {
+    /// Whether the hop names a way to reach its origin: exactly one
+    /// transport, an `ssh` destination that cannot be mistaken for an
+    /// option, or a syntactically valid peer URL.
+    pub fn reachable(&self) -> bool {
+        if self.ssh.is_empty() {
+            self.url.as_deref().is_some_and(valid_peer_url)
+        } else {
+            self.url.is_none() && !self.ssh.starts_with('-')
+        }
+    }
+}
+
+/// A peer base URL as hosts.json may spell it: `http` or `https` (the
+/// client verifies TLS itself), a non-empty host, no embedded credentials,
+/// and no whitespace or control characters for a shell or log to mangle.
+/// A path prefix is allowed (a reverse proxy may mount the API under one),
+/// but a query or fragment is not: the client appends its routes after the
+/// base, and `?` or `#` would swallow them.
+pub fn valid_peer_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    if url.contains(['?', '#']) {
+        return false;
+    }
+    let host = rest.split('/').next().unwrap_or_default();
+    !host.is_empty()
+        && !host.contains('@')
+        && !url
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_ascii_control())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -221,6 +270,19 @@ pub struct AccessRoute {
     /// merged local observation also retains remote alternatives. Forwarding
     /// prepends the queried peer to every path, including this sentinel.
     pub hops: Vec<RouteHop>,
+}
+
+impl AccessRoute {
+    /// Drop credential references from a route received over the wire.
+    /// Serialization already omits `token_env`, but a peer (or anything
+    /// else crafting route JSON) may still include one; only local
+    /// configuration may bind a token to an endpoint, so it is discarded
+    /// here and re-resolved from trusted hosts.json at open time.
+    pub fn strip_credentials(&mut self) {
+        for hop in &mut self.hops {
+            hop.token_env = None;
+        }
+    }
 }
 
 /// Tier-1 row. Producing one MUST NOT require parsing message bodies.
@@ -715,12 +777,16 @@ mod tests {
             origin_id: "A".into(),
             name: "alpha".into(),
             ssh: "a".into(),
+            url: None,
+            token_env: None,
             home: None,
         };
         let beta = RouteHop {
             origin_id: "B".into(),
             name: "beta".into(),
             ssh: "b".into(),
+            url: None,
+            token_env: None,
             home: None,
         };
         let direct = AccessRoute {
@@ -759,6 +825,92 @@ mod tests {
         assert!(
             !summary.is_local(),
             "an empty route cannot override remote origin attribution"
+        );
+    }
+
+    fn ssh_hop(origin: &str, name: &str) -> RouteHop {
+        RouteHop {
+            origin_id: origin.into(),
+            name: name.into(),
+            ssh: name.into(),
+            url: None,
+            token_env: None,
+            home: None,
+        }
+    }
+
+    #[test]
+    fn a_hop_names_exactly_one_transport() {
+        let mut both = ssh_hop("origin", "peer");
+        both.url = Some("http://127.0.0.1:8787".into());
+        assert!(!both.reachable(), "ssh and url together are ambiguous");
+
+        let mut neither = ssh_hop("origin", "peer");
+        neither.ssh.clear();
+        assert!(!neither.reachable(), "a hop must say how it is reached");
+
+        let mut option = ssh_hop("origin", "peer");
+        option.ssh = "-oProxyCommand=wrong".into();
+        assert!(!option.reachable());
+
+        let mut http = ssh_hop("origin", "peer");
+        http.ssh.clear();
+        http.url = Some("http://127.0.0.1:8787".into());
+        assert!(http.reachable());
+        http.url = Some("http://127.0.0.1:8787/base/".into());
+        assert!(http.reachable(), "a proxy path prefix is legal");
+
+        for bad in [
+            "ftp://example.net",
+            "http://",
+            "https://",
+            "example.net",
+            "",
+            // A base URL is an origin plus an optional path prefix; a
+            // query or fragment would swallow every appended route.
+            "http://127.0.0.1:8787?forward=peer",
+            "http://127.0.0.1:8787/transcripts#fleet",
+            "https://example.net?",
+        ] {
+            let mut bad_hop = ssh_hop("origin", "peer");
+            bad_hop.ssh.clear();
+            bad_hop.url = Some(bad.into());
+            assert!(!bad_hop.reachable(), "{bad:?}");
+        }
+
+        let mut injected = ssh_hop("origin", "peer");
+        injected.ssh.clear();
+        injected.url = Some("http://user:secret@127.0.0.1:8787".into());
+        assert!(
+            !injected.reachable(),
+            "credentials inside a URL are refused"
+        );
+    }
+
+    #[test]
+    fn serialized_routes_never_carry_a_credential_reference() {
+        let mut hop = ssh_hop("origin", "peer");
+        hop.ssh.clear();
+        hop.url = Some("http://127.0.0.1:8787".into());
+        hop.token_env = Some("LLMS_PEER_TOKEN".into());
+        let wire = serde_json::to_string(&AccessRoute { hops: vec![hop] }).unwrap();
+        assert!(!wire.contains("token_env"), "{wire}");
+        assert!(!wire.contains("LLMS_PEER_TOKEN"), "{wire}");
+
+        // A peer (or anything else) may still hand us a crafted route.
+        let received: AccessRoute = serde_json::from_str(
+            r#"{"hops":[{"origin_id":"origin","name":"peer","ssh":"",
+                     "url":"http://127.0.0.1:8787","token_env":"HOME"}]}"#,
+        )
+        .unwrap();
+        let mut received = received;
+        assert_eq!(received.hops[0].token_env.as_deref(), Some("HOME"));
+        received.strip_credentials();
+        assert_eq!(received.hops[0].token_env, None);
+        assert_eq!(
+            received.hops[0].url.as_deref(),
+            Some("http://127.0.0.1:8787"),
+            "the endpoint itself stays"
         );
     }
 }

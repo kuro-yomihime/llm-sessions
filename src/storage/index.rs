@@ -1318,6 +1318,8 @@ mod tests {
                 origin_id: "remote-origin".into(),
                 name: "beta".into(),
                 ssh: "beta".into(),
+                url: None,
+                token_env: None,
                 home: None,
             }],
         });
@@ -1377,6 +1379,8 @@ mod tests {
                 origin_id: "remote-origin".into(),
                 name: "beta".into(),
                 ssh: "beta".into(),
+                url: None,
+                token_env: None,
                 home: None,
             }],
         });

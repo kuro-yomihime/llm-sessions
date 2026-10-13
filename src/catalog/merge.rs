@@ -132,6 +132,8 @@ mod tests {
             origin_id: origin.into(),
             name: name.into(),
             ssh: name.into(),
+            url: None,
+            token_env: None,
             home: None,
         }
     }

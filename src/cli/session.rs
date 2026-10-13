@@ -163,4 +163,3 @@ fn resolve_one<'a>(sessions: &'a [SessionSummary], needle: &str) -> Result<&'a S
         }
     }
 }
-

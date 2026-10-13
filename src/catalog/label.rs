@@ -254,6 +254,8 @@ mod tests {
                 origin_id: "remote-origin".into(),
                 name: "remote".into(),
                 ssh: "remote".into(),
+                url: None,
+                token_env: None,
                 home: None,
             }],
         });
