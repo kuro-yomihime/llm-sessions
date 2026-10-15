@@ -382,6 +382,12 @@ pub struct ServeArgs {
     #[arg(long = "cors-origin", value_name = "ORIGIN",
           value_parser = llm_sessions::serve::parse_origin, conflicts_with = "no_auth")]
     pub cors_origins: Vec<String>,
+
+    /// Also serve the web dashboard at `/`. The page holds no data; open
+    /// it as /#token=TOKEN and it calls the API with that token.
+    #[cfg(feature = "dashboard")]
+    #[arg(long)]
+    pub dashboard: bool,
 }
 
 /// Nothing that prints args may print the token: one stray `{:?}` on the
@@ -402,6 +408,8 @@ impl std::fmt::Debug for ServeArgs {
             .field("query", &self.query)
             .field("federate", &self.federate)
             .field("cors_origins", &self.cors_origins);
+        #[cfg(feature = "dashboard")]
+        debug.field("dashboard", &self.dashboard);
         debug.finish()
     }
 }
@@ -516,6 +524,8 @@ mod tests {
             query: None,
             federate: false,
             cors_origins: Vec::new(),
+            #[cfg(feature = "dashboard")]
+            dashboard: false,
         };
         let printed = format!("{args:?}");
         assert!(!printed.contains("s3cret"), "{printed}");

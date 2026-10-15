@@ -98,6 +98,8 @@ pub fn run() -> Result<()> {
                 query: args.query,
                 federate: args.federate,
                 cors_origins: args.cors_origins,
+                #[cfg(feature = "dashboard")]
+                dashboard: args.dashboard,
             },
         ),
         Some(Command::Doctor(args)) => report::doctor(&home, &args),

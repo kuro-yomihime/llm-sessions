@@ -40,6 +40,8 @@
 
 mod auth;
 mod cors;
+#[cfg(feature = "dashboard")]
+mod dashboard;
 mod poll;
 mod router;
 mod stream;
@@ -88,6 +90,9 @@ pub struct Config {
     /// Browser origins, from [`parse_origin`], allowed to call the API
     /// cross-origin. Empty for none; refused together with `no_auth`.
     pub cors_origins: Vec<String>,
+    /// `--dashboard`: serve the web page at `/`.
+    #[cfg(feature = "dashboard")]
+    pub dashboard: bool,
 }
 
 /// Serve until SIGINT or SIGTERM.
@@ -175,6 +180,8 @@ async fn serve(home: &Path, config: Config, token: Option<String>) -> Result<()>
         base,
         sources: config.sources.clone(),
         cors_origins: config.cors_origins.clone(),
+        #[cfg(feature = "dashboard")]
+        dashboard: config.dashboard,
     });
     axum::serve(listener, router::router(app))
         .with_graceful_shutdown(async move {

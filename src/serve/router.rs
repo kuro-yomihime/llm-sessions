@@ -59,6 +59,9 @@ pub(super) struct App {
     pub sources: Vec<SourceId>,
     /// `--cors-origin`: exact origins whose pages may read responses.
     pub cors_origins: Vec<String>,
+    /// `--dashboard`: answer `/` with the web page.
+    #[cfg(feature = "dashboard")]
+    pub dashboard: bool,
 }
 
 pub(super) fn router(app: Arc<App>) -> Router {
@@ -76,10 +79,18 @@ pub(super) fn router(app: Arc<App>) -> Router {
                 app.clone(),
                 auth::bearer_or_query,
             ));
-    Router::new()
+    let routes = Router::new()
         .route("/v1/healthz", get(healthz))
         .merge(rest)
-        .merge(stream)
+        .merge(stream);
+    // The page is public, like healthz: it carries no data or secret.
+    #[cfg(feature = "dashboard")]
+    let routes = if app.dashboard {
+        routes.route("/", get(super::dashboard::page))
+    } else {
+        routes
+    };
+    routes
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "no such route") })
         .route_layer(middleware::from_fn_with_state(
             app.clone(),
@@ -666,6 +677,8 @@ mod tests {
             base: Arc::new(query::Query::parse("")),
             sources: Vec::new(),
             cors_origins: cors_origins.iter().map(|&o| o.to_owned()).collect(),
+            #[cfg(feature = "dashboard")]
+            dashboard: true,
         });
         Harness {
             app,
@@ -929,6 +942,8 @@ mod tests {
             base: Arc::new(query::Query::parse("")),
             sources: Vec::new(),
             cors_origins: Vec::new(),
+            #[cfg(feature = "dashboard")]
+            dashboard: false,
         });
         let (status, body) = get(&app, "/v1/sessions?q=body:needle").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
