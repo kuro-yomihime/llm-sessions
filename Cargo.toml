@@ -18,6 +18,7 @@ include = [
     "LICENSE",
     "README.md",
     "src/**/*.rs",
+    "assets/dashboard.html",
     "tests/**",
     "!tests/golden/home/.cache/**",
     "!tests/golden/home/.local/state/**",
@@ -34,7 +35,7 @@ name = "llm-sessions"
 path = "src/main.rs"
 
 [features]
-default = ["serve", "http"]
+default = ["serve", "http", "dashboard"]
 # `llm-sessions serve`: the read-only HTTP/WebSocket API. Pulls in tokio and
 # axum; `--no-default-features` builds the TUI and CLI without them, and CI
 # keeps that lean build green.
@@ -43,6 +44,10 @@ serve = ["dep:axum", "dep:tokio", "clap/env"]
 # --federate` gateway reads. Independent of `serve`, so the CLI can reach
 # HTTP peers in builds without the server.
 http = ["dep:reqwest"]
+# `serve --dashboard`: a single self-contained web page (assets/
+# dashboard.html, ~180 KB with its fonts) compiled into the binary. No
+# dependency of its own; leave it out to drop the page from the binary.
+dashboard = ["serve"]
 
 [dependencies]
 axum = { version = "0.8", optional = true, default-features = false, features = [
