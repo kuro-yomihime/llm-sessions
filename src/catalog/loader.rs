@@ -12,7 +12,6 @@
 //! branch, and merged — the one sequence behind `list`, the TUI's refresh
 //! and both federation endpoints.
 
-use crate::federation::{DiscoveryContext, Guard};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -20,6 +19,7 @@ use std::thread;
 use crate::catalog::query::Query;
 use crate::catalog::scan::{Scan, scan_with};
 use crate::error::{Error, Result};
+use crate::federation::{DiscoveryContext, Guard};
 use crate::model::{SessionSummary, SourceId, Transcript};
 use crate::runtime::live::Fleet;
 use crate::source::{self, Source, remote};

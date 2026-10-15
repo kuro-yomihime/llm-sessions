@@ -336,14 +336,15 @@ impl Host {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::federation::DiscoveryContext;
-    use crate::model::{AccessRoute, Locator, RouteHop, SourceId};
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::federation::DiscoveryContext;
+    use crate::model::{AccessRoute, Locator, RouteHop, SourceId};
 
     const A: &str = "00000000-0000-4000-8000-000000000002";
     const LOCAL: &str = "00000000-0000-4000-8000-000000000001";

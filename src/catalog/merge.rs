@@ -121,9 +121,10 @@ fn locator(a: &Locator, b: &Locator) -> Ordering {
 
 #[cfg(test)]
 mod tests {
+    use time::OffsetDateTime;
+
     use super::*;
     use crate::model::{AccessRoute, RouteHop, SourceId};
-    use time::OffsetDateTime;
 
     fn hop(origin: &str, name: &str) -> RouteHop {
         RouteHop {

@@ -900,8 +900,9 @@ fn mixed_transport_cycles_terminate_and_keep_alias_identity() {
 
 #[test]
 fn resume_keeps_the_ssh_alternate_after_http_dedup_prefers_the_http_route() {
-    use llm_sessions::model::SessionSummary;
     use std::os::unix::fs::PermissionsExt;
+
+    use llm_sessions::model::SessionSummary;
     // One origin, both transports: an HTTP server and a fixture ssh alias
     // resolving to the same home. After the merge deduplicates the two
     // observations, the read-preferred route is the http hop; a terminal

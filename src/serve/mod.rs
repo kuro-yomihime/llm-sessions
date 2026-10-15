@@ -54,15 +54,14 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+pub use self::auth::admit;
+pub use self::cors::parse_origin;
 use crate::catalog::loader::Loader;
 use crate::catalog::query::Query;
 use crate::error::{Error, Result};
 use crate::model::SourceId;
 use crate::runtime::live::Fleet;
 use crate::source;
-
-pub use self::auth::admit;
-pub use self::cors::parse_origin;
 
 /// Everything `llm-sessions serve` is told on its command line. No `Debug`:
 /// it holds the token.
