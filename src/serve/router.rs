@@ -21,6 +21,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::watch;
 
 use super::auth;
+use super::cors;
 use super::poll::{FactsCache, Key, Snapshot, lock, policy_filter, status_now};
 use super::stream;
 use crate::catalog::loader::{self, Resolved, body_hits, guarded_scan};
@@ -56,6 +57,8 @@ pub(super) struct App {
     pub base: Arc<query::Query>,
     /// The `--source` allow-list; empty for all.
     pub sources: Vec<SourceId>,
+    /// `--cors-origin`: exact origins whose pages may read responses.
+    pub cors_origins: Vec<String>,
 }
 
 pub(super) fn router(app: Arc<App>) -> Router {
@@ -82,6 +85,9 @@ pub(super) fn router(app: Arc<App>) -> Router {
             app.clone(),
             auth::valid_host,
         ))
+        // Outermost: a preflight never reaches auth, and every answer,
+        // errors and the fallback included, carries the allow headers.
+        .layer(middleware::from_fn_with_state(app.clone(), cors::cors))
         .with_state(app)
 }
 
@@ -633,15 +639,15 @@ mod tests {
     }
 
     fn harness() -> Harness {
-        harness_with(Some(TOKEN.into()))
+        harness_with(Some(TOKEN.into()), &[])
     }
 
     /// `--no-auth` mode: the branch where a wrong `Host` is the whole attack.
     fn no_auth_harness() -> Harness {
-        harness_with(None)
+        harness_with(None, &[])
     }
 
-    fn harness_with(token: Option<String>) -> Harness {
+    fn harness_with(token: Option<String>, cors_origins: &[&str]) -> Harness {
         let (tx, rx) = watch::channel(Arc::new(snapshot("[1]")));
         let (stop, stopped) = watch::channel(false);
         let opened = Arc::new(Mutex::new(Vec::new()));
@@ -659,6 +665,7 @@ mod tests {
             federate: false,
             base: Arc::new(query::Query::parse("")),
             sources: Vec::new(),
+            cors_origins: cors_origins.iter().map(|&o| o.to_owned()).collect(),
         });
         Harness {
             app,
@@ -798,6 +805,108 @@ mod tests {
         }
     }
 
+    fn cors_request(method: &Method, uri: &str, origin: &str, auth: Option<&str>) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .header(header::ORIGIN, origin);
+        if *method == Method::OPTIONS {
+            request = request
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization");
+        }
+        if let Some(auth) = auth {
+            request = request.header(header::AUTHORIZATION, auth);
+        }
+        request.body(Body::empty()).unwrap()
+    }
+
+    async fn send(app: &Arc<App>, request: Request<Body>) -> Response {
+        router(app.clone()).oneshot(request).await.unwrap()
+    }
+
+    fn allow_origin(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .map(|value| value.to_str().unwrap())
+    }
+
+    /// A browser's preflight carries no token, so a listed origin's is
+    /// answered before auth; the GET that follows still needs the token.
+    #[tokio::test]
+    async fn a_listed_origin_passes_preflight_but_still_needs_the_token() {
+        let Harness { app, .. } = harness_with(Some(TOKEN.into()), &["https://dash.example"]);
+        let origin = "https://dash.example";
+
+        let preflight = send(
+            &app,
+            cors_request(&Method::OPTIONS, "/v1/sessions", origin, None),
+        )
+        .await;
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(allow_origin(&preflight), Some(origin));
+        assert_eq!(
+            preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+            "authorization"
+        );
+        assert_eq!(
+            preflight.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
+            "GET"
+        );
+
+        let anonymous = send(
+            &app,
+            cors_request(&Method::GET, "/v1/sessions", origin, None),
+        )
+        .await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            allow_origin(&anonymous),
+            Some(origin),
+            "the page must be able to read why it was refused"
+        );
+
+        let authed = send(
+            &app,
+            cors_request(&Method::GET, "/v1/sessions", origin, Some("Bearer s3cret")),
+        )
+        .await;
+        assert_eq!(authed.status(), StatusCode::OK);
+        assert_eq!(allow_origin(&authed), Some(origin));
+        assert_eq!(authed.headers()[header::VARY], "origin");
+    }
+
+    /// An unlisted origin, or any origin with CORS off, gets no allow
+    /// header, so the browser withholds even a successful response.
+    #[tokio::test]
+    async fn unlisted_origins_and_the_default_get_no_allow_headers() {
+        let Harness { app: listed, .. } =
+            harness_with(Some(TOKEN.into()), &["https://dash.example"]);
+        let Harness { app: off, .. } = harness();
+        for (app, origin) in [
+            (&listed, "https://evil.example"),
+            (&listed, "https://dash.example.evil.example"),
+            (&listed, "http://dash.example"),
+            (&off, "https://dash.example"),
+        ] {
+            let preflight = send(
+                app,
+                cors_request(&Method::OPTIONS, "/v1/sessions", origin, None),
+            )
+            .await;
+            assert_ne!(preflight.status(), StatusCode::NO_CONTENT, "{origin}");
+            assert_eq!(allow_origin(&preflight), None, "{origin}");
+            let authed = send(
+                app,
+                cors_request(&Method::GET, "/v1/sessions", origin, Some("Bearer s3cret")),
+            )
+            .await;
+            assert_eq!(authed.status(), StatusCode::OK, "{origin}");
+            assert_eq!(allow_origin(&authed), None, "{origin}");
+        }
+    }
+
     /// `q=body:` needs the index, and the server must not build it: creating
     /// an empty one answers an empty list the client cannot tell from "no
     /// matches", on a host that never asked for an index.
@@ -819,6 +928,7 @@ mod tests {
             federate: false,
             base: Arc::new(query::Query::parse("")),
             sources: Vec::new(),
+            cors_origins: Vec::new(),
         });
         let (status, body) = get(&app, "/v1/sessions?q=body:needle").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

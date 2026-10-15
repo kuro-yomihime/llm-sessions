@@ -330,6 +330,8 @@ const MAX_STATUS_WINDOW_HOURS: u64 = 100 * 365 * 24;
     reaches a terminal. Clients send `Authorization: Bearer TOKEN`; /v1/stream\n\
     also takes `?token=TOKEN`. There is no TLS: off loopback, put a TLS\n\
     reverse proxy in front.\n\n\
+    Browser pages on another origin need --cors-origin; preflights from a\n\
+    listed origin are answered without the token, every GET still needs it.\n\n\
     Federation is opt-in: without --federate the server lists this machine\n\
     only and never contacts a peer, even with hosts configured.")]
 pub struct ServeArgs {
@@ -374,6 +376,12 @@ pub struct ServeArgs {
     /// machine only and never contacts a peer.
     #[arg(long)]
     pub federate: bool,
+
+    /// Let browser pages on this origin (scheme, host, optional port) call
+    /// the API. Repeatable; needs --token; no wildcard.
+    #[arg(long = "cors-origin", value_name = "ORIGIN",
+          value_parser = llm_sessions::serve::parse_origin, conflicts_with = "no_auth")]
+    pub cors_origins: Vec<String>,
 }
 
 /// Nothing that prints args may print the token: one stray `{:?}` on the
@@ -382,7 +390,8 @@ pub struct ServeArgs {
 #[cfg(feature = "serve")]
 impl std::fmt::Debug for ServeArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServeArgs")
+        let mut debug = f.debug_struct("ServeArgs");
+        debug
             .field("bind", &self.bind)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("no_auth", &self.no_auth)
@@ -392,7 +401,8 @@ impl std::fmt::Debug for ServeArgs {
             .field("sources", &self.sources)
             .field("query", &self.query)
             .field("federate", &self.federate)
-            .finish()
+            .field("cors_origins", &self.cors_origins);
+        debug.finish()
     }
 }
 
@@ -505,6 +515,7 @@ mod tests {
             sources: Vec::new(),
             query: None,
             federate: false,
+            cors_origins: Vec::new(),
         };
         let printed = format!("{args:?}");
         assert!(!printed.contains("s3cret"), "{printed}");

@@ -97,6 +97,7 @@ pub fn run() -> Result<()> {
                 sources: args.sources,
                 query: args.query,
                 federate: args.federate,
+                cors_origins: args.cors_origins,
             },
         ),
         Some(Command::Doctor(args)) => report::doctor(&home, &args),

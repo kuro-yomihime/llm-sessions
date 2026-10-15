@@ -223,6 +223,12 @@ WebSocket connects, so `--no-auth` (loopback only) answers just requests
 whose `Host` header names the loopback. There is no TLS: off loopback, put a
 TLS reverse proxy in front. `--source` and `-q` restrict
 what is published at all; `--poll-secs` (default 3) sets the rescan interval.
+
+A web page on another origin needs `--cors-origin <scheme://host[:port]>`
+(repeatable, exact match, no `*`). A listed origin's preflight is answered
+without the token; every request after it still needs the bearer header, so
+the page holds the token. `--cors-origin` is refused with `--no-auth`.
+
 Local-only is the default, even when `hosts.json` contains peers. Enable a
 federated gateway explicitly:
 

@@ -39,6 +39,7 @@
 //! binary; `main` captures the local offset before this starts threads.
 
 mod auth;
+mod cors;
 mod poll;
 mod router;
 mod stream;
@@ -59,6 +60,7 @@ use crate::runtime::live::Fleet;
 use crate::source;
 
 pub use self::auth::admit;
+pub use self::cors::parse_origin;
 
 /// Everything `llm-sessions serve` is told on its command line. No `Debug`:
 /// it holds the token.
@@ -83,11 +85,20 @@ pub struct Config {
     /// Gateway mode: also list the configured peers each scan and answer
     /// federation discovery through them. Default is this machine only.
     pub federate: bool,
+    /// Browser origins, from [`parse_origin`], allowed to call the API
+    /// cross-origin. Empty for none; refused together with `no_auth`.
+    pub cors_origins: Vec<String>,
 }
 
 /// Serve until SIGINT or SIGTERM.
 pub fn run(home: &Path, mut config: Config) -> Result<()> {
     let token = admit(config.bind, config.token.take(), config.no_auth).map_err(Error::Serve)?;
+    if token.is_none() && !config.cors_origins.is_empty() {
+        return Err(Error::Serve(
+            "--cors-origin needs --token: an allowed page would read every transcript without one"
+                .into(),
+        ));
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -163,6 +174,7 @@ async fn serve(home: &Path, config: Config, token: Option<String>) -> Result<()>
         federate: config.federate,
         base,
         sources: config.sources.clone(),
+        cors_origins: config.cors_origins.clone(),
     });
     axum::serve(listener, router::router(app))
         .with_graceful_shutdown(async move {
