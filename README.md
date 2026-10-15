@@ -16,16 +16,22 @@ agents merged into one list.
 
 ## Screenshots
 
-![Workspace view: workspaces, sessions with a live subagent tree, transcript](docs/assets/overview.png)
+**Terminal UI** (`llm-sessions`)
+
+![Workspace view: workspaces, sessions with a live subagent tree, transcript](assets/screenshots/overview.png)
+
+**Web dashboard** (`llm-sessions serve --dashboard`)
+
+![Web dashboard: live sessions by status, fleet stats, activity heatmap](assets/screenshots/dashboard.png)
 
 <details>
 <summary>More screenshots</summary>
 
 | Timeline view `6`, insert mode `i` | Full-text search `s` |
 |---|---|
-| ![Timeline of every agent's sessions with an insert-mode prompt](docs/assets/timeline-insert.png) | ![Sessions narrowed to body matches for "pricing"](docs/assets/search.png) |
+| ![Timeline of every agent's sessions with an insert-mode prompt](assets/screenshots/timeline-insert.png) | ![Sessions narrowed to body matches for "pricing"](assets/screenshots/search.png) |
 | **Fullscreen reader `Ctrl-W o`** | **Help `?`** |
-| ![Fullscreen transcript reader](docs/assets/reader.png) | ![Help overlay listing every key](docs/assets/help.png) |
+| ![Fullscreen transcript reader](assets/screenshots/reader.png) | ![Help overlay listing every key](assets/screenshots/help.png) |
 
 </details>
 
