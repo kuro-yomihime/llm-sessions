@@ -59,16 +59,16 @@ axum = { version = "0.8", optional = true, default-features = false, features = 
 ] }
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 crossterm = "0.29"
 ratatui = { version = "0.30", features = ["crossterm"] }
-reqwest = { version = "0.12", optional = true, default-features = false, features = [
+reqwest = { version = "0.13", optional = true, default-features = false, features = [
     "blocking",
     "json",
-    "rustls-tls",
-    "rustls-tls-native-roots",
+    "query",
+    "rustls",
 ] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -120,7 +120,7 @@ codegen-units = 1
 strip = "debuginfo"
 
 [dev-dependencies]
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Route and stream tests for `serve`: requests without a socket, and a
 # WebSocket client. Both are already in the tree under the `serve` feature.
 futures-util = { version = "0.3", default-features = false }
