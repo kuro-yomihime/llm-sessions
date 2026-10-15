@@ -183,7 +183,13 @@ pub enum HostsCommand {
     Remove { name: String },
     /// Enroll or replace a peer's origin UUID through its configured connection.
     Refresh {
-        name: String,
+        /// Host to refresh; omit with --all.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        name: Option<String>,
+        /// Refresh every configured host. Failures are reported and skipped;
+        /// successful pins are still saved.
+        #[arg(long)]
+        all: bool,
         /// First create the peer's origin-id marker if it does not exist —
         /// on the peer, over ssh, no llm-sessions needed there. A malformed
         /// marker is regenerated.

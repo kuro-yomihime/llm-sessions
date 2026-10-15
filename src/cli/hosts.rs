@@ -185,7 +185,9 @@ pub(super) fn remove(home: &Path, name: &str) -> Result<()> {
 /// Pin the peer's origin as observed through its connection. With `init`,
 /// first create the peer's marker on it — recovering a peer whose own
 /// `llm-sessions` predates origin identity — and pin what resulted.
-pub(super) fn refresh(home: &Path, name: &str, init: bool, force: bool) -> Result<()> {
+/// `name: None` refreshes every configured host, saving each success and
+/// failing at the end if any host failed.
+pub(super) fn refresh(home: &Path, name: Option<&str>, init: bool, force: bool) -> Result<()> {
     let (mut config, failure) = remote::Config::load(home);
     if let Some(failure) = failure {
         return Err(Error::BadArgument {
@@ -193,25 +195,53 @@ pub(super) fn refresh(home: &Path, name: &str, init: bool, force: bool) -> Resul
             got: failure,
         });
     }
-    let entry = config
-        .hosts
-        .iter_mut()
-        .find(|host| host.name == name)
-        .ok_or_else(|| Error::BadArgument {
+    if let Some(name) = name
+        && !config.hosts.iter().any(|host| host.name == name)
+    {
+        return Err(Error::BadArgument {
             what: "host name",
             got: name.to_owned(),
-        })?;
-    let peer = remote::Host::new(entry.clone());
-    let observed = if init {
-        peer.init_origin(force)?
+        });
+    }
+    let mut failed = Vec::new();
+    let mut changed = false;
+    for entry in config
+        .hosts
+        .iter_mut()
+        .filter(|host| name.is_none_or(|name| host.name == name))
+    {
+        let peer = remote::Host::new(entry.clone());
+        let observed = if init {
+            peer.init_origin(force)
+        } else {
+            peer.observed_origin().map(str::to_owned)
+        };
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(error) if name.is_none() => {
+                eprintln!("{}: {error}", entry.name);
+                failed.push(entry.name.clone());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let previous = entry.origin_id.replace(observed.clone());
+        changed = true;
+        emit(&format!(
+            "{}: {} -> {observed}",
+            entry.name,
+            previous.as_deref().unwrap_or("unregistered")
+        ));
+    }
+    if changed {
+        config.save(home)?;
+    }
+    if failed.is_empty() {
+        Ok(())
     } else {
-        peer.observed_origin()?.to_owned()
-    };
-    let previous = entry.origin_id.replace(observed.clone());
-    config.save(home)?;
-    emit(&format!(
-        "{name}: {} -> {observed}",
-        previous.as_deref().unwrap_or("unregistered")
-    ));
-    Ok(())
+        Err(Error::Remote {
+            host: failed.join(", "),
+            message: "refresh failed".into(),
+        })
+    }
 }
