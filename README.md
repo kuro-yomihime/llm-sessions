@@ -68,25 +68,25 @@ Not supported: Cursor GUI, Antigravity, Devin.
 
 ```sh
 llm-sessions                     # interactive explorer
-llm-sessions list                # newest 50 sessions (--json, -q '<query>', --format, -0)
+llm-sessions list                # newest 50 sessions (--json, -q '<query>', --template, -0)
 llm-sessions workspaces          # project totals, live first
 llm-sessions show <id>           # transcript; --thinking --tools, --format md -o out.md
 llm-sessions index               # build/update the optional text index
-llm-sessions search <words>      # full-text search
+llm-sessions search <words>      # full-text search; list's filters (--source, -q, …)
 llm-sessions digest --since 24h  # recent activity by project
 llm-sessions top                 # one row per running agent
 llm-sessions usage --by workspace --since 7d   # also: model, agent, day
 llm-sessions archive <id>        # --undo restores
 llm-sessions serve --token <t>   # read-only HTTP/WebSocket API
-llm-sessions hosts               # remote hosts
-llm-sessions sources             # detected stores and scan costs
+llm-sessions hosts               # remote hosts, pinned origins, transports (--json)
+llm-sessions sources             # this machine's stores and scan costs (--json)
 llm-sessions doctor              # diagnostics (--json)
 llm-sessions completions bash
 llm-sessions man
 ```
 
-`--read-only` blocks every write: archiving, indexing, origin init, host
-edits, tmux focus, bookmarks.
+`--read-only` blocks every write: archiving, indexing, host edits, origin init,
+bookmarks, sending messages, tmux focus.
 
 ## Keys
 

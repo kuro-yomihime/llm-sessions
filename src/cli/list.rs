@@ -21,7 +21,7 @@ pub(super) fn run(home: &Path, args: &ListArgs) -> Result<()> {
     if args.json {
         let json = serde_json::to_string_pretty(&rows)?;
         emit(&json);
-    } else if let Some(template) = &args.format {
+    } else if let Some(template) = &args.template {
         // A template is for machines, so it goes out raw: no truncation, no
         // padding, and `-0` for arguments that may contain whitespace.
         let mut out = std::io::stdout().lock();
@@ -150,48 +150,56 @@ fn body_restriction(home: &Path, query: &Query) -> Option<HashSet<(SourceId, Str
     }
 }
 
+/// `list`'s rows: the shared filters, newest first, at most `limit` (0 is
+/// no limit).
 fn filter(home: &Path, scan: &Scan, args: &FilterArgs, limit: usize) -> Vec<SessionSummary> {
-    let wanted: Vec<String> = args.sources.iter().map(|s| s.to_lowercase()).collect();
+    matching(home, scan, args)
+        // A subagent transcript is a child of a session, never a row of its
+        // own; `llm-sessions show <id>` still reaches one directly.
+        .filter(|s| !s.subagent)
+        .take(if limit == 0 { usize::MAX } else { limit })
+        .cloned()
+        .collect()
+}
+
+/// Every scanned session the filters admit, subagents included: `list`
+/// shapes these into rows, `search` keeps the hits that land on them.
+pub(super) fn matching<'a>(
+    home: &Path,
+    scan: &'a Scan,
+    args: &'a FilterArgs,
+) -> impl Iterator<Item = &'a SessionSummary> {
     let prefix = args
         .workspace
         .as_ref()
         .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
     let query = Query::parse(args.query.as_deref().unwrap_or_default());
     let bodies = body_restriction(home, &query);
-    // The archived / live / query gate is the library's, shared with the
-    // TUI's toggles, so the two frontends cannot drift on what those mean.
-    let filters = Filters {
-        query: &query,
-        hits: bodies.as_ref(),
-        show_archived: args.archived,
-        live_only: args.live,
-    };
-
-    scan.sessions
-        .iter()
-        // A subagent transcript is a child of a session, never a row of its
-        // own; `llm-sessions show <id>` still reaches one directly.
-        .filter(|s| !s.subagent)
-        .filter(|s| eligible(s, &filters))
-        .filter(|s| wanted.is_empty() || wanted.contains(&s.source.to_string()))
-        .filter(|s| {
-            args.hosts.is_empty()
+    scan.sessions.iter().filter(move |s| {
+        // The archived / live / query gate is the library's, shared with the
+        // TUI's toggles, so the two frontends cannot drift on what those mean.
+        let filters = Filters {
+            query: &query,
+            hits: bodies.as_ref(),
+            show_archived: args.archived,
+            live_only: args.live,
+        };
+        eligible(s, &filters)
+            && (args.sources.is_empty() || args.sources.contains(&s.source))
+            && (args.hosts.is_empty()
                 || args.hosts.iter().any(|host| {
                     if host == "local" {
                         s.is_local()
                     } else {
                         s.origin_label.as_ref() == Some(host)
                     }
-                })
-        })
-        .filter(|s| match (&prefix, &s.workspace) {
-            (None, _) => true,
-            (Some(p), Some(w)) => w.starts_with(p),
-            (Some(_), None) => false,
-        })
-        .take(if limit == 0 { usize::MAX } else { limit })
-        .cloned()
-        .collect()
+                }))
+            && match (&prefix, &s.workspace) {
+                (None, _) => true,
+                (Some(p), Some(w)) => w.starts_with(p),
+                (Some(_), None) => false,
+            }
+    })
 }
 
 #[cfg(test)]

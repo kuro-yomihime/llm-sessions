@@ -579,7 +579,7 @@ impl Host {
         }
     }
 
-    /// One line for `llm-sessions sources`: which transport this host will use, or
+    /// One line for `llm-sessions hosts`: which transport this host will use, or
     /// why it cannot be reached.
     pub fn status(&self) -> String {
         if self.is_http() {

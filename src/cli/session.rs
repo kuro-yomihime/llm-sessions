@@ -22,10 +22,7 @@ fn load(home: &Path, args: &ShowArgs) -> Result<(Transcript, SessionSummary)> {
             args.origin
                 .as_deref()
                 .is_none_or(|origin| session.origin_id.as_deref() == Some(origin))
-                && args
-                    .source
-                    .as_deref()
-                    .is_none_or(|source| session.source.name() == source)
+                && args.source.is_none_or(|source| session.source == source)
         })
         .collect();
     let session = resolve_one(&rows, &args.id)?;
@@ -33,22 +30,6 @@ fn load(home: &Path, args: &ShowArgs) -> Result<(Transcript, SessionSummary)> {
 }
 
 pub(super) fn show(home: &Path, args: &ShowArgs) -> Result<()> {
-    if let Some(origin) = &args.origin
-        && !llm_sessions::federation::valid_origin(origin)
-    {
-        return Err(Error::BadArgument {
-            what: "--origin",
-            got: origin.clone(),
-        });
-    }
-    if let Some(source) = &args.source
-        && llm_sessions::SourceId::parse(source).is_none()
-    {
-        return Err(Error::BadArgument {
-            what: "--source",
-            got: source.clone(),
-        });
-    }
     let (transcript, session) = load(home, args)?;
 
     if let Some(format) = args.format

@@ -19,7 +19,8 @@ use llm_sessions::source::remote::Mode;
                   `$(llm-sessions)`: command substitution does not safely parse shell quoting."
 )]
 pub struct Cli {
-    /// Refuse every mutation: archiving, indexing, moving tmux focus.
+    /// Refuse every mutation: archiving, indexing, host edits, origin init,
+    /// bookmarks, sending messages, moving tmux focus.
     #[arg(long, global = true)]
     pub read_only: bool,
 
@@ -38,7 +39,8 @@ pub enum Command {
     /// Read a session's normalized transcript.
     #[command(display_order = 3)]
     Show(ShowArgs),
-    /// Search indexed transcript bodies.
+    /// Search indexed transcript bodies. The index holds this machine's
+    /// sessions only; filters are `list`'s, so `--host` can select only `local`.
     #[command(display_order = 4)]
     Search(SearchArgs),
     /// Summarize recent sessions by workspace.
@@ -59,12 +61,14 @@ pub enum Command {
     /// only: fetching remote bodies would mean one ssh per session.
     #[command(display_order = 9)]
     Index(IndexArgs),
-    /// Inspect discovered stores and scan costs.
+    /// Inspect this machine's discovered stores and scan costs. Remote
+    /// machines are `llm-sessions hosts`.
     #[command(display_order = 10)]
-    Sources,
-    /// Show, add, or remove remote hosts (hosts.json). Bare `llm-sessions hosts`
-    /// lists every configured host and probes it, so one command answers
-    /// "is my fleet reachable and which transport will it use".
+    Sources(SourcesArgs),
+    /// Show, add, remove, or refresh remote hosts (hosts.json). Bare
+    /// `llm-sessions hosts` lists every configured host with its pinned
+    /// origin and probes it, so one command answers "is my fleet reachable
+    /// and which transport will it use".
     #[command(display_order = 10)]
     Hosts(HostsArgs),
     /// Report orphaned processes, dead paths, and stale caches.
@@ -131,8 +135,8 @@ pub struct ListArgs {
     /// Row template, e.g. '{liveness}\t{id}\t{workspace}\t{title}'.
     /// Fields: liveness pid pane activity source host id title label workspace
     /// branch model cost tokens files updated path.
-    #[arg(long, conflicts_with = "json")]
-    pub format: Option<String>,
+    #[arg(long, value_name = "TEMPLATE", conflicts_with = "json")]
+    pub template: Option<String>,
 
     /// Separate rows with NUL instead of newline, for `xargs -0`.
     #[arg(long, short = '0')]
@@ -154,9 +158,21 @@ pub struct WorkspacesArgs {
 }
 
 #[derive(Debug, Clone, clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct HostsArgs {
+    /// Emit name, destination, sources, pinned origin, and status as JSON.
+    #[arg(long)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Option<HostsCommand>,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct SourcesArgs {
+    /// Emit agent, sessions (or error), seconds, and roots as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -197,9 +213,9 @@ pub struct AddHostArgs {
     /// Remote home directory. Omit to ask the host at probe time.
     #[arg(long, value_name = "PATH")]
     pub home: Option<PathBuf>,
-    /// Agent names to scan. Repeatable; omit for all.
-    #[arg(long = "source", value_name = "AGENT")]
-    pub sources: Vec<String>,
+    /// Only scan these agents. Repeatable; omit for all.
+    #[arg(long = "source", value_name = "AGENT", value_parser = parse_source)]
+    pub sources: Vec<llm_sessions::SourceId>,
     /// Transport: auto (default), llm-sessions, or shell. SSH only.
     #[arg(long, value_enum)]
     pub mode: Option<Mode>,
@@ -208,8 +224,8 @@ pub struct AddHostArgs {
 #[derive(Debug, Clone, clap::Args)]
 pub struct FilterArgs {
     /// Only sessions from this agent. Repeatable.
-    #[arg(long = "source", value_name = "AGENT")]
-    pub sources: Vec<String>,
+    #[arg(long = "source", value_name = "AGENT", value_parser = parse_source)]
+    pub sources: Vec<llm_sessions::SourceId>,
     /// Only sessions with this origin display label. Repeatable.
     /// Direct origins use their hosts.json name; `local` selects this machine.
     #[arg(long = "host", value_name = "NAME")]
@@ -238,12 +254,12 @@ pub struct ShowArgs {
     /// Session id, or a unique prefix of one.
     pub id: String,
     /// Restrict resolution to this stable origin ID.
-    #[arg(long)]
+    #[arg(long, value_name = "UUID", value_parser = parse_origin_id)]
     pub origin: Option<String>,
 
     /// Restrict resolution to this agent.
-    #[arg(long)]
-    pub source: Option<String>,
+    #[arg(long, value_name = "AGENT", value_parser = parse_source)]
+    pub source: Option<llm_sessions::SourceId>,
 
     /// Emit the transcript as JSON.
     #[arg(long, conflicts_with = "format")]
@@ -284,7 +300,8 @@ pub struct IndexArgs {
     #[arg(long)]
     pub rebuild: bool,
 
-    /// Skip sessions older than this: `7d`, `2w`, `today`, RFC 3339.
+    /// Skip sessions older than this: `today`, `yesterday`, `24h`, `7d`,
+    /// `2w`, or an RFC 3339 timestamp.
     #[arg(long)]
     pub since: Option<String>,
 
@@ -424,7 +441,8 @@ impl std::fmt::Debug for ServeArgs {
     }
 }
 
-#[cfg(feature = "serve")]
+/// An agent name, checked when arguments are parsed so an unknown one is
+/// refused with the list of known names instead of silently matching nothing.
 fn parse_source(name: &str) -> Result<llm_sessions::SourceId, String> {
     llm_sessions::SourceId::parse(&name.to_lowercase()).ok_or_else(|| {
         let known: Vec<&str> = llm_sessions::SourceId::ALL
@@ -433,6 +451,15 @@ fn parse_source(name: &str) -> Result<llm_sessions::SourceId, String> {
             .collect();
         format!("unknown agent; one of: {}", known.join(", "))
     })
+}
+
+/// A stable origin ID, in the canonical lowercase form rows carry.
+fn parse_origin_id(origin: &str) -> Result<String, String> {
+    if llm_sessions::federation::valid_origin(origin) {
+        Ok(llm_sessions::model::normalize_origin(origin))
+    } else {
+        Err("not an origin UUID (see `llm-sessions origin`)".into())
+    }
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -448,7 +475,8 @@ pub struct UsageArgs {
     #[arg(long, default_value_t = Axis::Workspace)]
     pub by: Axis,
 
-    /// Only sessions touched since: `7d`, `2w`, `today`, RFC 3339.
+    /// Only sessions touched since: `today`, `yesterday`, `24h`, `7d`, `2w`,
+    /// or an RFC 3339 timestamp.
     #[arg(long)]
     pub since: Option<String>,
 
@@ -464,10 +492,14 @@ pub struct UsageArgs {
 #[derive(Debug, Clone, clap::Args)]
 pub struct SearchArgs {
     /// Words to look for in session bodies.
-    #[arg(required = true, num_args = 1..)]
-    pub query: Vec<String>,
+    #[arg(value_name = "WORDS", required = true, num_args = 1..)]
+    pub words: Vec<String>,
 
-    /// Maximum hits.
+    // Same filters as `list`, applied to the hits.
+    #[command(flatten)]
+    pub filters: FilterArgs,
+
+    /// Maximum hits, after filtering. 0 means no limit.
     #[arg(long, default_value_t = 50)]
     pub limit: usize,
 
@@ -505,7 +537,7 @@ mod tests {
 
     #[test]
     fn workspaces_rejects_session_row_output_flags() {
-        for flag in ["--format={id}", "-0", "--null"] {
+        for flag in ["--template={id}", "-0", "--null"] {
             let error = Cli::try_parse_from(["llm-sessions", "workspaces", flag]).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
             // These remain supported by list, where they describe session rows.
@@ -516,6 +548,51 @@ mod tests {
                 Some(Command::List(_))
             ));
         }
+    }
+
+    #[test]
+    fn agent_and_origin_filters_are_checked_and_canonical_at_parse_time() {
+        for command in [
+            &["llm-sessions", "list", "--source", "nope"][..],
+            &["llm-sessions", "search", "x", "--source", "nope"],
+            &["llm-sessions", "show", "x", "--source", "nope"],
+            &[
+                "llm-sessions",
+                "hosts",
+                "add",
+                "h",
+                "h.example",
+                "--source",
+                "nope",
+            ],
+            &["llm-sessions", "show", "x", "--origin", "not-a-uuid"],
+        ] {
+            let error = Cli::try_parse_from(command).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{command:?}"
+            );
+        }
+        // Rows carry lowercase origins; an uppercase paste still resolves.
+        let parsed = Cli::try_parse_from([
+            "llm-sessions",
+            "show",
+            "x",
+            "--origin",
+            "00000000-0000-4000-8000-0000000000AA",
+            "--source",
+            "OMP",
+        ])
+        .unwrap();
+        let Some(Command::Show(args)) = parsed.command else {
+            panic!("show did not parse");
+        };
+        assert_eq!(
+            args.origin.as_deref(),
+            Some("00000000-0000-4000-8000-0000000000aa")
+        );
+        assert_eq!(args.source, Some(llm_sessions::SourceId::Omp));
     }
 
     /// One stray `{:?}` on the parsed CLI must not copy the token into a

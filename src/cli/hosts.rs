@@ -1,23 +1,41 @@
-//! Where sessions come from: local adapters (`sources`) and remote machines
-//! (`hosts`).
+//! Where sessions come from: this machine's adapters (`sources`) and remote
+//! machines (`hosts`).
 
-use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
+use llm_sessions::Result;
 use llm_sessions::catalog::workspace;
 use llm_sessions::error::Error;
 use llm_sessions::source::{self, remote};
-use llm_sessions::{Result, SourceId};
 
 use super::emit;
 
-pub(super) fn sources(home: &Path) {
-    let mut stdout = std::io::stdout().lock();
+/// One line per local store: sessions found (or the error), what the scan
+/// cost, and its roots. Remote machines are `hosts`, which probes them.
+pub(super) fn sources(home: &Path, json: bool) -> Result<()> {
+    let mut rows = Vec::new();
     for src in source::all(home) {
         let started = Instant::now();
         let outcome = src.list();
         let elapsed = started.elapsed();
+        if json {
+            let (sessions, error) = match &outcome {
+                Ok(found) => (Some(found.len()), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+            rows.push(serde_json::json!({
+                "agent": src.id().name(),
+                "sessions": sessions,
+                "error": error,
+                "seconds": elapsed.as_secs_f64(),
+                "roots": src.roots().iter().map(|root| serde_json::json!({
+                    "path": root,
+                    "exists": root.exists(),
+                })).collect::<Vec<_>>(),
+            }));
+            continue;
+        }
         let status = match &outcome {
             Ok(found) => format!("{} sessions", found.len()),
             Err(e) => format!("error: {e}"),
@@ -30,55 +48,46 @@ pub(super) fn sources(home: &Path) {
                 format!("{}{mark}", workspace::display(r, home))
             })
             .collect();
-        let _ = writeln!(
-            stdout,
+        emit(&format!(
             "{:<10} {:>16}  {:>9.1?}  {}",
             src.id().to_string(),
             status,
             elapsed,
             roots.join(", ")
-        );
+        ));
     }
-    // One line per configured machine: which transport it will use, or why
-    // it cannot be reached. Probing is one `ssh` per host, which is exactly
-    // what `sources` exists to spend.
-    let (config, parse_failure) = remote::Config::load(home);
-    for host in config.hosts {
-        let host = remote::Host::new(host);
-        let _ = writeln!(
-            stdout,
-            "{:<10} {:>16}  {:>9}  {}",
-            host.name(),
-            host.destination(),
-            "",
-            host.status()
-        );
+    if json {
+        emit(&serde_json::to_string_pretty(&rows)?);
     }
-    if let Some(failure) = parse_failure {
-        let _ = writeln!(
-            stdout,
-            "{:<10} {:>16}  {:>9}  {failure}",
-            "hosts.json", "", ""
-        );
-    }
+    Ok(())
 }
 
-/// Show every configured host and probe it: name, destination, transport.
-pub(super) fn list(home: &Path) {
+/// Show every configured host and probe it: name, destination, scanned
+/// agents, pinned origin, transport.
+pub(super) fn list(home: &Path, json: bool) -> Result<()> {
     let (config, failure) = remote::Config::load(home);
-    if config.hosts.is_empty() {
+    if config.hosts.is_empty() && !json {
         let path = remote::Config::default_path(home);
         emit(&format!(
             "no remote hosts; add one with `llm-sessions hosts add <name> <ssh>` or `hosts add <name> --url <URL>` ({})",
             workspace::display(&path, home)
         ));
-        if let Some(failure) = failure {
-            eprintln!("llm-sessions: {failure}");
-        }
-        return;
     }
-    for host in &config.hosts {
-        let host = remote::Host::new(host.clone());
+    let mut rows = Vec::new();
+    for entry in &config.hosts {
+        let origin = entry.origin_id.clone();
+        let host = remote::Host::new(entry.clone());
+        let status = host.status();
+        if json {
+            rows.push(serde_json::json!({
+                "name": host.name(),
+                "destination": host.destination(),
+                "sources": host.configured_sources(),
+                "origin_id": origin,
+                "status": status,
+            }));
+            continue;
+        }
         let configured = host.configured_sources();
         let scanned = if configured.is_empty() {
             "all".to_string()
@@ -86,16 +95,20 @@ pub(super) fn list(home: &Path) {
             configured.join(",")
         };
         emit(&format!(
-            "{:<12} {:<24} {:<10} {}",
+            "{:<12} {:<24} {:<10} {:<36} {status}",
             host.name(),
             host.destination(),
             scanned,
-            host.status()
+            origin.as_deref().unwrap_or("unpinned"),
         ));
+    }
+    if json {
+        emit(&serde_json::to_string_pretty(&rows)?);
     }
     if let Some(failure) = failure {
         eprintln!("llm-sessions: {failure}");
     }
+    Ok(())
 }
 
 /// Add or update a host from the `hosts add` fields, applying the same
@@ -110,16 +123,7 @@ pub(super) fn add(home: &Path, args: super::args::AddHostArgs) -> Result<()> {
         sources: wanted,
         mode,
     } = args;
-    // Unknown agent names cannot match a store, so they are rejected here
-    // rather than silently listing nothing.
-    for agent in &wanted {
-        if SourceId::parse(agent).is_none() {
-            return Err(Error::BadArgument {
-                what: "--source",
-                got: agent.clone(),
-            });
-        }
-    }
+    let wanted: Vec<String> = wanted.iter().map(|id| id.name().to_owned()).collect();
     if name.trim().is_empty() {
         return Err(Error::BadArgument {
             what: "name",

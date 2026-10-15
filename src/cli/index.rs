@@ -1,13 +1,16 @@
 //! The body index: building it (`index`) and querying it (`search`).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use llm_sessions::catalog::workspace;
 use llm_sessions::storage::index::{Index, RefreshOptions};
-use llm_sessions::{Result, SessionSummary};
+use llm_sessions::{Result, SessionSummary, SourceId};
 
 use super::args::{IndexArgs, SearchArgs};
-use super::{Cached, Liveliness, Loaded, Remote, emit, parse_since, scan_all_with};
+use super::{
+    Cached, Liveliness, Loaded, Remote, emit, parse_since, report_failures, scan_all_with,
+};
 
 pub(super) fn build(home: &Path, args: &IndexArgs) -> Result<()> {
     let path = Index::default_path(home);
@@ -72,7 +75,27 @@ pub(super) fn build(home: &Path, args: &IndexArgs) -> Result<()> {
 
 pub(super) fn search(home: &Path, args: &SearchArgs) -> Result<()> {
     let index = Index::open(&Index::default_path(home))?;
-    let hits = index.search(&args.query.join(" "), args.limit)?;
+    // The index is this machine's, so peers are never contacted; process
+    // state costs a probe, paid only when a filter can read it.
+    let liveliness = if args.filters.live || args.filters.query.is_some() {
+        Liveliness::Needed
+    } else {
+        Liveliness::Skip
+    };
+    let Loaded { scan, .. } = scan_all_with(home, liveliness, Cached::Borrow, Remote::Skip);
+    let admitted: HashSet<(SourceId, &str)> = super::list::matching(home, &scan, &args.filters)
+        .map(|session| (session.source, session.id.as_str()))
+        .collect();
+    // Filters apply after ranking, so the limit counts only hits that survive.
+    let limit = if args.limit == 0 {
+        usize::MAX
+    } else {
+        args.limit
+    };
+    let hits = index.search_where(&args.words.join(" "), limit, |source, id| {
+        admitted.contains(&(source, id))
+    })?;
+    report_failures(&scan);
     if args.json {
         let rows: Vec<_> = hits
             .iter()

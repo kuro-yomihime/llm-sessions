@@ -58,15 +58,9 @@ pub fn run() -> Result<()> {
         }
         Some(Command::Workspaces(args)) => list::workspaces(&home, &args),
         Some(Command::Show(args)) => session::show(&home, &args),
-        Some(Command::Sources) => {
-            hosts::sources(&home);
-            Ok(())
-        }
+        Some(Command::Sources(args)) => hosts::sources(&home, args.json),
         Some(Command::Hosts(args)) => match args.command {
-            None => {
-                hosts::list(&home);
-                Ok(())
-            }
+            None => hosts::list(&home, args.json),
             Some(
                 HostsCommand::Add(_) | HostsCommand::Remove { .. } | HostsCommand::Refresh { .. },
             ) if cli.read_only => Err(Error::ReadOnly {

@@ -344,6 +344,69 @@ impl Index {
         Ok(hits)
     }
 
+    /// [`Index::search`] narrowed by `keep`, at most `limit` hits that pass.
+    /// Ranking every match is cheap; a snippet is not — on a common word it
+    /// is most of the cost — so only the hits that survive `keep` and the
+    /// limit pay for one.
+    pub fn search_where(
+        &self,
+        query: &str,
+        limit: usize,
+        keep: impl Fn(SourceId, &str) -> bool,
+    ) -> Result<Vec<Hit>> {
+        let Some(expression) = match_expression(query) else {
+            return Ok(Vec::new());
+        };
+        let mut ranked = self
+            .conn
+            .prepare(
+                "SELECT body.rowid, docs.source, docs.session_id
+                 FROM body
+                 JOIN docs ON docs.rowid = body.rowid
+                 WHERE body MATCH ?1
+                 ORDER BY rank",
+            )
+            .map_err(sql(&self.path))?;
+        let mut kept = Vec::new();
+        let rows = ranked
+            .query_map(params![expression], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sql(&self.path))?;
+        for row in rows {
+            if kept.len() == limit {
+                break;
+            }
+            let (rowid, source, session_id) = row.map_err(sql(&self.path))?;
+            let source = SourceId::parse(&source)
+                .ok_or_else(|| sql(&self.path)(invalid_index_value("source")))?;
+            if keep(source, &session_id) {
+                kept.push(rowid);
+            }
+        }
+        let mut snippet = self
+            .conn
+            .prepare(
+                "SELECT docs.source, docs.session_id, docs.title, docs.workspace,
+                        docs.updated, snippet(body, 0, '[', ']', '…', 16)
+                 FROM body
+                 JOIN docs ON docs.rowid = body.rowid
+                 WHERE body MATCH ?1 AND body.rowid = ?2",
+            )
+            .map_err(sql(&self.path))?;
+        kept.into_iter()
+            .map(|rowid| {
+                snippet
+                    .query_row(params![expression, rowid], hit_from_row)
+                    .map_err(sql(&self.path))
+            })
+            .collect()
+    }
+
     /// Cached per-session usage for sessions tier 1 cannot price.
     pub fn usage(&self) -> Result<UsageCache> {
         let mut stmt = self
