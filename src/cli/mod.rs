@@ -74,7 +74,9 @@ pub fn run() -> Result<()> {
             }),
             Some(HostsCommand::Add(args)) => hosts::add(&home, args),
             Some(HostsCommand::Remove { name }) => hosts::remove(&home, &name),
-            Some(HostsCommand::Refresh { name }) => hosts::refresh(&home, &name),
+            Some(HostsCommand::Refresh { name, init, force }) => {
+                hosts::refresh(&home, &name, init, force)
+            }
         },
         Some(Command::Index(args)) if cli.read_only && !args.stats => {
             Err(Error::ReadOnly { what: "indexing" })

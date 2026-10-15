@@ -39,6 +39,77 @@ command -v sqlite3 >/dev/null && echo sqlite3:yes
 exit 0
 "#;
 
+/// Run over SSH on stdin, where a non-login shell may have a restricted PATH.
+/// Pure POSIX `sh`, so a peer needs no `llm-sessions` binary of any version:
+/// keep a valid existing identity, generate one when the marker is missing
+/// (or malformed, which locks the peer out just the same), and replace even a
+/// valid one only when `force` was asked for. Creation never clobbers — a
+/// concurrent initializer (the peer's own newer binary, say) may win, and
+/// whoever's file persisted is authoritative.
+const INIT_ORIGIN_SCRIPT: &str = r#"state="${XDG_STATE_HOME:-$HOME/.local/state}"
+dir="$state/llm-sessions"
+marker="$dir/origin-id"
+origin=
+if [ -r "$marker" ]; then
+    IFS= read -r origin < "$marker" || :
+fi
+valid() {
+    case "$1" in
+        ????????-????-????-????-????????????) ;;
+        *) return 1 ;;
+    esac
+    hex=$(printf '%s' "$1" | tr -d '-' | tr 'ABCDEF' 'abcdef')
+    [ ${#hex} -eq 32 ] || return 1
+    case "$hex" in *[!0-9a-f]*) return 1 ;; esac
+}
+if valid "$origin" && [ "$force" != yes ]; then
+    printf 'origin:%s\n' "$(printf '%s' "$origin" | tr 'ABCDEF' 'abcdef')"
+    exit 0
+fi
+hex=$(head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n\t\r')
+if [ ${#hex} -ne 32 ]; then
+    echo "origin init: cannot read 16 bytes from /dev/urandom" >&2
+    exit 1
+fi
+a=$(printf '%s' "$hex" | cut -c1-8)
+b=$(printf '%s' "$hex" | cut -c9-12)
+c=4$(printf '%s' "$hex" | cut -c14-16)
+d=$(printf '%s' "$hex" | cut -c17-20)
+e=$(printf '%s' "$hex" | cut -c21-32)
+# Version 4 and RFC 4122 variant, without shell arithmetic on hex digits:
+# the variant nibble keeps its low two bits, so 0,4,8,c all map to 8.
+case $(printf '%s' "$d" | cut -c1) in
+    0|4|8|c) d=8$(printf '%s' "$d" | cut -c2-4) ;;
+    1|5|9|d) d=9$(printf '%s' "$d" | cut -c2-4) ;;
+    2|6|a|e) d=a$(printf '%s' "$d" | cut -c2-4) ;;
+    *) d=b$(printf '%s' "$d" | cut -c2-4) ;;
+esac
+uuid="$a-$b-$c-$d-$e"
+mkdir -p "$dir" || { echo "origin init: cannot create $dir" >&2; exit 1; }
+# A marker that exists — valid but forced, or invalid — is replaced
+# atomically by rename; an absent one is created without clobbering, so a
+# concurrent initializer (the peer's own newer binary, say) may win, and
+# whoever's file persisted is authoritative.
+if [ -e "$marker" ]; then
+    tmp="$marker.init.$$"
+    if ! (umask 077; printf '%s\n' "$uuid" > "$tmp") || ! mv -f "$tmp" "$marker"; then
+        rm -f "$tmp"
+        echo "origin init: cannot write $marker" >&2
+        exit 1
+    fi
+else
+    (umask 077; set -C; printf '%s\n' "$uuid" > "$marker") 2>/dev/null || :
+fi
+origin=
+[ -r "$marker" ] && { IFS= read -r origin < "$marker" || :; }
+if ! valid "$origin"; then
+    echo "origin init: $marker does not hold a UUID" >&2
+    exit 1
+fi
+printf 'origin:%s\n' "$(printf '%s' "$origin" | tr 'ABCDEF' 'abcdef')"
+exit 0
+"#;
+
 /// What probing a host learned, once per process.
 #[derive(Clone, Debug)]
 pub(super) struct Probe {
@@ -92,6 +163,37 @@ impl Host {
         } else {
             std::borrow::Cow::Borrowed(PROBE_SCRIPT)
         }
+    }
+
+    /// The origin-init script, with `force` bound and a configured home's
+    /// namespace exported ahead of it, exactly as the probe script does.
+    fn init_script(&self, force: bool) -> String {
+        let script = format!(
+            "force={}\n{INIT_ORIGIN_SCRIPT}",
+            if force { "yes" } else { "no" }
+        );
+        match self.configured_home() {
+            Some(home) => {
+                let environment = home_environment(home);
+                let assignments = shell_command(environment.iter().map(String::as_str));
+                format!("export {assignments}\n{script}")
+            }
+            None => script,
+        }
+    }
+
+    /// Create or replace the peer's origin-id marker over the connection and
+    /// return the identity that resulted. The reply is parsed like the
+    /// probe's, so a login profile's noise cannot masquerade as an origin.
+    pub(super) fn ssh_init_origin(&self, force: bool) -> Result<String> {
+        let raw = self.ssh_script(&self.init_script(force))?;
+        raw.lines()
+            .map(str::trim)
+            .find_map(|line| {
+                let origin = line.strip_prefix("origin:")?;
+                crate::federation::valid_origin(origin).then(|| normalize_origin(origin))
+            })
+            .ok_or_else(|| self.fail("unreadable origin init output: no origin line"))
     }
 
     /// A configured home selects an account/session namespace consistently for
@@ -153,7 +255,10 @@ impl Host {
                     .or(reported)
                     .ok_or_else(|| "host reported no home directory".to_string())?;
                 let origin_id = origin_id.ok_or_else(|| {
-                    "canonical origin identity unavailable: missing or malformed origin-id marker under $XDG_STATE_HOME (default ~/.local/state)/llm-sessions".to_string()
+                    format!(
+                        "canonical origin identity unavailable: missing or malformed origin-id marker under $XDG_STATE_HOME (default ~/.local/state)/llm-sessions; run `llm-sessions hosts refresh --init {}` to generate one on the peer",
+                        self.name()
+                    )
                 })?;
                 let federation = if let Some(binary) = llm_sessions.as_deref() {
                     match self.ssh_binary(&home, &[binary, "federation", "capabilities"]) {
@@ -446,6 +551,93 @@ mod tests {
         assert!(raw.lines().any(|line| line == format!("origin:{origin}")));
         assert!(!raw.contains("llm-sessions:"));
         assert_eq!(crate::federation::read_origin(dir.path()).unwrap(), origin);
+    }
+
+    fn ssh_host(name: &str, home: Option<PathBuf>) -> Host {
+        Host::new(crate::source::remote::HostConfig {
+            name: name.into(),
+            origin_id: None,
+            transport: Transport::Ssh {
+                ssh: name.into(),
+                home,
+            },
+            sources: Vec::new(),
+            mode: crate::source::remote::Mode::Auto,
+        })
+    }
+
+    fn run_init(host: &Host, force: bool, home: &std::path::Path) -> String {
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(host.init_script(force))
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let raw = String::from_utf8(output.stdout).unwrap();
+        raw.lines()
+            .find_map(|line| line.strip_prefix("origin:"))
+            .unwrap_or_else(|| panic!("no origin line in {raw}"))
+            .to_owned()
+    }
+
+    #[test]
+    fn init_generates_a_v4_marker_keeps_it_and_replaces_it_only_by_force() {
+        let peer = tempfile::tempdir().unwrap();
+        let host = ssh_host("worker", None);
+        let marker = peer.path().join(".local/state/llm-sessions/origin-id");
+
+        let generated = run_init(&host, false, peer.path());
+        assert!(crate::federation::valid_origin(&generated));
+        assert_eq!(generated.as_bytes()[14], b'4', "UUID version nibble");
+        assert!(matches!(generated.as_bytes()[19], b'8'..=b'b'), "variant");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), generated);
+        let mode = std::fs::metadata(&marker).unwrap().permissions();
+        assert_eq!(mode.mode() & 0o777, 0o600);
+
+        // A valid identity is stable: reruns report it, never roll it.
+        assert_eq!(run_init(&host, false, peer.path()), generated);
+
+        // A malformed marker locks a peer out; init regenerates unprompted.
+        std::fs::write(&marker, "not a uuid\n").unwrap();
+        let repaired = run_init(&host, false, peer.path());
+        assert!(crate::federation::valid_origin(&repaired));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), repaired);
+
+        // Force deliberately rekeys; the new identity lands in the marker.
+        let forced = run_init(&host, true, peer.path());
+        assert!(crate::federation::valid_origin(&forced));
+        assert_ne!(forced, repaired);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), forced);
+        // And force is not sticky: the rekeyed identity is kept from now on.
+        assert_eq!(run_init(&host, false, peer.path()), forced);
+    }
+
+    #[test]
+    fn init_writes_the_configured_home_namespace_not_the_login_one() {
+        let login = tempfile::tempdir().unwrap();
+        let configured = login.path().join("another namespace with ' spaces");
+        let host = ssh_host("namespace", Some(configured.clone()));
+        let origin = run_init(&host, false, login.path());
+        assert!(crate::federation::valid_origin(&origin));
+        assert_eq!(
+            std::fs::read_to_string(configured.join(".local/state/llm-sessions/origin-id"))
+                .unwrap()
+                .trim(),
+            origin
+        );
+        assert!(
+            !login
+                .path()
+                .join(".local/state/llm-sessions/origin-id")
+                .exists()
+        );
     }
 
     #[test]

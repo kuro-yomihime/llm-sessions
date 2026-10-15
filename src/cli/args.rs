@@ -166,7 +166,17 @@ pub enum HostsCommand {
     /// Remove a host by name.
     Remove { name: String },
     /// Enroll or replace a peer's origin UUID through its configured connection.
-    Refresh { name: String },
+    Refresh {
+        name: String,
+        /// First create the peer's origin-id marker if it does not exist —
+        /// on the peer, over ssh, no llm-sessions needed there. A malformed
+        /// marker is regenerated.
+        #[arg(long)]
+        init: bool,
+        /// With --init, replace a valid existing marker too, rekeying the peer.
+        #[arg(long, requires = "init")]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, clap::Args)]

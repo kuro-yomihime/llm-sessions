@@ -178,7 +178,10 @@ pub(super) fn remove(home: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn refresh(home: &Path, name: &str) -> Result<()> {
+/// Pin the peer's origin as observed through its connection. With `init`,
+/// first create the peer's marker on it — recovering a peer whose own
+/// `llm-sessions` predates origin identity — and pin what resulted.
+pub(super) fn refresh(home: &Path, name: &str, init: bool, force: bool) -> Result<()> {
     let (mut config, failure) = remote::Config::load(home);
     if let Some(failure) = failure {
         return Err(Error::BadArgument {
@@ -195,7 +198,11 @@ pub(super) fn refresh(home: &Path, name: &str) -> Result<()> {
             got: name.to_owned(),
         })?;
     let peer = remote::Host::new(entry.clone());
-    let observed = peer.observed_origin()?.to_owned();
+    let observed = if init {
+        peer.init_origin(force)?
+    } else {
+        peer.observed_origin()?.to_owned()
+    };
     let previous = entry.origin_id.replace(observed.clone());
     config.save(home)?;
     emit(&format!(

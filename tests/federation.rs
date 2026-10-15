@@ -691,3 +691,85 @@ fn an_unpinned_ssh_peer_is_enrolled_only_by_hosts_refresh() {
         Some(Graph::origin("B").as_str())
     );
 }
+
+#[test]
+fn a_peer_without_a_marker_is_recovered_by_refresh_init_without_upgrading_it() {
+    let graph = Graph::new();
+    graph.host("L", &[("worker", "B", "auto")]);
+    graph.host("B", &[]);
+    graph.session("B", "remote-session");
+    let marker = graph.home("B").join(".local/state/llm-sessions/origin-id");
+    fs::remove_file(&marker).unwrap();
+    let config_path = graph.home("L").join(".config/llm-sessions/hosts.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["hosts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("origin_id");
+    fs::write(&config_path, config.to_string()).unwrap();
+
+    // The lockout: no marker, and a plain refresh cannot help because the
+    // probe itself needs one. The failure names the remedy.
+    let (rows, failures) = graph.list("L");
+    assert!(rows.is_empty());
+    assert!(failures.contains("identity unavailable"), "{failures}");
+    assert!(
+        failures.contains("hosts refresh --init worker"),
+        "{failures}"
+    );
+    let unrefreshable = graph.command("L", &["hosts", "refresh", "worker"]);
+    assert!(!unrefreshable.status.success());
+
+    let before = fs::read(&config_path).unwrap();
+    let denied = graph.command(
+        "L",
+        &["--read-only", "hosts", "refresh", "--init", "worker"],
+    );
+    assert!(!denied.status.success());
+    // --force alone must never degrade into a plain refresh.
+    let unforced = graph.command("L", &["hosts", "refresh", "--force", "worker"]);
+    assert!(!unforced.status.success());
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+    assert!(!marker.exists());
+
+    let initialized = graph.command("L", &["hosts", "refresh", "--init", "worker"]);
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let origin = fs::read_to_string(&marker).unwrap().trim().to_owned();
+    assert_ne!(origin, Graph::origin("B"), "a fresh identity, not the pin");
+    assert!(origin.len() == 36 && origin.as_bytes()[14] == b'4');
+    let stdout = String::from_utf8_lossy(&initialized.stdout);
+    assert!(stdout.contains(&origin), "reported: {stdout}");
+    let config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(config["hosts"][0]["origin_id"], origin);
+    let (rows, failures) = graph.list("L");
+    assert!(failures.is_empty(), "{failures}");
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.id.as_str(), row.origin_id.as_deref()))
+            .collect::<Vec<_>>(),
+        [("remote-session", Some(origin.as_str()))]
+    );
+
+    // Reruns keep the generated identity; only --force rekeys it.
+    let kept = graph.command("L", &["hosts", "refresh", "--init", "worker"]);
+    assert!(kept.status.success());
+    assert_eq!(fs::read_to_string(&marker).unwrap().trim(), origin);
+    let forced = graph.command("L", &["hosts", "refresh", "--init", "--force", "worker"]);
+    assert!(forced.status.success());
+    let rekeyed = fs::read_to_string(&marker).unwrap().trim().to_owned();
+    assert_ne!(rekeyed, origin);
+    let config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(config["hosts"][0]["origin_id"], rekeyed);
+    let (rows, failures) = graph.list("L");
+    assert!(failures.is_empty(), "{failures}");
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.id.as_str(), row.origin_id.as_deref()))
+            .collect::<Vec<_>>(),
+        [("remote-session", Some(rekeyed.as_str()))]
+    );
+}

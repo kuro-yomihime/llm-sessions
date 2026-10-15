@@ -166,7 +166,11 @@ Configure in `$XDG_CONFIG_HOME/llm-sessions/hosts.json`, or via
 (`llm-sessions origin --init` to do it explicitly). Sessions reached by several
 routes are merged by `(origin, source, id)`. Peers are pinned by UUID; run
 `llm-sessions hosts refresh <name>` to enroll or re-pin. Keep the file across
-upgrades; give cloned machines a new one.
+upgrades; give cloned machines a new one. A peer whose own `llm-sessions`
+predates identity never created its marker: `llm-sessions hosts refresh --init
+<name>` creates it on the peer over ssh — no upgrade needed — then enrolls it
+(`--force` also replaces a valid one, rekeying the peer). HTTP peers manage
+their own marker.
 
 Use `show <id> --origin <uuid> --source <agent>` if IDs collide.
 

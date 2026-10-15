@@ -471,6 +471,21 @@ impl Host {
             .map_err(|message| self.fail(message))
     }
 
+    /// Give the peer an origin-id marker over its configured connection and
+    /// return the identity that resulted, for peers whose own binary
+    /// predates origin identity. A valid existing marker is kept — identity
+    /// is stable — unless `force` replaces it; a missing or malformed one is
+    /// always (re)generated. An HTTP peer manages its own marker: the
+    /// server is read-only by construction and cannot be told to write.
+    pub fn init_origin(&self, force: bool) -> Result<String> {
+        if self.is_http() {
+            return Err(self.fail(
+                "an HTTP peer generates its own origin identity; run `llm-sessions origin --init` on it",
+            ));
+        }
+        self.ssh_init_origin(force)
+    }
+
     pub fn new(config: HostConfig) -> Self {
         Self {
             config,
@@ -1575,14 +1590,70 @@ mod tests {
             ),
             ..transport::Scripted::default()
         });
+        let failure = missing
+            .list_with(&sources, &DiscoveryContext::default())
+            .unwrap_err()
+            .to_string();
+        assert!(failure.contains("identity unavailable"), "{failure}");
         assert!(
-            missing
-                .list_with(&sources, &DiscoveryContext::default())
-                .unwrap_err()
-                .to_string()
-                .contains("identity unavailable")
+            failure.contains("hosts refresh --init missing"),
+            "the lockout names its own remedy: {failure}"
         );
         assert_eq!(calls(&missing).len(), 1);
+    }
+
+    #[test]
+    fn init_regenerates_a_missing_marker_and_enrolls_what_resulted() {
+        let mut host = Host::from_route_hop(&hop(B, "worker"), Path::new("/local"));
+        host.scripted = Some(transport::Scripted {
+            replies: std::sync::Mutex::new(
+                [Ok(format!(
+                    "home:/remote\norigin:{B}\nllm-sessions:/bin/new\n"
+                ))]
+                .into_iter()
+                .collect(),
+            ),
+            ..transport::Scripted::default()
+        });
+        assert_eq!(host.init_origin(false).unwrap(), B);
+        let scripts = host
+            .scripted
+            .as_ref()
+            .unwrap()
+            .scripts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(scripts.len(), 1, "one round trip, no probe first");
+        assert!(scripts[0].contains("origin-id"));
+        assert!(scripts[0].contains("force=no"));
+
+        let mut forced = Host::from_route_hop(&hop(B, "worker"), Path::new("/local"));
+        forced.scripted = Some(transport::Scripted {
+            replies: std::sync::Mutex::new([Ok(format!("origin:{B}\n"))].into_iter().collect()),
+            ..transport::Scripted::default()
+        });
+        assert_eq!(forced.init_origin(true).unwrap(), B);
+        assert!(
+            forced
+                .scripted
+                .as_ref()
+                .unwrap()
+                .scripts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+                .contains("force=yes")
+        );
+    }
+
+    #[test]
+    fn init_is_refused_for_http_peers() {
+        let host = Host::from_route_hop(
+            &http_hop(A, "gateway", "https://gateway.example"),
+            Path::new("/local"),
+        );
+        let error = host.init_origin(false).unwrap_err().to_string();
+        assert!(error.contains("HTTP peer"), "{error}");
+        assert!(error.contains("origin --init"), "{error}");
     }
 
     #[test]
