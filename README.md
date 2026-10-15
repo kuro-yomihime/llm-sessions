@@ -171,6 +171,9 @@ predates identity never created its marker: `llm-sessions hosts refresh --init
 <name>` creates it on the peer over ssh — no upgrade needed — then enrolls it
 (`--force` also replaces a valid one, rekeying the peer). HTTP peers manage
 their own marker.
+Initialization publishes complete markers atomically and preserves a concurrent
+initializer's valid identity. Surrounding whitespace is accepted; extra
+non-whitespace content makes a marker malformed and is repaired by `--init`.
 
 Use `show <id> --origin <uuid> --source <agent>` if IDs collide.
 

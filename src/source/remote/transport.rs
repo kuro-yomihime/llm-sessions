@@ -49,10 +49,15 @@ exit 0
 const INIT_ORIGIN_SCRIPT: &str = r#"state="${XDG_STATE_HOME:-$HOME/.local/state}"
 dir="$state/llm-sessions"
 marker="$dir/origin-id"
-origin=
-if [ -r "$marker" ]; then
-    IFS= read -r origin < "$marker" || :
-fi
+read_origin() {
+    origin=$(cat "$marker" 2>/dev/null) || origin=
+    # Trim surrounding whitespace only; embedded whitespace remains invalid.
+    origin=${origin#"${origin%%[![:space:]]*}"}
+    origin=${origin%"${origin##*[![:space:]]}"}
+}
+replace=no
+[ -e "$marker" ] && replace=yes
+read_origin
 valid() {
     case "$1" in
         ????????-????-????-????-????????????) ;;
@@ -86,22 +91,23 @@ case $(printf '%s' "$d" | cut -c1) in
 esac
 uuid="$a-$b-$c-$d-$e"
 mkdir -p "$dir" || { echo "origin init: cannot create $dir" >&2; exit 1; }
-# A marker that exists — valid but forced, or invalid — is replaced
-# atomically by rename; an absent one is created without clobbering, so a
-# concurrent initializer (the peer's own newer binary, say) may win, and
-# whoever's file persisted is authoritative.
-if [ -e "$marker" ]; then
-    tmp="$marker.init.$$"
-    if ! (umask 077; printf '%s\n' "$uuid" > "$tmp") || ! mv -f "$tmp" "$marker"; then
-        rm -f "$tmp"
-        echo "origin init: cannot write $marker" >&2
-        exit 1
-    fi
-else
-    (umask 077; set -C; printf '%s\n' "$uuid" > "$marker") 2>/dev/null || :
+# Publish complete files only. A marker created after our initial read wins.
+tmp=$(mktemp "$marker.init.XXXXXX") || exit 1
+trap 'rm -f "$tmp"' 0
+trap 'exit 1' 1 2 15
+if ! printf '%s\n' "$uuid" > "$tmp"; then
+    echo "origin init: cannot write $tmp" >&2
+    exit 1
 fi
-origin=
-[ -r "$marker" ] && { IFS= read -r origin < "$marker" || :; }
+read_origin
+if valid "$origin" && [ "$force" != yes ]; then
+    :
+elif [ "$force" = yes ] || [ "$replace" = yes ]; then
+    mv -f "$tmp" "$marker" || exit 1
+else
+    ln "$tmp" "$marker" 2>/dev/null || :
+fi
+read_origin
 if ! valid "$origin"; then
     echo "origin init: $marker does not hold a UUID" >&2
     exit 1
@@ -588,6 +594,30 @@ mod tests {
     }
 
     #[test]
+    fn init_preserves_an_identity_created_after_its_initial_read() {
+        let peer = tempfile::tempdir().unwrap();
+        let host = ssh_host("worker", None);
+        let winner = "00000000-0000-4000-8000-0000000000aa";
+        // Pause at directory creation by publishing the competing winner there.
+        let script = format!(
+            "mkdir() {{ command mkdir \"$@\" || return; printf '%s\\n' '{winner}' > \"$2/origin-id\"; }}\n{}",
+            host.init_script(false)
+        );
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("HOME", peer.path())
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(crate::federation::read_origin(peer.path()).unwrap(), winner);
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("origin:{winner}")
+        );
+    }
+
+    #[test]
     fn init_generates_a_v4_marker_keeps_it_and_replaces_it_only_by_force() {
         let peer = tempfile::tempdir().unwrap();
         let host = ssh_host("worker", None);
@@ -603,6 +633,21 @@ mod tests {
 
         // A valid identity is stable: reruns report it, never roll it.
         assert_eq!(run_init(&host, false, peer.path()), generated);
+        for padded in [format!(" {generated} \n"), format!("{generated}\r\n")] {
+            std::fs::write(&marker, padded).unwrap();
+            assert_eq!(run_init(&host, false, peer.path()), generated);
+            assert_eq!(
+                crate::federation::read_origin(peer.path()).unwrap(),
+                generated
+            );
+        }
+        std::fs::write(&marker, format!("{generated}\ntrailing garbage\n")).unwrap();
+        let recovered = run_init(&host, false, peer.path());
+        assert_eq!(
+            crate::federation::read_origin(peer.path()).unwrap(),
+            recovered
+        );
+        assert_ne!(recovered, generated);
 
         // A malformed marker locks a peer out; init regenerates unprompted.
         std::fs::write(&marker, "not a uuid\n").unwrap();
