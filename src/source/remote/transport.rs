@@ -246,15 +246,16 @@ impl Host {
         let mut child = command
             .spawn()
             .map_err(|e| self.fail(format!("cannot run ssh: {e}")))?;
+        // A command that dies before reading its script — an unreachable
+        // host, a refused connection — closes the pipe, so feeding it fails
+        // with a broken pipe. That is not the diagnosis: the command's own
+        // status and stderr are, and they are collected below regardless,
+        // so a feeding error never replaces what the command actually said.
         if let Some(script) = stdin {
             let mut pipe = child.stdin.take().expect("piped stdin");
-            let written = pipe
+            let _ = pipe
                 .write_all(script.as_bytes())
                 .and_then(|()| pipe.flush());
-            drop(pipe);
-            if let Err(e) = written {
-                return Err(self.fail(format!("cannot send the listing script: {e}")));
-            }
         }
         let output = child
             .wait_with_output()
