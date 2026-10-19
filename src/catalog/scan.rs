@@ -62,10 +62,26 @@ impl Scan {
 
     /// Assemble the whole observation: every contributed branch merged
     /// under canonical identity — routes combine, metadata comes from one
-    /// complete, shortest-route observation — in a deterministic order.
+    /// complete, shortest-route observation — then put back in listing
+    /// order. Merging sorts by identity; without the re-sort every
+    /// frontend's "first N" would be grouped by origin and agent.
     pub fn assemble(&mut self) {
         self.sessions = crate::catalog::merge::merge(std::mem::take(&mut self.sessions));
+        self.sessions.sort_unstable_by(listing_order);
     }
+}
+
+/// Running first — an attached agent is what you came to look at — then
+/// most recently updated, then a total tie-break so the order is stable.
+fn listing_order(a: &SessionSummary, b: &SessionSummary) -> std::cmp::Ordering {
+    a.liveness
+        .rank()
+        .cmp(&b.liveness.rank())
+        .then_with(|| b.updated.cmp(&a.updated))
+        .then_with(|| a.source.cmp(&b.source))
+        .then_with(|| a.id.cmp(&b.id))
+        .then_with(|| a.origin_id.cmp(&b.origin_id))
+        .then_with(|| a.preferred_route().cmp(&b.preferred_route()))
 }
 
 /// `overlay` supplies archive state for agents that have no such concept of
@@ -186,17 +202,7 @@ pub fn scan_with(
         fleet.attribute(&mut sessions[..local], OffsetDateTime::now_utc());
     }
 
-    // Running first: an attached agent is what you came to look at.
-    sessions.sort_unstable_by(|a, b| {
-        a.liveness
-            .rank()
-            .cmp(&b.liveness.rank())
-            .then_with(|| b.updated.cmp(&a.updated))
-            .then_with(|| a.source.cmp(&b.source))
-            .then_with(|| a.id.cmp(&b.id))
-            .then_with(|| a.origin_id.cmp(&b.origin_id))
-            .then_with(|| a.preferred_route().cmp(&b.preferred_route()))
-    });
+    sessions.sort_unstable_by(listing_order);
     Scan { sessions, failures }
 }
 
@@ -357,6 +363,32 @@ mod tests {
             Some(Resolver::new().resolve(dir.path())),
             "and a local row in the same scan is still resolved"
         );
+    }
+
+    #[test]
+    fn assembly_lists_running_first_then_newest_across_agents_and_origins() {
+        let at = |seconds| OffsetDateTime::from_unix_timestamp(seconds).unwrap();
+        // Identity order (origin, source, id) is the opposite of listing
+        // order here, so a merge that forgot to re-sort fails loudly.
+        let mut old = row("a-old", None, false);
+        old.source = SourceId::Codex;
+        old.updated = at(1_000);
+        let mut new = row("b-new", None, false);
+        new.updated = at(3_000);
+        let mut running = row("c-running", None, false);
+        running.updated = at(500);
+        running.liveness = Liveness::Live { pid: 1 };
+        let mut far = row("d-far", None, false);
+        far.origin_id = Some("00000000-0000-4000-8000-0000000000aa".into());
+        far.updated = at(2_000);
+
+        let mut scan = Scan {
+            sessions: vec![old, new, running, far],
+            failures: Vec::new(),
+        };
+        scan.assemble();
+        let ids: Vec<_> = scan.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["c-running", "b-new", "d-far", "a-old"]);
     }
 
     #[test]
