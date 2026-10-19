@@ -140,9 +140,10 @@ id:01a0  after:7d  before:today  cost:>1
 live:yes  archived:only  body:naming  bare words = free text
 ```
 
-`body:` needs `llm-sessions index`. Unknown keys and unreadable values become
-free text; the API reports each one in `warnings`. `today` and `yesterday`
-start at UTC midnight (the API's `tz=` moves that).
+`body:` needs `llm-sessions index`. Unknown keys, unreadable or empty values,
+and unterminated quotes become free text; the API reports each one in
+`warnings`. `today` and `yesterday` start at UTC midnight (the API's `tz=`
+moves that).
 
 ## Remote hosts
 
@@ -174,8 +175,10 @@ predates identity never created its marker: `llm-sessions hosts refresh --init
 (`--force` also replaces a valid one, rekeying the peer). HTTP peers manage
 their own marker.
 Initialization publishes complete markers atomically and preserves a concurrent
-initializer's valid identity. Surrounding whitespace is accepted; extra
-non-whitespace content makes a marker malformed and is repaired by `--init`.
+initializer's valid identity; `--init` runs take turns under `origin-id.lock`
+beside the marker, which a killed run can leave behind (the error names it).
+Surrounding whitespace is accepted; extra non-whitespace content makes a
+marker malformed and is repaired by `--init`.
 
 Use `show <id> --origin <uuid> --source <agent>` if IDs collide.
 
@@ -189,7 +192,7 @@ curl -H "Authorization: Bearer $LLMS_TOKEN" 'http://host:8787/v1/sessions?q=live
 | Route (all `GET`) | Returns |
 |---|---|
 | `/v1/healthz` | version and host, no token |
-| `/v1/hosts` | the labels `host:` can name: `local` (with its hostname), then peers |
+| `/v1/hosts` | the labels `host:` can name: `local` (with its hostname, `local: true`), then peers (`local: false`, even one named `local`) |
 | `/v1/sessions?q=<query>&limit=N&tz=+02:00` | `list --json` rows plus `status`, running first then newest; `warnings` for filters that cannot match as written; `tz` is the UTC offset calendar words use (default UTC; send `+` as `%2B`) |
 | `/v1/sessions/<id>` | one row |
 | `/v1/sessions/<id>/transcript` | `show <id> --json` |

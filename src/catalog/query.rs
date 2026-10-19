@@ -112,7 +112,17 @@ impl Query {
         };
 
         for (term, balanced) in tokenize(input) {
+            // Only a known key makes a malformed term a filter that was
+            // dropped; anything else is ordinary free text.
+            let filter = term
+                .split_once(':')
+                .is_some_and(|(key, _)| is_filter_key(&key.to_ascii_lowercase()));
             if !balanced {
+                if filter {
+                    query.warnings.push(format!(
+                        "unterminated quote in {term:?}; searched as free text"
+                    ));
+                }
                 query.add_free(&term);
                 continue;
             }
@@ -121,6 +131,11 @@ impl Query {
                 continue;
             };
             if key.is_empty() || value.is_empty() {
+                if filter {
+                    query
+                        .warnings
+                        .push(format!("empty value in {term:?}; searched as free text"));
+                }
                 query.add_free(&term);
                 continue;
             }
@@ -292,6 +307,28 @@ impl Query {
     }
 }
 
+/// Every key [`Query::parse`] reads as a filter, aliases included.
+fn is_filter_key(key: &str) -> bool {
+    matches!(
+        key,
+        "source"
+            | "agent"
+            | "ws"
+            | "workspace"
+            | "host"
+            | "machine"
+            | "model"
+            | "branch"
+            | "id"
+            | "after"
+            | "before"
+            | "cost"
+            | "live"
+            | "archived"
+            | "body"
+    )
+}
+
 fn tokenize(input: &str) -> Vec<(String, bool)> {
     let mut terms = Vec::new();
     let mut current = String::new();
@@ -428,6 +465,25 @@ mod tests {
             ]
         );
         assert_eq!(query.hosts().collect::<Vec<_>>(), ["fe"]);
+    }
+
+    #[test]
+    fn empty_and_unterminated_filters_are_reported_but_free_text_is_not() {
+        let empty = Query::parse("after: Before: plain note: :x");
+        assert_eq!(
+            empty.warnings(),
+            [
+                r#"empty value in "after:"; searched as free text"#,
+                r#"empty value in "Before:"; searched as free text"#,
+            ]
+        );
+        let unterminated = Query::parse(r#"plain after:"unfinished"#);
+        assert_eq!(
+            unterminated.warnings(),
+            [r#"unterminated quote in "after:unfinished"; searched as free text"#]
+        );
+        assert!(Query::parse(r#"title:"unfinished"#).warnings().is_empty());
+        assert!(Query::parse(r#"say "hello"#).warnings().is_empty());
     }
 
     #[test]

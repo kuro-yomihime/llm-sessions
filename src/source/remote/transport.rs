@@ -45,18 +45,19 @@ exit 0
 /// (or malformed, which locks the peer out just the same), and replace even a
 /// valid one only when `force` was asked for. Creation never clobbers — a
 /// concurrent initializer (the peer's own newer binary, say) may win, and
-/// whoever's file persisted is authoritative.
+/// whoever's file persisted is authoritative. Repair never clobbers either:
+/// runs publish one at a time under `origin-id.lock`, the malformed marker is
+/// renamed aside, and if what moved turns out to be a valid identity
+/// published since the last read, it is put back.
 const INIT_ORIGIN_SCRIPT: &str = r#"state="${XDG_STATE_HOME:-$HOME/.local/state}"
 dir="$state/llm-sessions"
 marker="$dir/origin-id"
 read_origin() {
-    origin=$(cat "$marker" 2>/dev/null) || origin=
+    origin=$(cat "${1:-$marker}" 2>/dev/null) || origin=
     # Trim surrounding whitespace only; embedded whitespace remains invalid.
     origin=${origin#"${origin%%[![:space:]]*}"}
     origin=${origin%"${origin##*[![:space:]]}"}
 }
-replace=no
-[ -e "$marker" ] && replace=yes
 read_origin
 valid() {
     case "$1" in
@@ -93,21 +94,46 @@ uuid="$a-$b-$c-$d-$e"
 mkdir -p "$dir" || { echo "origin init: cannot create $dir" >&2; exit 1; }
 # Publish complete files only. A marker created after our initial read wins.
 tmp=$(mktemp "$marker.init.XXXXXX") || exit 1
-trap 'rm -f "$tmp"' 0
-trap 'exit 1' 1 2 15
+aside="$tmp.old"
+lock="$marker.lock"
+locked=
+trap 'rm -f "$tmp" "$aside"; [ -z "$locked" ] || rmdir "$lock"' 0
+trap 'exit 1' 1 2 13 15
 if ! printf '%s\n' "$uuid" > "$tmp"; then
     echo "origin init: cannot write $tmp" >&2
     exit 1
 fi
+# Runs of this script publish one at a time, so none can move aside a
+# marker another just published. The peer's own binary only ever creates a
+# missing marker without clobbering, which needs no turn.
+tries=0
+until mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 100 ]; then
+        echo "origin init: $lock is held by another initializer; remove it if none is running" >&2
+        exit 1
+    fi
+    sleep 0.1 2>/dev/null || sleep 1
+done
+locked=yes
 read_origin
 if valid "$origin" && [ "$force" != yes ]; then
     :
-elif [ "$force" = yes ] || [ "$replace" = yes ]; then
+elif [ "$force" = yes ]; then
     mv -f "$tmp" "$marker" || exit 1
 else
+    # Rename is atomic, so whatever is moved is exactly what gets judged.
+    if mv "$marker" "$aside" 2>/dev/null; then
+        read_origin "$aside"
+        if valid "$origin"; then
+            ln "$aside" "$marker" 2>/dev/null || :
+        fi
+    fi
     ln "$tmp" "$marker" 2>/dev/null || :
 fi
 read_origin
+rmdir "$lock"
+locked=
 if ! valid "$origin"; then
     echo "origin init: $marker does not hold a UUID" >&2
     exit 1
@@ -600,7 +626,7 @@ mod tests {
         let winner = "00000000-0000-4000-8000-0000000000aa";
         // Pause at directory creation by publishing the competing winner there.
         let script = format!(
-            "mkdir() {{ command mkdir \"$@\" || return; printf '%s\\n' '{winner}' > \"$2/origin-id\"; }}\n{}",
+            "mkdir() {{ command mkdir \"$@\" || return; if [ \"$1\" = -p ]; then printf '%s\\n' '{winner}' > \"$2/origin-id\"; fi; }}\n{}",
             host.init_script(false)
         );
         let output = Command::new("/bin/sh")
@@ -615,6 +641,78 @@ mod tests {
             String::from_utf8(output.stdout).unwrap().trim(),
             format!("origin:{winner}")
         );
+    }
+
+    #[test]
+    fn repair_preserves_an_identity_published_after_its_final_read() {
+        let peer = tempfile::tempdir().unwrap();
+        let host = ssh_host("worker", None);
+        let marker = peer.path().join(".local/state/llm-sessions/origin-id");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "not a uuid\n").unwrap();
+        let winner = "00000000-0000-4000-8000-0000000000aa";
+        // The first `mv` is the repair's publication step, after every read:
+        // a concurrent initializer's valid marker lands just before it.
+        let script = format!(
+            "mv() {{ [ -n \"$raced\" ] || {{ raced=1; printf '%s\\n' '{winner}' > \"$marker\"; }}; command mv \"$@\"; }}\n{}",
+            host.init_script(false)
+        );
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("HOME", peer.path())
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(crate::federation::read_origin(peer.path()).unwrap(), winner);
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("origin:{winner}")
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(marker.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "origin-id")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn concurrent_repairs_agree_on_one_identity() {
+        let host = ssh_host("worker", None);
+        let script = host.init_script(false);
+        for _ in 0..5 {
+            let peer = tempfile::tempdir().unwrap();
+            let marker = peer.path().join(".local/state/llm-sessions/origin-id");
+            std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            std::fs::write(&marker, "not a uuid\n").unwrap();
+            let children: Vec<_> = (0..8)
+                .map(|_| {
+                    Command::new("/bin/sh")
+                        .args(["-c", &script])
+                        .env("HOME", peer.path())
+                        .env("PATH", "/usr/bin:/bin")
+                        .env_remove("XDG_STATE_HOME")
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            let reported: Vec<_> = children
+                .into_iter()
+                .map(|child| child.wait_with_output().unwrap())
+                .collect();
+            let persisted = crate::federation::read_origin(peer.path()).unwrap();
+            for output in reported {
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(
+                    String::from_utf8(output.stdout).unwrap().trim(),
+                    format!("origin:{persisted}"),
+                    "every run reports the identity that persisted"
+                );
+            }
+        }
     }
 
     #[test]

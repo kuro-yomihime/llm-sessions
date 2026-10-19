@@ -147,38 +147,33 @@ async fn healthz(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
     }))
 }
 
-/// The `host:` labels this server's rows can carry: `local` first, then
-/// every peer label, sorted. In gateway mode that is the configured peers
-/// plus labels further hops contributed; a local-only server lists just
-/// `local`, since no peer row is ever published.
-fn host_labels(snapshot: &Snapshot) -> Vec<String> {
-    let peers: std::collections::BTreeSet<&str> = snapshot
+/// The peer labels this server's rows can carry, sorted. In gateway mode
+/// that is the configured peers plus labels further hops contributed; a
+/// local-only server has none, since no peer row is ever published. This
+/// machine is never among them: a peer configured under the name `local`
+/// is still a peer, listed beside this machine, never merged into it.
+fn peer_labels(snapshot: &Snapshot) -> std::collections::BTreeSet<&str> {
+    snapshot
         .sessions
         .iter()
         .filter(|s| !s.is_local())
         .filter_map(|s| s.origin_label.as_deref())
         .chain(snapshot.peers.iter().map(String::as_str))
-        .collect();
-    std::iter::once("local")
-        .chain(peers)
-        .map(str::to_owned)
         .collect()
 }
 
-/// Which machines `host:` can name, so a client never has to guess one.
+/// Which machines `host:` can name, so a client never has to guess one:
+/// this machine first, then every peer.
 async fn hosts(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
     let snapshot = app.snapshot.borrow().clone();
-    let hosts: Vec<_> = host_labels(&snapshot)
-        .into_iter()
-        .map(|label| {
-            let local = label == "local";
-            let mut entry = json!({ "label": label, "local": local });
-            if local {
-                entry["hostname"] = json!(app.host);
-            }
-            entry
-        })
-        .collect();
+    let hosts: Vec<_> =
+        std::iter::once(json!({ "label": "local", "local": true, "hostname": app.host }))
+            .chain(
+                peer_labels(&snapshot)
+                    .into_iter()
+                    .map(|label| json!({ "label": label, "local": false })),
+            )
+            .collect();
     Json(json!({ "hosts": hosts }))
 }
 
@@ -273,7 +268,9 @@ async fn sessions(
     let mut warnings = query.warnings().to_vec();
     let mut wanted = query.hosts().peekable();
     if wanted.peek().is_some() {
-        let labels = host_labels(&snapshot);
+        let labels: Vec<&str> = std::iter::once("local")
+            .chain(peer_labels(&snapshot))
+            .collect();
         for value in wanted {
             if labels
                 .iter()
@@ -1201,6 +1198,54 @@ mod tests {
         let (_, body) = get(&app, "/v1/sessions?q=host:golden").await;
         let warning = body["warnings"][0].as_str().unwrap();
         assert!(warning.contains("host:local"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn a_peer_named_local_is_listed_as_a_peer_not_as_this_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        std::fs::write(
+            &path,
+            r#"{"hosts":[{"name":"local","url":"http://127.0.0.1:9/"}]}"#,
+        )
+        .unwrap();
+        let (config, failure) = remote::Config::load_at(&path);
+        assert_eq!(failure, None, "the loader accepts the name");
+        let Harness { app, tx, .. } = harness();
+        tx.send(Arc::new(Snapshot {
+            peers: config.hosts.iter().map(|host| host.name.clone()).collect(),
+            ..snapshot("[1]")
+        }))
+        .unwrap();
+
+        assert_eq!(
+            get(&app, "/v1/hosts").await.1["hosts"],
+            json!([
+                {"label": "local", "local": true, "hostname": "golden"},
+                {"label": "local", "local": false},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_and_unterminated_filters_are_warned_about() {
+        let Harness { app, .. } = harness();
+        for (q, warning) in [
+            (
+                "after:",
+                r#"empty value in "after:"; searched as free text"#,
+            ),
+            (
+                "after:%22unfinished",
+                r#"unterminated quote in "after:unfinished"; searched as free text"#,
+            ),
+        ] {
+            let (status, body) = get(&app, &format!("/v1/sessions?q={q}")).await;
+            assert_eq!(status, StatusCode::OK, "{q}");
+            assert_eq!(body["warnings"], json!([warning]), "{q}");
+        }
+        let (_, body) = get(&app, "/v1/sessions?q=plain%20%22words").await;
+        assert_eq!(body["warnings"], json!([]), "free text stays quiet");
     }
 
     #[tokio::test]
