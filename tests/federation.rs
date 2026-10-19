@@ -789,12 +789,7 @@ fn hosts_add_of_an_unreachable_peer_stays_unpinned_and_keeps_an_existing_pin() {
     let updated = graph.command("L", &["hosts", "add", "worker", "unreachable"]);
     assert!(updated.status.success());
     let config: Value = serde_json::from_slice(
-        &fs::read(
-            graph
-                .home("L")
-                .join(".config/llm-sessions/hosts.json"),
-        )
-        .unwrap(),
+        &fs::read(graph.home("L").join(".config/llm-sessions/hosts.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(config["hosts"][0]["origin_id"], Graph::origin("B"));

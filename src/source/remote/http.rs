@@ -111,8 +111,7 @@ impl Host {
 
     fn http_probed(&self) -> std::result::Result<&str, String> {
         let origin = self.http_observed_origin()?;
-        self.check_origin(origin)
-            .map_err(Error::bare)?;
+        self.check_origin(origin).map_err(Error::bare)?;
         Ok(origin)
     }
 
