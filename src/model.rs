@@ -335,6 +335,19 @@ impl AccessRoute {
             .then_with(|| self.cmp(other))
     }
 }
+/// The exact process and tmux pane serving a live session, from an open
+/// descriptor on that very session file — never from a cwd guess.
+///
+/// OMP only for now: it is the agent measured to keep an fd on its
+/// transcript. A pane is required because delivery speaks tmux; a process
+/// outside tmux is live but unowned. Rows that are merely inferred
+/// (`Liveness::Probably`) never carry one — a confident lie is worse than
+/// an admitted guess.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveOwner {
+    pub pid: u32,
+    pub pane: crate::runtime::tmux::Pane,
+}
 
 /// Tier-1 row. Producing one MUST NOT require parsing message bodies.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -380,6 +393,10 @@ pub struct SessionSummary {
     /// Filled in by [`crate::catalog::scan`], not by the source: whether a process is
     /// attached to this session right now.
     pub liveness: Liveness,
+    /// The exact owning process and its tmux pane, when liveness is an fd
+    /// match on this very file and the owner runs inside tmux. OMP only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_owner: Option<LiveOwner>,
 }
 
 impl SessionSummary {
@@ -412,6 +429,7 @@ impl SessionSummary {
             change: None,
             size_bytes: None,
             liveness: Liveness::default(),
+            live_owner: None,
         }
     }
 

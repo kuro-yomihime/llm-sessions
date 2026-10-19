@@ -92,6 +92,10 @@ fn observation(a: &SessionSummary, b: &SessionSummary) -> Ordering {
         .then_with(|| {
             (a.liveness.rank(), a.liveness.pid()).cmp(&(b.liveness.rank(), b.liveness.pid()))
         })
+        // An observation that names the owning process and pane is the more
+        // complete one at equal distance, so the origin's own claim survives
+        // a peer's duller echo of the same row — never the reverse.
+        .then_with(|| b.live_owner.is_some().cmp(&a.live_owner.is_some()))
         .then_with(|| a.routes.cmp(&b.routes))
 }
 
@@ -182,6 +186,60 @@ mod tests {
         assert_eq!(merged[0].updated, OffsetDateTime::UNIX_EPOCH);
         assert_eq!(merged[0].routes.len(), 2);
         assert_eq!(merged[0].preferred_route().unwrap().hops.len(), 1);
+    }
+
+    #[test]
+    fn a_local_owner_survives_a_remote_observation_of_the_same_row() {
+        // A scan stamps this machine's own rows with its origin, so the
+        // peer's echo of one carries the same key — that is the collision
+        // the merge must resolve in the local observation's favour.
+        let mut local = row(Some("B"), Vec::new());
+        local.liveness = crate::model::Liveness::Live { pid: 42 };
+        local.live_owner = Some(crate::model::LiveOwner {
+            pid: 42,
+            pane: crate::runtime::tmux::Pane {
+                address: "work:0.1".into(),
+                session: "work".into(),
+                window: "0".into(),
+                pid: 900,
+                command: "omp".into(),
+                path: "/w".into(),
+            },
+        });
+        let mut remote = row(Some("B"), vec![hop("B", "beta")]);
+        remote.liveness = crate::model::Liveness::Live { pid: 42 };
+        remote.updated += time::Duration::days(1);
+
+        let merged = merge(vec![remote, local]);
+        assert_eq!(merged.len(), 1);
+        assert!(
+            merged[0].live_owner.is_some(),
+            "this machine's own exact join outranks a peer's echo of it"
+        );
+    }
+
+    #[test]
+    fn equal_distance_prefers_the_observation_that_names_an_owner() {
+        let mut owned = row(Some("B"), vec![hop("B", "beta")]);
+        owned.liveness = crate::model::Liveness::Live { pid: 42 };
+        owned.live_owner = Some(crate::model::LiveOwner {
+            pid: 42,
+            pane: crate::runtime::tmux::Pane {
+                address: "work:0.1".into(),
+                session: "work".into(),
+                window: "0".into(),
+                pid: 900,
+                command: "omp".into(),
+                path: "/w".into(),
+            },
+        });
+        let mut plain = row(Some("B"), vec![hop("B", "beta")]);
+        // Same liveness, same distance: only the named owner can break the
+        // tie, which is exactly the case the tiebreak exists for.
+        plain.liveness = crate::model::Liveness::Live { pid: 42 };
+        let merged = merge(vec![plain.clone(), owned]);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].live_owner.is_some());
     }
 
     #[test]

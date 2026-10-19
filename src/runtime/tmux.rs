@@ -10,8 +10,10 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use serde::{Deserialize, Serialize};
+
 /// One tmux pane, addressed the way `-t` expects.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pane {
     /// `session:window.pane`, ready to pass to `-t`.
     pub address: String,

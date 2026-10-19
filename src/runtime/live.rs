@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::model::{Liveness, SessionSummary, SourceId};
+use crate::model::{LiveOwner, Liveness, SessionSummary, SourceId};
 use crate::runtime::procfs::{Proc, TcpSocket, socket_inode};
 use crate::runtime::tmux::{self, Pane};
 
@@ -201,6 +201,18 @@ impl Fleet {
                     && claimed_session.insert(index)
                 {
                     sessions[index].liveness = Liveness::Live { pid: process.pid };
+                    // Only OMP is measured to keep its transcript open, and
+                    // only a tmux pane can receive a delivered message, so
+                    // an owner is stated in exactly that combination. Every
+                    // other live row stays live without one.
+                    if sessions[index].source == SourceId::Omp
+                        && let Some(pane) = &process.pane
+                    {
+                        sessions[index].live_owner = Some(LiveOwner {
+                            pid: process.pid,
+                            pane: pane.clone(),
+                        });
+                    }
                     claimed_pid.insert(process.pid);
                     break;
                 }
@@ -274,6 +286,35 @@ impl Fleet {
             } else {
                 Liveness::Stale
             };
+        }
+    }
+}
+
+/// Hand-built processes, so route decisions can be tested without a
+/// fixture `/proc` tree.
+#[cfg(test)]
+impl Process {
+    pub(crate) fn stub(pid: u32, agent: SourceId, pane: Option<Pane>) -> Self {
+        Self {
+            pid,
+            agent,
+            cwd: None,
+            servers: Vec::new(),
+            open_sessions: Vec::new(),
+            pane,
+            activity: Activity::default(),
+            ticks: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Fleet {
+    pub(crate) fn of(processes: Vec<Process>) -> Self {
+        Self {
+            processes,
+            previous: HashMap::new(),
+            sampled_at: None,
         }
     }
 }
@@ -409,6 +450,7 @@ mod tests {
             subagent: false,
             change: None,
             liveness: Liveness::Stale,
+            live_owner: None,
             origin_label: None,
             origin_id: None,
             routes: Vec::new(),
@@ -451,6 +493,105 @@ mod tests {
         fleet.attribute(&mut sessions, now());
         assert_eq!(sessions[1].liveness, Liveness::Live { pid: 7 });
         assert_ne!(sessions[0].liveness, Liveness::Live { pid: 7 });
+    }
+
+    fn pane_of(pid: u32) -> Pane {
+        Pane {
+            address: format!("work:0.{pid}"),
+            session: "work".into(),
+            window: "0".into(),
+            pid,
+            command: "omp".into(),
+            path: PathBuf::from("/w"),
+        }
+    }
+
+    /// The owner is the whole point of the exact join: not just that the
+    /// session is live, but which process in which pane is serving it.
+    #[test]
+    fn an_exact_descriptor_in_tmux_states_its_owner() {
+        let mut sessions = vec![
+            session(SourceId::Omp, "old", "/w", "/s/old.jsonl", 999_000),
+            session(SourceId::Omp, "held", "/w", "/s/held.jsonl", 100),
+        ];
+        let mut owner = process(7, SourceId::Omp, "/w", &["/s/held.jsonl"]);
+        owner.pane = Some(pane_of(99));
+        fleet_of(vec![owner]).attribute(&mut sessions, now());
+        assert_eq!(
+            sessions[1].live_owner,
+            Some(LiveOwner {
+                pid: 7,
+                pane: pane_of(99),
+            })
+        );
+        assert!(
+            sessions[0].live_owner.is_none(),
+            "an unrelated session is never assigned an owner"
+        );
+    }
+
+    /// Live without a pane is still the truth — the process just runs
+    /// outside tmux, so there is nothing to deliver to and no owner.
+    #[test]
+    fn a_live_process_outside_tmux_has_no_owner() {
+        let mut sessions = vec![session(SourceId::Omp, "held", "/w", "/s/held.jsonl", 100)];
+        fleet_of(vec![process(7, SourceId::Omp, "/w", &["/s/held.jsonl"])])
+            .attribute(&mut sessions, now());
+        assert_eq!(sessions[0].liveness, Liveness::Live { pid: 7 });
+        assert!(sessions[0].live_owner.is_none());
+    }
+
+    /// A cwd-and-recency match is a guess about the *session*, and would be
+    /// a further guess about the pane; it must not manufacture an owner.
+    #[test]
+    fn an_inferred_session_never_carries_an_owner() {
+        let mut sessions = vec![session(
+            SourceId::Omp,
+            "recent",
+            "/w",
+            "/s/r.jsonl",
+            999_900,
+        )];
+        let mut guess = process(7, SourceId::Omp, "/w", &[]);
+        guess.pane = Some(pane_of(99));
+        fleet_of(vec![guess]).attribute(&mut sessions, now());
+        assert_eq!(sessions[0].liveness, Liveness::Probably { pid: 7 });
+        assert!(sessions[0].live_owner.is_none());
+    }
+
+    #[test]
+    fn a_live_subagent_lends_its_parent_liveness_but_not_delivery_ownership() {
+        for locator in [
+            crate::model::Locator::File {
+                path: "/s/parent.jsonl".into(),
+            },
+            crate::model::Locator::Row {
+                db: "/s/parent.db".into(),
+                id: "parent".into(),
+            },
+        ] {
+            let mut parent = session(SourceId::Omp, "parent", "/w", "/s/parent.jsonl", 1);
+            parent.locator = locator;
+            let mut child = session(SourceId::Omp, "kid", "/w", "/s/parent/Scout.jsonl", 999_900);
+            child.subagent = true;
+            child.parent = Some("parent".into());
+            let mut sessions = vec![parent, child];
+            let mut owner = process(5, SourceId::Omp, "/w", &["/s/parent/Scout.jsonl"]);
+            owner.pane = Some(pane_of(98));
+            fleet_of(vec![owner]).attribute(&mut sessions, now());
+            assert_eq!(sessions[0].liveness, Liveness::Live { pid: 5 });
+            assert!(
+                sessions[0].live_owner.is_none(),
+                "a child's descriptor cannot authorize delivery to the parent"
+            );
+            assert_eq!(
+                sessions[1].live_owner,
+                Some(LiveOwner {
+                    pid: 5,
+                    pane: pane_of(98)
+                })
+            );
+        }
     }
 
     #[test]

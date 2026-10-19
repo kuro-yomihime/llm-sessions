@@ -24,6 +24,7 @@ fn session(source: SourceId, id: &str, workspace: &str, secs: i64) -> SessionSum
         subagent: false,
         change: None,
         liveness: Liveness::Stale,
+        live_owner: None,
         origin_label: None,
         origin_id: None,
         routes: Vec::new(),
@@ -1512,6 +1513,7 @@ fn a_remote_row_is_read_through_its_host_not_the_local_filesystem() {
 /// a file. With `live`, it can also reach a running instance.
 struct Recorder {
     out: PathBuf,
+    source: SourceId,
     live: bool,
 }
 
@@ -1534,16 +1536,16 @@ impl Recorder {
 
 impl Source for Recorder {
     fn id(&self) -> SourceId {
-        SourceId::Omp
+        self.source
     }
     fn roots(&self) -> Vec<PathBuf> {
         Vec::new()
     }
     fn list(&self) -> crate::error::Result<Vec<SessionSummary>> {
-        Ok(vec![recent(SourceId::Omp, "a", "", 1)])
+        Ok(vec![recent(self.source, "a", "", 1)])
     }
     fn open(&self, _locator: &Locator) -> crate::error::Result<Transcript> {
-        Ok(Transcript::new("a", SourceId::Omp))
+        Ok(Transcript::new("a", self.source))
     }
     fn insert_command(&self, id: &str, message: &str) -> Option<Vec<String>> {
         Some(self.record(&format!("resume {id}"), message))
@@ -1559,6 +1561,7 @@ fn recorder_app(out: &Path, live: bool, session: SessionSummary, fleet: Fleet) -
         Path::new("/home/u"),
         vec![Box::new(Recorder {
             out: out.to_path_buf(),
+            source: session.source,
             live,
         })],
         vec![session],
@@ -1651,12 +1654,40 @@ fn insert_mode_hands_the_message_to_the_agent_verbatim() {
 #[test]
 fn insert_mode_reaches_a_running_session_through_its_owner() {
     let out = std::env::temp_dir().join(format!("llm-sessions-insert-live-{}", std::process::id()));
-    let mut session = recent(SourceId::Omp, "a", "", 1);
+    let mut session = recent(SourceId::OpenCode, "a", "", 1);
     session.liveness = Liveness::Probably { pid: 42 };
-    let fleet = fleet_with(42, "omp --model x", Some(49374));
+    let fleet = fleet_with(42, "opencode --model x", Some(49374));
     let mut app = recorder_app(&out, true, session, fleet);
     send_and_wait(&mut app, "hi");
     assert_eq!(take(&out), "a via [49374]|hi");
+}
+
+#[test]
+fn insert_mode_opens_a_prompt_for_an_exact_omp_owner_in_tmux() {
+    let mut session = recent(SourceId::Omp, "a", "", 1);
+    session.liveness = Liveness::Live { pid: 42 };
+    let pane = crate::runtime::tmux::Pane {
+        address: "work:0.0".into(),
+        session: "work".into(),
+        window: "0".into(),
+        pid: 42,
+        command: "omp".into(),
+        path: "/w".into(),
+    };
+    let fleet = Fleet::of(vec![crate::runtime::live::Process::stub(
+        42,
+        SourceId::Omp,
+        Some(pane),
+    )]);
+    let mut app = recorder_app(Path::new("/unused"), false, session, fleet);
+    app.handle(Action::StartInsert);
+    assert_eq!(
+        app.prompt(),
+        &Prompt::Insert {
+            target: app.selected_session().unwrap().identity(),
+            text: String::new(),
+        }
+    );
 }
 
 #[test]
@@ -1671,7 +1702,7 @@ fn insert_mode_refuses_sessions_it_must_not_write_behind() {
         (open, false, "is open in pid 42"),
         // An inferred owner may hold it in memory just the same.
         (maybe, false, "may be open in pid 42"),
-        (remote, false, "local sessions only"),
+        (remote, false, "no origin id"),
         (stale(), true, "--read-only"),
     ] {
         // This agent has no way into a running instance.

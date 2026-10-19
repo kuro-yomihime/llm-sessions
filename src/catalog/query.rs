@@ -415,6 +415,7 @@ mod tests {
                 path: PathBuf::from("session.jsonl"),
             },
             liveness: Liveness::Stale,
+            live_owner: None,
             origin_label: None,
             origin_id: None,
             routes: Vec::new(),
