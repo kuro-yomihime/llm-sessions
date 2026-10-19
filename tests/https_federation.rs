@@ -35,7 +35,9 @@ proxy = None
 try:
     deadline = time.monotonic()+15
     while time.monotonic() < deadline:
-        match = re.search(r'on http://(127\.0\.0\.1:\d+)',log.read_text())
+        # Ignore an incomplete readiness line, including a partial port.
+        complete = log.read_text().rpartition('\n')[0]
+        match = re.search(r'on http://(127\.0\.0\.1:\d+)',complete)
         if match: break
         assert backend.poll() is None, log.read_text()
         time.sleep(.025)

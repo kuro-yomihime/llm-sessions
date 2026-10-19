@@ -117,7 +117,11 @@ fn spawn_ready(mut cmd: Command, log: &Path) -> Server {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let text = fs::read_to_string(log).unwrap();
+        // stderr may be read between writes within the readiness line.
         if let Some(address) = text
+            .rsplit_once('\n')
+            .map(|(complete, _)| complete)
+            .unwrap_or_default()
             .split("on http://")
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
