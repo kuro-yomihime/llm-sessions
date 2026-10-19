@@ -445,6 +445,7 @@ fn resume_route(session: &SessionSummary) -> Option<&AccessRoute> {
 }
 
 impl Host {
+    /// Require a configured origin pin that matches the observed identity.
     fn check_origin(&self, observed: &str) -> Result<()> {
         match self.config.origin_id.as_deref() {
             Some(expected) if expected == observed => Ok(()),
@@ -457,6 +458,11 @@ impl Host {
                 self.name()
             ))),
         }
+    }
+
+    // A remedy from a peer refers to its hosts.json, not this observer's.
+    fn reported_failure(&self, failure: &str) -> String {
+        format!("{} reports: {failure}", self.name())
     }
 
     /// Read the authenticated endpoint's identity for an explicit trust reset.
@@ -779,9 +785,14 @@ impl Host {
         for session in &mut scan.sessions {
             self.attach_route(session, &probe.origin_id)?;
         }
+        let failures = scan
+            .failures
+            .into_iter()
+            .map(|failure| self.reported_failure(&failure))
+            .collect();
         Ok(Scan {
             sessions: scan.sessions,
-            failures: scan.failures,
+            failures,
         })
     }
 

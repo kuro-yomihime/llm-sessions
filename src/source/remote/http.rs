@@ -20,7 +20,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 
 use crate::catalog::scan::Scan;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::federation::{Capabilities, DiscoveryContext, FederationScan, valid_origin};
 use crate::model::{RouteHop, SessionSummary, Transcript, normalize_origin};
 use crate::source::remote::{
@@ -93,7 +93,7 @@ impl Host {
             .get_or_init(|| {
                 let capabilities: Capabilities = self
                     .http_get_json("/v1/federation/capabilities", &[])
-                    .map_err(|error| error.to_string())?;
+                    .map_err(Error::bare)?;
                 if capabilities.version != crate::federation::PROTOCOL_VERSION {
                     return Err(format!(
                         "federation protocol version {} is not supported",
@@ -112,7 +112,7 @@ impl Host {
     fn http_probed(&self) -> std::result::Result<&str, String> {
         let origin = self.http_observed_origin()?;
         self.check_origin(origin)
-            .map_err(|error| error.to_string())?;
+            .map_err(Error::bare)?;
         Ok(origin)
     }
 
@@ -134,9 +134,14 @@ impl Host {
         for session in &mut scan.sessions {
             self.attach_route(session, origin)?;
         }
+        let failures = scan
+            .failures
+            .into_iter()
+            .map(|failure| self.reported_failure(&failure))
+            .collect();
         Ok(Scan {
             sessions: scan.sessions,
-            failures: scan.failures,
+            failures,
         })
     }
 

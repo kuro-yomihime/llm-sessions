@@ -9,7 +9,8 @@ line here when a module is named after a concept not yet listed.
 - **Origin** — the host/account session namespace where a session lives.
   Its stable identity is shared by every observer and access method.
 - **Origin pin** — a configured peer's explicitly enrolled UUID. Remote access
-  rejects missing or mismatched pins; `hosts refresh` deliberately resets
+  rejects missing or mismatched pins; `hosts add` enrolls unpinned peers and
+  preserves existing pins on updates; `hosts refresh` deliberately resets
   trust, and `--init` first creates the peer's own marker if it does not
   exist — over its connection, for peers whose binary predates origin
   identity.

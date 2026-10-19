@@ -178,6 +178,8 @@ pub struct SourcesArgs {
 #[derive(Debug, Clone, Subcommand)]
 pub enum HostsCommand {
     /// Add a host, or update an existing one of the same name.
+    /// Enroll unpinned peers automatically; existing pins require a matching
+    /// identity. Use hosts refresh to deliberately replace a pin.
     Add(AddHostArgs),
     /// Remove a host by name.
     Remove { name: String },

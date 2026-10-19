@@ -130,7 +130,7 @@ pub(super) fn add(home: &Path, args: super::args::AddHostArgs) -> Result<()> {
             got: name.clone(),
         });
     }
-    let entry = match remote::Transport::from_parts(ssh, url, remote_home, token_env) {
+    let mut entry = match remote::Transport::from_parts(ssh, url, remote_home, token_env) {
         Ok(transport) => remote::HostConfig {
             name,
             transport,
@@ -155,13 +155,42 @@ pub(super) fn add(home: &Path, args: super::args::AddHostArgs) -> Result<()> {
     if let Some(failure) = failure {
         eprintln!("llm-sessions: {failure} (rewriting the file)");
     }
-    let updated = config.hosts.iter().any(|kept| kept.name == entry.name);
-    config.hosts.retain(|kept| kept.name != entry.name);
+    let previous = config.hosts.iter().find(|kept| kept.name == entry.name);
+    let updated = previous.is_some();
+    entry.origin_id = previous.and_then(|kept| kept.origin_id.clone());
     let name = entry.name.clone();
+    let peer = remote::Host::new(entry.clone());
+    let status = match peer.observed_origin() {
+        Ok(origin) => {
+            // Only an explicit refresh may reset an existing pin.
+            if let Some(expected) = entry.origin_id.as_deref()
+                && expected != origin
+            {
+                return Err(Error::Remote {
+                    host: name.clone(),
+                    message: format!(
+                        "origin mismatch: expected {expected}, received {origin}; hosts.json was not changed; \
+                         verify the intended peer. `llm-sessions hosts refresh {name}` re-pins only the saved destination; \
+                         to accept a new destination, use `hosts remove` followed by `hosts add`"
+                    ),
+                });
+            }
+            entry.origin_id = Some(origin.to_owned());
+            format!("enrolled {origin}")
+        }
+        Err(error) => {
+            eprintln!("llm-sessions: {error}");
+            match entry.origin_id.as_deref() {
+                Some(origin) => format!("existing pin {origin} retained; probe failed"),
+                None => "saved unpinned; enrollment failed".to_owned(),
+            }
+        }
+    };
+    config.hosts.retain(|kept| kept.name != entry.name);
     config.hosts.push(entry);
     config.save(home)?;
     emit(&format!(
-        "{} {} ({} hosts total)",
+        "{} {} — {status} ({} hosts total)",
         if updated { "updated" } else { "added" },
         name,
         config.hosts.len()

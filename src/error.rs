@@ -48,6 +48,18 @@ pub enum Error {
     Serve(String),
 }
 
+impl Error {
+    /// The message without this variant's own context — for a [`Error::Remote`],
+    /// without the host name a caller may re-add. Stringly layers under
+    /// `source::remote` use this to avoid `host: host: message` doubling.
+    pub fn bare(self) -> String {
+        match self {
+            Self::Remote { message, .. } => message,
+            other => other.to_string(),
+        }
+    }
+}
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub fn io(path: impl Into<PathBuf>) -> impl FnOnce(std::io::Error) -> Error {

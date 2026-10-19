@@ -668,7 +668,7 @@ fn pinned_ssh_identity_requires_explicit_refresh_and_failed_refresh_keeps_pin() 
 }
 
 #[test]
-fn an_unpinned_ssh_peer_is_enrolled_only_by_hosts_refresh() {
+fn listing_does_not_enroll_an_unpinned_ssh_peer() {
     let graph = Graph::new();
     graph.host("L", &[("worker", "B", "auto")]);
     graph.host("B", &[]);
@@ -690,6 +690,115 @@ fn an_unpinned_ssh_peer_is_enrolled_only_by_hosts_refresh() {
         rows[0].origin_id.as_deref(),
         Some(Graph::origin("B").as_str())
     );
+}
+
+#[test]
+fn forwarded_failures_name_the_peer_that_reported_them() {
+    let graph = Graph::new();
+    graph.host("L", &[("worker", "B", "auto")]);
+    graph.host("B", &[("leaf", "C", "auto")]);
+    graph.host("C", &[]);
+    graph.session("C", "leaf-session");
+    let path = graph.home("B").join(".config/llm-sessions/hosts.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["hosts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("origin_id");
+    fs::write(&path, config.to_string()).unwrap();
+    let (rows, failures) = graph.list("L");
+    assert!(rows.is_empty());
+    // The remedy is written for B's own hosts.json; the label must say so.
+    assert!(
+        failures.contains("worker reports: leaf: origin not enrolled"),
+        "{failures}"
+    );
+}
+
+#[test]
+fn hosts_add_enrolls_the_peer_immediately() {
+    let graph = Graph::new();
+    graph.host("L", &[]);
+    graph.host("B", &[]);
+    graph.session("B", "remote-session");
+    let added = graph.command("L", &["hosts", "add", "worker", "B"]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let path = graph.home("L").join(".config/llm-sessions/hosts.json");
+    let config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(config["hosts"][0]["origin_id"], Graph::origin("B"));
+    let (rows, _) = graph.list("L");
+    assert_eq!(
+        rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["remote-session"]
+    );
+}
+
+#[test]
+fn hosts_add_preserves_existing_trust_until_explicit_refresh() {
+    let graph = Graph::new();
+    graph.host("L", &[("worker", "B", "auto")]);
+    graph.host("B", &[]);
+    graph.host("C", &[]);
+    let path = graph.home("L").join(".config/llm-sessions/hosts.json");
+
+    let updated = graph.command("L", &["hosts", "add", "worker", "B", "--source", "omp"]);
+    assert!(updated.status.success());
+    let before = fs::read(&path).unwrap();
+    fs::write(
+        graph.home("B").join(".local/state/llm-sessions/origin-id"),
+        Graph::origin("C"),
+    )
+    .unwrap();
+
+    // Neither a changed endpoint identity nor a different destination may
+    // silently reset an existing host's trust while updating its settings.
+    for destination in ["B", "C"] {
+        let denied = graph.command(
+            "L",
+            &["hosts", "add", "worker", destination, "--source", "codex"],
+        );
+        assert!(!denied.status.success());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    let refreshed = graph.command("L", &["hosts", "refresh", "worker"]);
+    assert!(refreshed.status.success());
+    let updated = graph.command("L", &["hosts", "add", "worker", "B", "--source", "codex"]);
+    assert!(updated.status.success());
+    let config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(config["hosts"][0]["origin_id"], Graph::origin("C"));
+    assert_eq!(config["hosts"][0]["sources"], json!(["codex"]));
+}
+
+#[test]
+fn hosts_add_of_an_unreachable_peer_stays_unpinned_and_keeps_an_existing_pin() {
+    let graph = Graph::new();
+    graph.host("L", &[]);
+    let added = graph.command("L", &["hosts", "add", "worker", "unreachable"]);
+    assert!(added.status.success());
+    let path = graph.home("L").join(".config/llm-sessions/hosts.json");
+    let config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(config["hosts"][0]["origin_id"], Value::Null);
+
+    // Re-adding a pinned host while it is down must not drop the pin.
+    let graph = Graph::new();
+    graph.host("L", &[("worker", "B", "auto")]);
+    let updated = graph.command("L", &["hosts", "add", "worker", "unreachable"]);
+    assert!(updated.status.success());
+    let config: Value = serde_json::from_slice(
+        &fs::read(
+            graph
+                .home("L")
+                .join(".config/llm-sessions/hosts.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["hosts"][0]["origin_id"], Graph::origin("B"));
+    assert_eq!(config["hosts"][0]["ssh"], "unreachable");
 }
 
 #[test]

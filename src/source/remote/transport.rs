@@ -255,10 +255,7 @@ impl Host {
                 // The probe travels on stdin like the listing script: ssh
                 // hands argv to the remote login shell for re-parsing, and
                 // this script's quoting would not survive that round trip.
-                let raw = self.ssh_script(&self.probe_script()).map_err(|e| match e {
-                    Error::Remote { message, .. } => message,
-                    other => other.to_string(),
-                })?;
+                let raw = self.ssh_script(&self.probe_script()).map_err(Error::bare)?;
                 let mut reported = None;
                 let mut llm_sessions = None;
                 let mut sqlite3 = false;

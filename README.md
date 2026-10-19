@@ -167,8 +167,16 @@ Configure in `$XDG_CONFIG_HOME/llm-sessions/hosts.json`, or via
 **Identity.** Each machine has a UUID at
 `$XDG_STATE_HOME/llm-sessions/origin-id`, created on first run
 (`llm-sessions origin --init` to do it explicitly). Sessions reached by several
-routes are merged by `(origin, source, id)`. Peers are pinned by UUID; run
-`llm-sessions hosts refresh <name>` (or `--all`) to enroll or re-pin. Keep the file across
+routes are merged by `(origin, source, id)`. Peers are pinned by UUID:
+`hosts add` enrolls unpinned hosts automatically. Updates preserve existing
+pins: an identity mismatch rejects the update without changing `hosts.json`.
+`hosts refresh` probes only the saved destination. To accept a different
+destination with a different identity, explicitly remove and re-add the host.
+A failed probe still saves the host settings, retaining any existing pin;
+otherwise the host remains unpinned. The output distinguishes these states
+and preserves the specific failure's repair instructions. Run
+`llm-sessions hosts refresh <name>` (or `--all`) to enroll or deliberately
+re-pin later. Keep the origin-id file across
 upgrades; give cloned machines a new one. A peer whose own `llm-sessions`
 predates identity never created its marker: `llm-sessions hosts refresh --init
 <name>` creates it on the peer over ssh — no upgrade needed — then enrolls it
