@@ -197,6 +197,21 @@ impl Host {
         }
     }
 
+    /// The live-owner inventory script, exported into a configured home's
+    /// namespace exactly as the probe script is. The script itself reads
+    /// only absolute `/proc` paths and the user's own tmux socket, so the
+    /// environment matters only for symmetry with the listing channel.
+    pub(super) fn owner_inventory_script(&self) -> String {
+        match self.configured_home() {
+            Some(home) => {
+                let environment = home_environment(home);
+                let assignments = shell_command(environment.iter().map(String::as_str));
+                format!("export {assignments}\n{OWNER_INVENTORY_SCRIPT}")
+            }
+            None => OWNER_INVENTORY_SCRIPT.to_owned(),
+        }
+    }
+
     /// The origin-init script, with `force` bound and a configured home's
     /// namespace exported ahead of it, exactly as the probe script does.
     fn init_script(&self, force: bool) -> String {
@@ -475,6 +490,58 @@ pub(super) fn missing_sqlite3_script(home: &str, agent: &str, db: &str) -> Strin
     format!("if [ -e {db} ]; then printf 'M\\t{agent}\\n'; fi\n")
 }
 
+/// One bounded inventory of the host's own live owners, run over SSH on
+/// stdin like every other script: `P\t<pid>\t<pane-pid>\t<path>` per open
+/// OMP transcript fd, `T\t<session>\t<window>\t<pane>\t<pid>\t<command>\t<path>`
+/// per tmux pane. Pure POSIX `sh` plus `tmux`/`awk`/`tr`/`readlink`, so a
+/// peer needs no `llm-sessions` binary of any version — which is the point:
+/// a shell-only host and an old-binary host are enriched the same way.
+///
+/// Every failure is silence, never an error: no tmux server, an unreadable
+/// `/proc` (not the login user's processes), a busybox without a utility —
+/// each degrades to "no owner recorded" without costing the listing.
+/// `agent_of`'s exclusions are mirrored so `omp __omp_worker…` helpers and
+/// `omp daemon` brokers, which own no session, claim none here either.
+/// A pane claim rides the same ancestry walk `pane_for` uses — bounded at
+/// 32 hops, each stat line split after the last `)` because a comm may
+/// contain one — so a raced or malformed read claims no pane instead of
+/// spinning.
+const OWNER_INVENTORY_SCRIPT: &str = r#"panes=$(tmux list-panes -a -F '#{session_name}	#{window_index}	#{pane_index}	#{pane_pid}	#{pane_current_command}	#{pane_current_path}' 2>/dev/null) || panes=''
+if [ -n "$panes" ]; then printf '%s\n' "$panes" | awk -F'\t' 'NF >= 6 { printf "T\t%s\t%s\t%s\t%s\t%s\t%s", $1, $2, $3, $4, $5, $6; for (i = 7; i <= NF; i++) printf "\t%s", $i; printf "\n" }'; fi
+panepids=" $(tmux list-panes -a -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ')"
+for d in $(grep -l -a -- omp /proc/[0-9]*/cmdline 2>/dev/null); do
+  [ -r "$d" ] || continue
+  pid=${d#/proc/}
+  pid=${pid%/cmdline}
+  cmd=$(tr '\0' ' ' < "$d" 2>/dev/null) || continue
+  [ -n "$cmd" ] || continue
+  case " $cmd " in *" __omp_worker"*|*" daemon "*) continue ;; esac
+  set -- $cmd
+  argv0=${1##*/}
+  [ "$argv0" = "omp" ] || continue
+  p=$pid
+  panepid=0
+  hops=0
+  while [ "$hops" -lt 32 ]; do
+    hops=$((hops + 1))
+    case "$panepids" in *" $p "*) panepid=$p; break ;; esac
+    line=$(cat "/proc/$p/stat" 2>/dev/null) || break
+    rest=${line##*) }
+    ppid=${rest#* }
+    ppid=${ppid%% *}
+    case "$ppid" in ''|*[!0-9]*) break ;; esac
+    [ "$ppid" -gt 1 ] || break
+    [ "$ppid" -ne "$p" ] || break
+    p=$ppid
+  done
+  for fd in /proc/$pid/fd/*; do
+    [ -L "$fd" ] || continue
+    target=$(readlink "$fd" 2>/dev/null) || continue
+    case "$target" in */.omp/agent/sessions/*) printf 'P\t%s\t%s\t%s\n' "$pid" "$panepid" "$target" ;; esac
+  done
+done
+exit 0"#;
+
 /// Read one session's rows on the host: each named SELECT becomes one
 /// `R\t<name>\t<base64 json>` record, so only that session crosses the
 /// wire, never the database. A missing database emits nothing.
@@ -498,6 +565,65 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn owner_inventory_resolves_a_process_name_containing_a_parenthesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join(".omp/agent/sessions/project/session.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, "{}").unwrap();
+        let program = dir.path().join("omp) S 9999");
+        std::fs::copy("/bin/sleep", &program).unwrap();
+        let mut agent = Command::new("/bin/bash")
+            .args(["-c", "exec -a omp \"$1\" 60", "agent"])
+            .arg(&program)
+            .stdin(std::fs::File::open(&session).unwrap())
+            .spawn()
+            .unwrap();
+        let tmux = dir.path().join("tmux");
+        std::fs::write(
+            &tmux,
+            r#"#!/bin/sh
+for arg; do :; done
+if [ "$arg" = '#{pane_pid}' ]; then
+    printf '%s\n' "$TEST_PANE_PID"
+else
+    printf 'work\t0\t0\t%s\tomp\t/project\n' "$TEST_PANE_PID"
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::read(format!("/proc/{}/comm", agent.id())).unwrap_or_default()
+            != b"omp) S 9999\n"
+        {
+            if std::time::Instant::now() >= deadline {
+                let _ = agent.kill();
+                let _ = agent.wait();
+                panic!("agent did not exec");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let output = Command::new("/bin/sh")
+            .args(["-c", OWNER_INVENTORY_SCRIPT])
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .env("TEST_PANE_PID", std::process::id().to_string())
+            .output()
+            .unwrap();
+        let pid = agent.id();
+        let _ = agent.kill();
+        let _ = agent.wait();
+        assert!(output.status.success());
+        let expected = format!("P\t{pid}\t{}\t{}", std::process::id(), session.display());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .any(|line| line == expected),
+            "the exact open transcript must resolve to its ancestor pane"
+        );
+    }
 
     #[test]
     fn configured_home_probe_reads_its_marker_not_the_login_account_marker() {

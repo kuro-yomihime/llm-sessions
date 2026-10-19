@@ -40,6 +40,7 @@ use crate::model::{
     AccessRoute, Locator, RouteHop, SessionKey, SessionSummary, SourceId, Transcript,
     valid_peer_url,
 };
+use crate::runtime::insert;
 use crate::runtime::live::Activity;
 use crate::source::{self, Source};
 
@@ -444,6 +445,251 @@ fn resume_route(session: &SessionSummary) -> Option<&AccessRoute> {
         .min_by(|a, b| a.cmp_preferred(b))
 }
 
+/// Deliver one message at the actual origin, over SSH only, without a
+/// remote `llm-sessions` of any version.
+///
+/// The route is the same validated shortest ssh-only one a resume takes;
+/// an HTTP-only session is refused, because the fetch-only transport
+/// cannot be asked to mutate. What runs at the final hop is a plain
+/// POSIX `sh` script plus standard utilities:
+///
+/// * An exactly identified running OMP — `live_owner` from the scan — is
+///   typed to through its own tmux pane, re-proving at delivery time
+///   everything the scan established (pane identity, foreground command,
+///   open-file join) after first re-reading the peer's origin marker.
+/// * An idle session with a headless agent CLI (`omp`, `hermes`,
+///   `opencode`) runs that CLI directly, after a guard script refuses a
+///   session file some process now holds open, or a same-agent process
+///   now sitting in the workspace or the recorded directory — the scan's
+///   idle verdict can be stale, and a competing writer is worse than a
+///   refused send.
+///
+/// Anything else — a running session without an exact OMP owner, an
+/// inferred owner, an unsupported agent — is refused, never downgraded to
+/// a headless fallback. Every refusal carries its own actionable reason
+/// for the caller to surface verbatim: which fact could not be proven,
+/// not a generic complaint about routes. Every dynamic value travels as
+/// a positional argument; nothing is interpolated into shell source.
+/// `BatchMode=yes` keeps a misconfigured hop from sitting on a password
+/// prompt the caller cannot answer — the spawner closes stdin.
+pub fn insert_command(
+    session: &SessionSummary,
+    sources: &[Box<dyn Source>],
+    message: &str,
+) -> Result<Vec<String>, String> {
+    if session.is_local() {
+        // Local delivery is `runtime::insert::local_command`'s business;
+        // this route exists to reach another machine over SSH.
+        return Err("a local session is delivered in place, not over ssh".into());
+    }
+    if session.subagent {
+        return Err("a subagent takes messages from its parent, not from here".into());
+    }
+    let origin = session.origin_id.clone().ok_or_else(|| {
+        "the session has no origin id, so its peer cannot be re-verified; rescan the host"
+            .to_owned()
+    })?;
+    let route = resume_route(session).ok_or_else(|| {
+        format!(
+            "no usable ssh route to {}; http cannot deliver a message and an invalid hop is never used",
+            session.origin_label.as_deref().unwrap_or(&origin)
+        )
+    })?;
+    let mut command = if let Some(owner) = session.live_owner.as_ref() {
+        // Exact OMP ownership: the scan pinned the agent's pid and pane,
+        // and `pane_delivery_argv` re-proves all of it at run time.
+        if session.source != SourceId::Omp {
+            return Err(format!("pane delivery is omp only, not {}", session.source));
+        }
+        if session.liveness != (crate::model::Liveness::Live { pid: owner.pid }) {
+            return Err(format!(
+                "the pinned pane owner pid {} no longer matches the session's running pid; rescan the host",
+                owner.pid
+            ));
+        }
+        let Locator::File { path } = &session.locator else {
+            return Err(
+                "pane delivery re-proves the open session file; this row has no file path".into(),
+            );
+        };
+        // The two refusals `pane_delivery_argv` can still make are
+        // named here first, so the reason reaches the caller verbatim.
+        if owner.pane.command != SourceId::Omp.name() {
+            return Err(format!(
+                "the pinned pane {} foregrounds {}, not omp; only an omp pane can be typed to",
+                owner.pane.address, owner.pane.command
+            ));
+        }
+        if message
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err(
+                "the message contains control bytes, which a pane reads as terminal commands"
+                    .into(),
+            );
+        }
+        let script = format!("{ORIGIN_PRELUDE}{}", insert::PANE_DELIVERY);
+        let Some(mut delivery) = insert::pane_delivery_argv(
+            &script,
+            &owner.pane,
+            owner.pid,
+            &path.to_string_lossy(),
+            message,
+        ) else {
+            // Everything this can refuse was prevalidated above; this
+            // branch only keeps a future divergence honest.
+            return Err(format!(
+                "the pinned pane {} cannot be typed to safely",
+                owner.pane.address
+            ));
+        };
+        delivery.insert(4, origin);
+        delivery
+    } else {
+        // A running session without an exact owner — inferred, or a pid no
+        // pane was pinned to — has a live writer; guessing is refused.
+        match session.liveness {
+            crate::model::Liveness::Live { pid } => {
+                return Err(format!(
+                    "session is running in pid {pid} but no tmux pane was pinned; only an exactly identified omp pane can be typed to"
+                ));
+            }
+            crate::model::Liveness::Probably { .. } => {
+                return Err(
+                        "an inferred owner may be a different conversation; it is never typed to, nor downgraded to headless"
+                            .into(),
+                    );
+            }
+            _ => {}
+        }
+        let source = source::find(sources, session.source)
+            .ok_or_else(|| format!("insert mode does not support {} yet", session.source))?;
+        let cli = source
+            .insert_command(&session.id, message)
+            .ok_or_else(|| format!("insert mode does not support {} yet", session.source))?;
+        let session_path = match &session.locator {
+            Locator::File { path } => path.to_string_lossy().into_owned(),
+            Locator::Row { .. } => String::new(),
+        };
+        let workspace = session
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let recorded_cwd = session
+            .recorded_cwd
+            .as_ref()
+            .map(|cwd| cwd.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut headless = vec![
+            "sh".into(),
+            "-c".into(),
+            format!("{ORIGIN_PRELUDE}{IDLE_GUARD}"),
+            "llm-sessions-remote-insert".into(),
+            origin,
+            session_path,
+            workspace,
+            session.source.name().into(),
+            recorded_cwd,
+        ];
+        headless.extend(cli);
+        headless
+    };
+    for hop in route.hops.iter().rev() {
+        let remote = if let Some(home) = &hop.home {
+            let environment = transport::home_environment(home);
+            transport::shell_command(
+                std::iter::once("env")
+                    .chain(environment.iter().map(String::as_str))
+                    .chain(command.iter().map(String::as_str)),
+            )
+        } else {
+            transport::shell_command(command.iter().map(String::as_str))
+        };
+        command = vec![
+            "ssh".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "--".into(),
+            hop.ssh.clone(),
+            remote,
+        ];
+    }
+    Ok(command)
+}
+
+/// POSIX prelude every remote delivery script runs first: prove this hop is
+/// still the origin the row was pinned to by reading the peer's existing
+/// marker — never creating or replacing one — before anything is touched.
+/// The expected origin arrives as `$1`; whatever follows shifts down into
+/// the wrapped script's own positional contract.
+const ORIGIN_PRELUDE: &str = r#"set -eu
+origin=$1
+shift
+marker="${XDG_STATE_HOME:-$HOME/.local/state}/llm-sessions/origin-id"
+[ -r "$marker" ] || { echo "origin marker $marker is missing" >&2; exit 1; }
+IFS= read -r observed < "$marker" || observed=
+observed=${observed#"${observed%%[![:space:]]*}"}
+observed=${observed%"${observed##*[![:space:]]}"}
+observed=$(printf '%s' "$observed" | tr 'ABCDEF' 'abcdef')
+[ "$observed" = "$origin" ] || { echo "origin mismatch: marker holds $observed, expected $origin" >&2; exit 1; }
+"#;
+
+/// Execution-time guard for a headless send to a session the scan called
+/// idle. The scan's verdict can be stale, so before the agent CLI runs,
+/// `/proc` is asked again: any process holding the session file open, or a
+/// same-agent process sitting in the workspace or the recorded cwd — a
+/// shell listing records its path there, never in the workspace — is a
+/// competing writer and the send is refused. One directory both fields
+/// name is scanned once, and a row with no session file and no directory
+/// to inspect cannot be checked at all, so it is refused rather than run
+/// blind. `$1` is the session path (empty for a locator without one),
+/// `$2` the workspace (empty when unknown), `$3` the agent name, `$4`
+/// the recorded cwd; the CLI to exec follows as `$5` onward. Only the
+/// user's own processes are visible, exactly like the local `/proc` scan.
+const IDLE_GUARD: &str = r#"session_path=$1 workspace=$2 agent=$3 recorded_cwd=$4
+shift 4
+fail() { echo "$*" >&2; exit 1; }
+if [ -n "$session_path" ]; then
+    for fd in /proc/[0-9]*/fd/*; do
+        [ "$(readlink "$fd" 2>/dev/null)" = "$session_path" ] || continue
+        pid=${fd#/proc/}
+        pid=${pid%/fd/*}
+        [ "$pid" = "$$" ] || fail "pid $pid still holds $session_path open"
+    done
+fi
+inspected=
+for dir in "$workspace" "$recorded_cwd"; do
+    [ -n "$dir" ] || continue
+    [ "$dir" = "$inspected" ] && continue
+    inspected=$dir
+    for cwd in /proc/[0-9]*/cwd; do
+        link=$(readlink "$cwd" 2>/dev/null) || continue
+        case "$link" in
+        "$dir" | "$dir"/*)
+            pid=${cwd#/proc/}
+            pid=${pid%/cwd}
+            [ "$pid" = "$$" ] && continue
+            if tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null |
+                head -n 2 | grep -Eq "(^|/)$agent$"; then
+                fail "pid $pid looks like a running $agent in $dir"
+            fi
+            ;;
+        esac
+    done
+done
+if [ -z "$session_path" ] && [ -z "$inspected" ]; then
+    fail "no session file or directory to check for a running $agent"
+fi
+if [ -n "$recorded_cwd" ] && [ -d "$recorded_cwd" ]; then
+    cd "$recorded_cwd"
+elif [ -n "$workspace" ] && [ -d "$workspace" ]; then
+    cd "$workspace"
+fi
+exec "$@"
+"#;
+
 impl Host {
     /// Require a configured origin pin that matches the observed identity.
     fn check_origin(&self, observed: &str) -> Result<()> {
@@ -790,10 +1036,35 @@ impl Host {
             .into_iter()
             .map(|failure| self.reported_failure(&failure))
             .collect();
+        self.enrich_owners(&mut scan.sessions, probe);
         Ok(Scan {
             sessions: scan.sessions,
             failures,
         })
+    }
+
+    /// Owners the peer's own listing could not attach — an older
+    /// `llm-sessions` predates the field — are recovered by one bounded
+    /// inventory per host, never per session, and only when some direct row
+    /// actually lacks an owner. An inventory that cannot run leaves the
+    /// rows exactly as the peer stated them.
+    fn enrich_owners(&self, sessions: &mut [SessionSummary], probe: &Probe) {
+        let direct = |session: &SessionSummary| {
+            session.origin_id.as_deref() == Some(probe.origin_id.as_str())
+                && session.source == SourceId::Omp
+                && matches!(session.locator, Locator::File { .. })
+        };
+        if !sessions
+            .iter()
+            .any(|session| direct(session) && session.live_owner.is_none())
+        {
+            return;
+        }
+        let Ok(raw) = self.ssh_script(&self.owner_inventory_script()) else {
+            return;
+        };
+        let inventory = parse::parse_owner_inventory(&raw);
+        parse::apply_owners(sessions, &inventory, &probe.origin_id);
     }
 
     /// Qualify one received row with this peer as its first hop. `peer` is
@@ -878,6 +1149,14 @@ impl Host {
             }
         }
 
+        // Same scan, same round trip: the owner inventory rides along when
+        // OMP rows are wanted, so a host with no `llm-sessions` at all is
+        // listed with exact live owners anyway.
+        let want_owners = self.wants(SourceId::Omp);
+        if want_owners {
+            script.push_str(&self.owner_inventory_script());
+        }
+
         if script.is_empty() {
             return Ok(Scan {
                 sessions: Vec::new(),
@@ -897,6 +1176,10 @@ impl Host {
         for session in &mut sessions {
             session.origin_id = Some(probe.origin_id.clone());
             self.attach_route(session, &probe.origin_id)?;
+        }
+        if want_owners {
+            let inventory = parse::parse_owner_inventory(&raw);
+            parse::apply_owners(&mut sessions, &inventory, &probe.origin_id);
         }
         failures.extend(unscanned(&raw, self.name()));
         Ok(Scan { sessions, failures })
@@ -1392,6 +1675,9 @@ mod tests {
                         crate::federation::PROTOCOL_VERSION
                     )),
                     Ok(wire(vec![row(A)])),
+                    // The owner inventory the listing triggers: empty, so
+                    // the row keeps whatever the peer itself stated.
+                    Ok(String::new()),
                     Ok(serde_json::to_string(&transcript).unwrap()),
                     Ok("[]".into()),
                 ]
@@ -1420,15 +1706,33 @@ mod tests {
         assert!(host.top().unwrap().is_empty());
         let commands = calls(&host);
         let environment = transport::home_environment(&home);
-        for (command, operation) in
-            commands[1..]
-                .iter()
-                .zip(["capabilities", "list", "show", "top"])
+        for (command, operation) in commands[1..]
+            .iter()
+            .filter(|command| command[0] == "env")
+            .zip(["capabilities", "list", "show", "top"])
         {
             assert_eq!(command[0], "env");
             assert_eq!(&command[1..6], &environment);
             assert_eq!(&command[6..9], &["/bin/peer", "federation", operation]);
         }
+        // The one stdin script beyond the probe: the owner inventory,
+        // carrying the configured home's namespace exactly as the probe
+        // script does.
+        let scripts = host
+            .scripted
+            .as_ref()
+            .unwrap()
+            .scripts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(scripts.len(), 2);
+        let assignments = transport::shell_command(environment.iter().map(String::as_str));
+        assert!(
+            scripts[1].starts_with(&format!("export {assignments}\n")),
+            "the inventory runs inside the pinned namespace"
+        );
+        assert!(scripts[1].contains("list-panes"));
     }
 
     #[test]
@@ -1459,6 +1763,295 @@ mod tests {
                 .unwrap()
                 .resume_command(&session.id)
                 .unwrap()
+        );
+    }
+
+    fn owned(pane_pid: u32, agent_pid: u32) -> crate::model::LiveOwner {
+        crate::model::LiveOwner {
+            pid: agent_pid,
+            pane: crate::runtime::tmux::Pane {
+                address: "work:0.1".into(),
+                session: "work".into(),
+                window: "0".into(),
+                pid: pane_pid,
+                command: "omp".into(),
+                path: PathBuf::from("/remote"),
+            },
+        }
+    }
+
+    fn sources() -> Vec<Box<dyn Source>> {
+        source::all(Path::new("/local"))
+    }
+
+    #[test]
+    fn direct_idle_delivery_checks_origin_and_ownership_and_restores_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(state.join("llm-sessions")).unwrap();
+        std::fs::write(state.join("llm-sessions/origin-id"), format!("{B}\n")).unwrap();
+        let cwd = dir.path().join("project ' with spaces");
+        std::fs::create_dir(&cwd).unwrap();
+        let script = format!("{ORIGIN_PRELUDE}{IDLE_GUARD}");
+        let run = |origin: &str, path: &str| {
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &script,
+                    "delivery",
+                    origin,
+                    path,
+                    cwd.to_str().unwrap(),
+                    "omp",
+                    cwd.to_str().unwrap(),
+                    "/bin/pwd",
+                ])
+                .env("XDG_STATE_HOME", &state)
+                .output()
+                .unwrap()
+        };
+        let output = run(B, "");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            cwd.to_str().unwrap()
+        );
+        let wrong = run(A, "");
+        assert!(!wrong.status.success());
+        assert!(String::from_utf8_lossy(&wrong.stderr).contains("origin mismatch"));
+        let path = dir.path().join("session.jsonl");
+        let held = std::fs::File::create(&path).unwrap();
+        let busy = run(B, path.to_str().unwrap());
+        drop(held);
+        assert!(!busy.status.success());
+        assert!(String::from_utf8_lossy(&busy.stderr).contains("still holds"));
+        assert!(
+            busy.stdout.is_empty(),
+            "busy sessions must not launch the agent CLI"
+        );
+    }
+
+    /// A shell listing records its path in `recorded_cwd`, never in
+    /// `workspace`, and a database row has no session file at all — so the
+    /// guard must catch a same-agent process in the recorded directory, let
+    /// an identical process elsewhere pass, and refuse a row that leaves
+    /// nothing to inspect.
+    #[test]
+    fn idle_guard_checks_the_recorded_directory_and_fails_closed() {
+        use std::os::unix::process::CommandExt;
+
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(state.join("llm-sessions")).unwrap();
+        std::fs::write(state.join("llm-sessions/origin-id"), format!("{B}\n")).unwrap();
+        let recorded = dir.path().join("recorded");
+        let unrelated = dir.path().join("unrelated");
+        std::fs::create_dir(&recorded).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        // A long-lived process named like the agent, sitting in the
+        // recorded directory — the competing writer a stale database row
+        // cannot see for itself.
+        let ready = dir.path().join("agent-ready");
+        let _agent = Kill(
+            std::process::Command::new("sh")
+                .arg0("omp")
+                .arg("-c")
+                .arg(format!(
+                    "cd {recorded:?} && printf ok > {ready:?} && while :; do sleep 1; done"
+                ))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "the agent process never reached its directory"
+        );
+        let script = format!("{ORIGIN_PRELUDE}{IDLE_GUARD}");
+        // A database row: no session path, no workspace, only the cwd the
+        // listing recorded.
+        let run = |workspace: &str, recorded_cwd: &str| {
+            std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &script,
+                    "delivery",
+                    B,
+                    "",
+                    workspace,
+                    "omp",
+                    recorded_cwd,
+                    "/bin/pwd",
+                ])
+                .env("XDG_STATE_HOME", &state)
+                .output()
+                .unwrap()
+        };
+        let busy = run("", recorded.to_str().unwrap());
+        assert!(
+            !busy.status.success(),
+            "a same-agent process in the recorded directory must refuse the send"
+        );
+        assert!(
+            String::from_utf8_lossy(&busy.stderr).contains("looks like a running omp"),
+            "{}",
+            String::from_utf8_lossy(&busy.stderr)
+        );
+        assert!(
+            busy.stdout.is_empty(),
+            "the agent CLI must not run behind a competing writer"
+        );
+        let elsewhere = run("", unrelated.to_str().unwrap());
+        assert!(
+            elsewhere.status.success(),
+            "{}",
+            String::from_utf8_lossy(&elsewhere.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(elsewhere.stdout).unwrap().trim(),
+            unrelated.to_str().unwrap()
+        );
+        let blind = run("", "");
+        assert!(
+            !blind.status.success(),
+            "a row with nothing to inspect must be refused, not run blind"
+        );
+        assert!(
+            String::from_utf8_lossy(&blind.stderr).contains("no session file or directory"),
+            "{}",
+            String::from_utf8_lossy(&blind.stderr)
+        );
+        assert!(blind.stdout.is_empty());
+    }
+
+    #[test]
+    fn insert_command_refuses_anything_it_cannot_prove() {
+        let sources = sources();
+        let mut session = row(B);
+        // Each refusal must name its own actionable reason; the sweep at
+        // the end keeps them from collapsing into one wording.
+        let mut refusals = Vec::new();
+        refusals.push(insert_command(&session, &sources, "hi").unwrap_err());
+        session.routes = vec![AccessRoute {
+            hops: vec![hop(B, "worker")],
+        }];
+        assert!(
+            insert_command(&session, &sources, "hi").is_ok(),
+            "the same row over ssh is deliverable while idle"
+        );
+        session.subagent = true;
+        refusals.push(insert_command(&session, &sources, "hi").unwrap_err());
+        session.subagent = false;
+        session.origin_id = None;
+        refusals.push(insert_command(&session, &sources, "hi").unwrap_err());
+        session.origin_id = Some(B.into());
+        session.liveness = crate::model::Liveness::Probably { pid: 99 };
+        refusals.push(insert_command(&session, &sources, "hi").unwrap_err());
+        session.liveness = crate::model::Liveness::Live { pid: 77 };
+        refusals.push(insert_command(&session, &sources, "hi").unwrap_err());
+        session.liveness = crate::model::Liveness::Live { pid: 4242 };
+        session.live_owner = Some(owned(3131, 4242));
+        session.source = SourceId::Hermes;
+        refusals.push(insert_command(&session, &sources, "hi").unwrap_err());
+        session.source = SourceId::Omp;
+        session.liveness = crate::model::Liveness::Live { pid: 5555 };
+        refusals.push(insert_command(&session, &sources, "hi").unwrap_err());
+        session.liveness = crate::model::Liveness::Live { pid: 4242 };
+        refusals.push(insert_command(&session, &sources, "hi\u{1b}").unwrap_err());
+        let mut editing = owned(3131, 4242);
+        editing.pane.command = "vim".into();
+        session.live_owner = Some(editing);
+        refusals.push(insert_command(&session, &sources, "hi").unwrap_err());
+        session.live_owner = Some(owned(3131, 4242));
+        session.locator = Locator::Row {
+            db: PathBuf::from("/remote/store.db"),
+            id: session.id.clone(),
+        };
+        refusals.push(insert_command(&session, &sources, "hi").unwrap_err());
+        session.locator = Locator::File {
+            path: PathBuf::from("/remote/session.jsonl"),
+        };
+        session.live_owner = None;
+        session.source = SourceId::Codex;
+        session.liveness = crate::model::Liveness::Stale;
+        refusals.push(insert_command(&session, &sources, "hi").unwrap_err());
+        for (index, refusal) in refusals.iter().enumerate() {
+            assert!(!refusal.is_empty());
+            for (other, message) in refusals.iter().enumerate() {
+                assert!(
+                    other == index || message != refusal,
+                    "refusals {index} and {other} share one wording: {refusal}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn insert_command_reuses_the_resume_route_rules() {
+        let sources = sources();
+        let mut session = row(B);
+        session.routes = vec![
+            AccessRoute {
+                hops: vec![http_hop(B, "api", "http://127.0.0.1:8001")],
+            },
+            AccessRoute {
+                hops: vec![hop(B, "direct")],
+            },
+        ];
+        assert_eq!(
+            &insert_command(&session, &sources, "hi").unwrap()[..5],
+            &["ssh", "-o", "BatchMode=yes", "--", "user@direct"],
+            "the shortest ssh route wins, http cannot carry a mutation"
+        );
+        session.routes = vec![AccessRoute {
+            hops: vec![http_hop(B, "api", "http://127.0.0.1:8001")],
+        }];
+        let http_only = insert_command(&session, &sources, "hi").unwrap_err();
+        assert!(
+            !http_only.is_empty(),
+            "an http-only session is never sent through a fetch-only transport"
+        );
+        session.routes = vec![AccessRoute {
+            hops: vec![hop(C, "wrong-target")],
+        }];
+        let invalid = insert_command(&session, &sources, "hi").unwrap_err();
+        assert!(
+            !invalid.is_empty(),
+            "an invalid route is not a silent fallback"
+        );
+    }
+
+    #[test]
+    fn insert_command_preserves_each_pinned_home_namespace() {
+        let home_a = PathBuf::from("/namespace a with ' quotes");
+        let mut first = hop(A, "a");
+        first.home = Some(home_a.clone());
+        let mut session = row(B);
+        session.routes = vec![AccessRoute {
+            hops: vec![first, hop(B, "b")],
+        }];
+        let command = insert_command(&session, &sources(), "hi").unwrap();
+        let first_remote = shell_words(&command[5]);
+        assert_eq!(first_remote[0], "env");
+        assert_eq!(&first_remote[1..6], &transport::home_environment(&home_a));
+        assert_eq!(
+            &first_remote[6..11],
+            &["ssh", "-o", "BatchMode=yes", "--", "user@b"]
         );
     }
 
@@ -1531,7 +2124,15 @@ mod tests {
         }];
         let a = scripted_host(A, "a", true, vec![wire(vec![forwarded.clone()])]);
         let c = scripted_host(C, "c", true, vec![wire(vec![forwarded])]);
-        let direct = scripted_host(B, "direct-b", true, vec![wire(vec![row(B)])]);
+        let direct = scripted_host(
+            B,
+            "direct-b",
+            true,
+            vec![
+                wire(vec![row(B)]),
+                "T\twork\t0\t1\t900\tomp\t/w\nP\t42\t900\t/remote/session.jsonl\n".into(),
+            ],
+        );
         let mut rows = Vec::new();
         for host in [&a, &c, &direct] {
             let scan = host.list_with(&[], &context).unwrap();
@@ -1552,6 +2153,10 @@ mod tests {
         assert_eq!(
             merged[0].preferred_route().unwrap().hops,
             vec![hop(B, "direct-b")]
+        );
+        assert!(
+            merged[0].live_owner.is_some(),
+            "the origin's own observation is the one that can name an owner"
         );
         assert_eq!(context.visited, vec![LOCAL]);
     }
@@ -1801,7 +2406,7 @@ mod tests {
             remaining_hops: 3,
         };
         let failed = scripted_host(A, "a", true, vec!["invalid output".into()]);
-        let working = scripted_host(B, "b", true, vec![wire(vec![row(B)])]);
+        let working = scripted_host(B, "b", true, vec![wire(vec![row(B)]), String::new()]);
         assert!(failed.list_with(&[], &context).is_err());
         let scan = working.list_with(&[], &context).unwrap();
         assert_eq!(scan.sessions.len(), 1);
@@ -1955,6 +2560,106 @@ mod tests {
             vec!["ar-2: copilot not scanned (sqlite3 missing)".to_string()]
         );
         assert!(unscanned("S\tcopilot\t\n", "ar-2").is_empty());
+    }
+
+    /// The acceptance path: a host with no `llm-sessions` at all still gets
+    /// exact owners, because the inventory rides along in the same listing
+    /// round trip — one `ssh` call, no remote binary.
+    #[test]
+    fn a_shell_only_host_lists_exact_owners_without_any_binary() {
+        let listing = "F\tomp\t/remote/.omp/agent/sessions/w/held.jsonl\t1700000000\t30\n\
+             H\t/remote/.omp/agent/sessions/w/held.jsonl\teyJ0eXBlIjoic2Vzc2lvbiIsImlkIjoicyJ9\n\
+             T\twork\t0\t1\t900\tomp\t/w\n\
+             P\t42\t900\t/remote/.omp/agent/sessions/w/held.jsonl\n";
+        let host = scripted_host(A, "a", false, vec![listing.to_owned()]);
+        let scan = host
+            .list_with(
+                &source::all(Path::new("/local")),
+                &DiscoveryContext::default(),
+            )
+            .unwrap();
+        assert_eq!(scan.sessions.len(), 1);
+        let session = &scan.sessions[0];
+        assert_eq!(session.liveness, crate::model::Liveness::Live { pid: 42 });
+        let owner = session.live_owner.as_ref().expect("an exact fd and pane");
+        assert_eq!(owner.pid, 42);
+        assert_eq!(owner.pane.address, "work:0.1");
+        assert_eq!(owner.pane.pid, 900);
+        assert_eq!(owner.pane.command, "omp");
+        assert_eq!(calls(&host).len(), 1, "the inventory joined the listing");
+    }
+
+    /// An older peer binary predates the owner field, so its payload has no
+    /// `live_owner` at all (this fixture serializes exactly that shape) and
+    /// still deserializes. The recovery is one bounded inventory per host —
+    /// never per session — and it must not stamp this host's process facts
+    /// onto a row another origin forwarded through the peer.
+    #[test]
+    fn an_old_binary_listing_is_enriched_once_and_never_across_origins() {
+        let mut direct = row(A);
+        direct.locator = Locator::File {
+            path: PathBuf::from("/remote/held.jsonl"),
+        };
+        let mut forwarded = row(B);
+        forwarded.locator = Locator::File {
+            path: PathBuf::from("/elsewhere/held.jsonl"),
+        };
+        forwarded.routes = vec![AccessRoute {
+            hops: vec![hop(B, "b")],
+        }];
+        let host = scripted_host(
+            A,
+            "a",
+            true,
+            vec![
+                wire(vec![direct, forwarded]),
+                "T\twork\t0\t1\t900\tomp\t/w\nP\t42\t900\t/remote/held.jsonl\n".to_owned(),
+            ],
+        );
+        let scan = host.list_with(&[], &DiscoveryContext::default()).unwrap();
+        assert_eq!(calls(&host).len(), 2, "the listing plus one inventory");
+        let direct = scan
+            .sessions
+            .iter()
+            .find(|session| session.origin_id.as_deref() == Some(A))
+            .unwrap();
+        assert_eq!(direct.liveness, crate::model::Liveness::Live { pid: 42 });
+        assert_eq!(direct.live_owner.as_ref().unwrap().pane.address, "work:0.1");
+        let forwarded = scan
+            .sessions
+            .iter()
+            .find(|session| session.origin_id.as_deref() == Some(B))
+            .unwrap();
+        assert!(
+            forwarded.live_owner.is_none(),
+            "an indirect origin is not this host's /proc"
+        );
+    }
+
+    /// A current peer already states exact owners; asking it again would be
+    /// a wasted round trip per refresh.
+    #[test]
+    fn a_current_binary_owner_needs_no_inventory_call() {
+        let mut direct = row(A);
+        direct.locator = Locator::File {
+            path: PathBuf::from("/remote/held.jsonl"),
+        };
+        direct.liveness = crate::model::Liveness::Live { pid: 42 };
+        direct.live_owner = Some(crate::model::LiveOwner {
+            pid: 42,
+            pane: crate::runtime::tmux::Pane {
+                address: "work:0.1".into(),
+                session: "work".into(),
+                window: "0".into(),
+                pid: 900,
+                command: "omp".into(),
+                path: PathBuf::from("/w"),
+            },
+        });
+        let host = scripted_host(A, "a", true, vec![wire(vec![direct])]);
+        let scan = host.list_with(&[], &DiscoveryContext::default()).unwrap();
+        assert_eq!(calls(&host).len(), 1);
+        assert_eq!(scan.sessions[0].live_owner.as_ref().unwrap().pid, 42);
     }
 
     #[test]

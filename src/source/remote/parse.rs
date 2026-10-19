@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use time::OffsetDateTime;
 
-use crate::model::{Liveness, Locator, PathTrust, SessionSummary, SourceId, Usage};
+use crate::model::{LiveOwner, Liveness, Locator, PathTrust, SessionSummary, SourceId, Usage};
+use crate::runtime::tmux::Pane;
 use crate::source;
 
 /// A file the shell transport found, before its head arrived.
@@ -108,6 +109,117 @@ pub fn parse_shell_listing(
     sessions
 }
 
+/// One `P` record: a process holding a transcript open, with the tmux pane
+/// its ancestry resolved to (`0` when it runs outside tmux).
+#[derive(Debug)]
+pub(super) struct OwnerClaim {
+    pub(super) pid: u32,
+    pub(super) pane_pid: u32,
+    pub(super) path: PathBuf,
+}
+
+/// The `T` (pane) and `P` (process claim) records of one host's live-owner
+/// inventory, framed exactly like the listing's own records so both can
+/// share one `sh -s` channel — or none at all, on a host with nothing
+/// running.
+#[derive(Debug, Default)]
+pub(super) struct OwnerInventory {
+    pub(super) panes: HashMap<u32, Pane>,
+    pub(super) claims: Vec<OwnerClaim>,
+}
+
+/// Turn the inventory records into panes and claims. Malformed lines are
+/// skipped, never fatal, for the same reason as the listing: a host may
+/// print anything it likes around our records.
+pub(super) fn parse_owner_inventory(raw: &str) -> OwnerInventory {
+    let mut inventory = OwnerInventory::default();
+    for line in raw.lines() {
+        let mut fields = line.split('\t');
+        match fields.next() {
+            Some("T") => {
+                let (Some(session), Some(window), Some(pane), Some(pid), Some(command)) = (
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                ) else {
+                    continue;
+                };
+                let Ok(pid) = pid.parse() else {
+                    continue;
+                };
+                // A path may legitimately contain a tab, so it takes the
+                // remainder — same rule as the local pane parser.
+                let path = fields.collect::<Vec<_>>().join("\t");
+                inventory.panes.insert(
+                    pid,
+                    Pane {
+                        address: format!("{session}:{window}.{pane}"),
+                        session: session.to_owned(),
+                        window: window.to_owned(),
+                        pid,
+                        command: command.to_owned(),
+                        path: PathBuf::from(path),
+                    },
+                );
+            }
+            Some("P") => {
+                let (Some(pid), Some(pane_pid)) = (fields.next(), fields.next()) else {
+                    continue;
+                };
+                let (Ok(pid), Ok(pane_pid)) = (pid.parse(), pane_pid.parse()) else {
+                    continue;
+                };
+                let path = fields.collect::<Vec<_>>().join("\t");
+                if path.is_empty() {
+                    continue;
+                }
+                inventory.claims.push(OwnerClaim {
+                    pid,
+                    pane_pid,
+                    path: PathBuf::from(path),
+                });
+            }
+            _ => {}
+        }
+    }
+    inventory
+}
+
+/// Attach owners to `origin`'s own OMP rows: an exact fd↔file join, so the
+/// association is the session file itself, never a cwd. A claim whose pane
+/// is unknown still marks the row live — that much is exact — but states no
+/// owner, and rows another origin forwarded through this host are never
+/// touched: this host's `/proc` says nothing about them.
+pub(super) fn apply_owners(sessions: &mut [SessionSummary], owners: &OwnerInventory, origin: &str) {
+    let mut by_path: HashMap<&Path, &OwnerClaim> = HashMap::new();
+    for claim in &owners.claims {
+        by_path.entry(claim.path.as_path()).or_insert(claim);
+    }
+    for session in sessions {
+        if session.live_owner.is_some()
+            || session.origin_id.as_deref() != Some(origin)
+            || session.source != SourceId::Omp
+        {
+            continue;
+        }
+        let Locator::File { path } = &session.locator else {
+            continue;
+        };
+        let Some(claim) = by_path.get(path.as_path()) else {
+            continue;
+        };
+        session.liveness = Liveness::Live { pid: claim.pid };
+        if let Some(pane) = owners.panes.get(&claim.pane_pid) {
+            session.live_owner = Some(LiveOwner {
+                pid: claim.pid,
+                pane: pane.clone(),
+            });
+        }
+    }
+}
+
 /// The records of a remote open: `R\t<name>\t<base64 sqlite3 json>`, one
 /// per named query. An empty payload (no rows, or a failed query) is an
 /// empty list; unframed lines are ignored as in the listing.
@@ -189,6 +301,7 @@ fn summary_from_sql(
         // The shell transport cannot see the host's `/proc`, and an inferred
         // badge dressed as a fact is worse than no badge.
         liveness: Liveness::Stale,
+        live_owner: None,
     })
 }
 
@@ -245,6 +358,7 @@ fn summary_from_head(row: &FileRow, host: &str, path: &str) -> Option<SessionSum
             path: PathBuf::from(path),
         },
         liveness: Liveness::Stale,
+        live_owner: None,
     })
 }
 
@@ -456,6 +570,148 @@ mod tests {
                 db: PathBuf::from("/home/x/.copilot/session-store.db"),
                 id: "0688".into(),
             }
+        );
+    }
+
+    fn owned_session(path: &str, origin: &str) -> SessionSummary {
+        let mut session = SessionSummary::new(
+            "held".into(),
+            SourceId::Omp,
+            OffsetDateTime::from_unix_timestamp(EPOCH).unwrap(),
+            Locator::File {
+                path: PathBuf::from(path),
+            },
+        );
+        session.origin_id = Some(origin.into());
+        session
+    }
+
+    #[test]
+    fn owner_records_join_on_the_exact_session_file() {
+        let raw = "T\twork\t0\t1\t900\tomp\t/w\
+                   \nP\t42\t900\t/remote/.omp/agent/sessions/w/held.jsonl\
+                   \nP\t43\t0\t/remote/.omp/agent/sessions/w/bare.jsonl";
+        let inventory = parse_owner_inventory(raw);
+        assert_eq!(inventory.panes.len(), 1);
+        assert_eq!(inventory.claims.len(), 2);
+
+        let mut sessions = vec![
+            owned_session("/remote/.omp/agent/sessions/w/held.jsonl", "B"),
+            owned_session("/remote/.omp/agent/sessions/w/bare.jsonl", "B"),
+            owned_session("/remote/.omp/agent/sessions/w/other.jsonl", "B"),
+        ];
+        apply_owners(&mut sessions, &inventory, "B");
+
+        assert_eq!(
+            sessions[0].live_owner,
+            Some(LiveOwner {
+                pid: 42,
+                pane: Pane {
+                    address: "work:0.1".into(),
+                    session: "work".into(),
+                    window: "0".into(),
+                    pid: 900,
+                    command: "omp".into(),
+                    path: PathBuf::from("/w"),
+                },
+            }),
+            "the fd names the file, the pane names the terminal"
+        );
+        assert_eq!(sessions[0].liveness, Liveness::Live { pid: 42 });
+        assert_eq!(
+            sessions[1].liveness,
+            Liveness::Live { pid: 43 },
+            "live outside tmux is still the truth"
+        );
+        assert!(sessions[1].live_owner.is_none());
+        assert_eq!(
+            sessions[2].liveness,
+            Liveness::Stale,
+            "no fd, no claim: an unrelated session is never assigned an owner"
+        );
+    }
+
+    #[test]
+    fn recovery_fills_missing_owners_without_replacing_reported_owners() {
+        let mut sessions = vec![
+            owned_session("/remote/held.jsonl", "B"),
+            owned_session("/remote/other.jsonl", "B"),
+        ];
+        let reported = parse_owner_inventory(
+            "T\twork\t0\t1\t900\tomp\t/w\nP\t42\t900\t/remote/held.jsonl\nP\t43\t900\t/remote/other.jsonl",
+        );
+        apply_owners(&mut sessions, &reported, "B");
+        let held_owner = sessions[0].live_owner.clone();
+        let other_owner = sessions[1].live_owner.clone();
+        sessions.push(owned_session("/remote/missing.jsonl", "B"));
+        let recovery = parse_owner_inventory(
+            "T\tnew\t0\t0\t901\tomp\t/w\nP\t99\t0\t/remote/held.jsonl\nP\t100\t901\t/remote/other.jsonl\nP\t44\t901\t/remote/missing.jsonl",
+        );
+        apply_owners(&mut sessions, &recovery, "B");
+        assert_eq!(sessions[0].liveness, Liveness::Live { pid: 42 });
+        assert_eq!(sessions[0].live_owner, held_owner);
+        assert_eq!(sessions[1].liveness, Liveness::Live { pid: 43 });
+        assert_eq!(sessions[1].live_owner, other_owner);
+        assert_eq!(sessions[2].liveness, Liveness::Live { pid: 44 });
+        let recovered = sessions[2].live_owner.as_ref().unwrap();
+        assert_eq!(recovered.pid, 44);
+        assert_eq!(recovered.pane.pid, 901);
+    }
+
+    #[test]
+    fn owner_records_never_cross_origin_or_agent() {
+        let raw = "P\t42\t900\t/remote/.omp/agent/sessions/w/held.jsonl";
+        let inventory = parse_owner_inventory(raw);
+        let mut forwarded = owned_session("/remote/.omp/agent/sessions/w/held.jsonl", "C");
+        forwarded.liveness = Liveness::Stale;
+        let mut other_agent = SessionSummary::new(
+            "held".into(),
+            SourceId::Claude,
+            OffsetDateTime::from_unix_timestamp(EPOCH).unwrap(),
+            Locator::File {
+                path: PathBuf::from("/remote/.omp/agent/sessions/w/held.jsonl"),
+            },
+        );
+        other_agent.origin_id = Some("B".into());
+        let mut sessions = vec![forwarded, other_agent];
+        apply_owners(&mut sessions, &inventory, "B");
+        assert!(
+            sessions[0].live_owner.is_none(),
+            "this host's /proc says nothing about a row another origin forwarded"
+        );
+        assert!(
+            sessions[1].live_owner.is_none(),
+            "only OMP is measured to keep its transcript open"
+        );
+    }
+
+    #[test]
+    fn malformed_owner_records_are_skipped_not_fatal() {
+        let raw = "T\twork\t0\t1\tnot-a-pid\tomp\t/w\
+                   \nP\t\
+                   \nP\tx\t900\t/remote/held.jsonl\
+                   \nP\t7\t900\
+                   \nnoise from a login banner";
+        let inventory = parse_owner_inventory(raw);
+        assert!(inventory.panes.is_empty());
+        assert!(inventory.claims.is_empty());
+
+        let mut sessions = vec![owned_session("/remote/held.jsonl", "B")];
+        apply_owners(&mut sessions, &inventory, "B");
+        assert_eq!(sessions[0].liveness, Liveness::Stale);
+        assert!(sessions[0].live_owner.is_none());
+    }
+
+    #[test]
+    fn a_pane_path_may_contain_tabs() {
+        let raw = "T\twork\t0\t1\t900\tomp\t/w\twith\ttabs\
+                   \nP\t42\t900\t/remote/held.jsonl";
+        let inventory = parse_owner_inventory(raw);
+        let mut sessions = vec![owned_session("/remote/held.jsonl", "B")];
+        apply_owners(&mut sessions, &inventory, "B");
+        assert_eq!(
+            sessions[0].live_owner.as_ref().unwrap().pane.path,
+            PathBuf::from("/w\twith\ttabs")
         );
     }
 }
