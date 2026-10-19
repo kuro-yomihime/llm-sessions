@@ -140,7 +140,9 @@ id:01a0  after:7d  before:today  cost:>1
 live:yes  archived:only  body:naming  bare words = free text
 ```
 
-`body:` needs `llm-sessions index`. Unknown keys become free text.
+`body:` needs `llm-sessions index`. Unknown keys and unreadable values become
+free text; the API reports each one in `warnings`. `today` and `yesterday`
+start at UTC midnight (the API's `tz=` moves that).
 
 ## Remote hosts
 
@@ -187,7 +189,8 @@ curl -H "Authorization: Bearer $LLMS_TOKEN" 'http://host:8787/v1/sessions?q=live
 | Route (all `GET`) | Returns |
 |---|---|
 | `/v1/healthz` | version and host, no token |
-| `/v1/sessions?q=<query>&limit=N` | `list --json` rows plus `status` |
+| `/v1/hosts` | the labels `host:` can name: `local` (with its hostname), then peers |
+| `/v1/sessions?q=<query>&limit=N&tz=+02:00` | `list --json` rows plus `status`, running first then newest; `warnings` for filters that cannot match as written; `tz` is the UTC offset calendar words use (default UTC; send `+` as `%2B`) |
 | `/v1/sessions/<id>` | one row |
 | `/v1/sessions/<id>/transcript` | `show <id> --json` |
 | `/v1/stream` | WebSocket snapshots on change, ping every 20 s |

@@ -75,6 +75,9 @@ pub(super) struct Snapshot {
     /// The watched rows as a JSON array: the stream's payload, and what
     /// decides whether a stream subscriber is woken at all.
     pub watched: String,
+    /// Configured peer names in gateway mode, as of this tick; empty for a
+    /// local-only server, which never publishes a peer's rows.
+    pub peers: Vec<String>,
 }
 
 impl Snapshot {
@@ -205,15 +208,16 @@ impl Poller {
         // Gateway mode rereads hosts.json every tick: a peer added after
         // startup is discovered without a restart, like the request-local
         // federation route.
-        let remote = if self.federate {
+        let (remote, peers) = if self.federate {
             let (config, failure) = remote::Config::load(self.loader.home());
+            let peers = config.hosts.iter().map(|host| host.name.clone()).collect();
             self.loader.hosts = config.hosts.into_iter().map(remote::Host::new).collect();
             if let Some(failure) = failure {
                 self.warn(failure);
             }
-            Remote::Inline
+            (Remote::Inline, peers)
         } else {
-            Remote::Skip
+            (Remote::Skip, Vec::new())
         };
         let mut scan = self.loader.scan(Some(&self.fleet), Cached::Borrow, remote);
         for failure in scan.failures.drain(..) {
@@ -273,6 +277,7 @@ impl Poller {
             sessions: Vec::new(),
             statuses,
             watched: String::new(),
+            peers,
         };
         let rows: Vec<Row> = watched.into_iter().map(|s| snapshot.row(s)).collect();
         snapshot.watched = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_owned());

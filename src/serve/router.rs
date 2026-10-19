@@ -67,6 +67,7 @@ pub(super) struct App {
 pub(super) fn router(app: Arc<App>) -> Router {
     let rest = Router::new()
         .route("/v1/sessions", get(sessions))
+        .route("/v1/hosts", get(hosts))
         .route("/v1/sessions/{id}", get(session))
         .route("/v1/sessions/{id}/transcript", get(transcript))
         .route("/v1/federation/capabilities", get(federation_capabilities))
@@ -146,15 +147,73 @@ async fn healthz(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
     }))
 }
 
+/// The `host:` labels this server's rows can carry: `local` first, then
+/// every peer label, sorted. In gateway mode that is the configured peers
+/// plus labels further hops contributed; a local-only server lists just
+/// `local`, since no peer row is ever published.
+fn host_labels(snapshot: &Snapshot) -> Vec<String> {
+    let peers: std::collections::BTreeSet<&str> = snapshot
+        .sessions
+        .iter()
+        .filter(|s| !s.is_local())
+        .filter_map(|s| s.origin_label.as_deref())
+        .chain(snapshot.peers.iter().map(String::as_str))
+        .collect();
+    std::iter::once("local")
+        .chain(peers)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Which machines `host:` can name, so a client never has to guess one.
+async fn hosts(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    let snapshot = app.snapshot.borrow().clone();
+    let hosts: Vec<_> = host_labels(&snapshot)
+        .into_iter()
+        .map(|label| {
+            let local = label == "local";
+            let mut entry = json!({ "label": label, "local": local });
+            if local {
+                entry["hostname"] = json!(app.host);
+            }
+            entry
+        })
+        .collect();
+    Json(json!({ "hosts": hosts }))
+}
+
 #[derive(Deserialize)]
 struct ListQuery {
     q: Option<String>,
     /// A string on purpose: `limit=abc` must be a JSON 400 of our own, not
     /// axum's plain-text extractor rejection.
     limit: Option<String>,
+    /// The UTC offset `today`/`yesterday` count from; UTC when absent.
+    tz: Option<String>,
 }
 
-/// `list --json` over HTTP: the same grammar, visibility and order.
+/// A UTC offset: `Z`, `UTC`, `+HH`, or `+HH:MM` (either sign). A leading
+/// space is a `+` an unencoded query string turned into one.
+fn parse_offset(text: &str) -> Option<time::UtcOffset> {
+    if text.eq_ignore_ascii_case("z") || text.eq_ignore_ascii_case("utc") {
+        return Some(time::UtcOffset::UTC);
+    }
+    let (sign, rest) = match text.as_bytes().first()? {
+        b'+' | b' ' => (1, &text[1..]),
+        b'-' => (-1, &text[1..]),
+        _ => return None,
+    };
+    let (hours, minutes) = rest.split_once(':').unwrap_or((rest, "00"));
+    let digits = |part: &str| {
+        (part.len() == 2 && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| part.parse::<i8>().ok())
+            .flatten()
+    };
+    time::UtcOffset::from_hms(sign * digits(hours)?, sign * digits(minutes)?, 0).ok()
+}
+
+/// `list --json` over HTTP: the same grammar, visibility and order, plus
+/// `warnings` for any filter that cannot have meant what it says.
 async fn sessions(
     State(app): State<Arc<App>>,
     Query(params): Query<ListQuery>,
@@ -172,8 +231,17 @@ async fn sessions(
             }
         },
     };
+    let offset = match params.tz.as_deref() {
+        None => time::UtcOffset::UTC,
+        Some(text) => parse_offset(text).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("invalid tz {text:?}: use a UTC offset like +02:00 (send + as %2B)"),
+            )
+        })?,
+    };
     let text = params.q.unwrap_or_default();
-    let query = query::Query::parse(&text);
+    let query = query::Query::parse_at(&text, OffsetDateTime::now_utc().to_offset(offset));
     let hits = if query.needs_index() {
         let home = app.home.clone();
         let searched =
@@ -202,6 +270,28 @@ async fn sessions(
         live_only: false,
     };
     let snapshot = app.snapshot.borrow().clone();
+    let mut warnings = query.warnings().to_vec();
+    let mut wanted = query.hosts().peekable();
+    if wanted.peek().is_some() {
+        let labels = host_labels(&snapshot);
+        for value in wanted {
+            if labels
+                .iter()
+                .any(|label| label.to_lowercase().starts_with(value))
+            {
+                continue;
+            }
+            let hint = if app.host.starts_with(value) {
+                format!("; {value:?} is this server, which host:local names")
+            } else {
+                String::new()
+            };
+            warnings.push(format!(
+                "host:{value} matches no known machine (known: {}){hint}",
+                labels.join(", ")
+            ));
+        }
+    }
     let rows: Vec<_> = snapshot
         .sessions
         .iter()
@@ -212,7 +302,17 @@ async fn sessions(
         .take(limit)
         .map(|s| snapshot.row(s))
         .collect();
-    Ok(Json(json!({ "serverTime": now(), "sessions": rows })))
+    Ok(Json(json!({
+        "serverTime": now(),
+        "tz": format!(
+            "{}{:02}:{:02}",
+            if offset.is_negative() { '-' } else { '+' },
+            offset.whole_hours().unsigned_abs(),
+            offset.minutes_past_hour().unsigned_abs()
+        ),
+        "warnings": warnings,
+        "sessions": rows,
+    })))
 }
 
 /// The one session `id` names in a row set. `origin` and `source`, when a
@@ -639,6 +739,7 @@ mod tests {
                 block,
             )]),
             watched: watched.to_owned(),
+            peers: Vec::new(),
         }
     }
 
@@ -729,6 +830,7 @@ mod tests {
         let Harness { app, .. } = harness();
         for uri in [
             "/v1/sessions",
+            "/v1/hosts",
             "/v1/sessions/live-1",
             "/v1/sessions/live-1/transcript",
             "/v1/federation/capabilities",
@@ -1064,6 +1166,61 @@ mod tests {
         );
         assert_eq!(ids(&get(&app, "/v1/sessions?limit=1").await.1), ["live-1"]);
         assert_eq!(ids(&get(&app, "/v1/sessions?limit=0").await.1).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn hosts_are_listed_and_a_host_filter_matching_none_is_explained() {
+        let Harness { app, tx, .. } = harness();
+        tx.send(Arc::new(Snapshot {
+            peers: vec!["t16".into(), "fe-1".into()],
+            ..snapshot("[1]")
+        }))
+        .unwrap();
+
+        let (status, body) = get(&app, "/v1/hosts").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["hosts"],
+            json!([
+                {"label": "local", "local": true, "hostname": "golden"},
+                {"label": "fe-1", "local": false},
+                {"label": "t16", "local": false},
+            ])
+        );
+
+        let (_, body) = get(&app, "/v1/sessions?q=host:fe").await;
+        assert_eq!(body["warnings"], json!([]), "a prefix of fe-1 is known");
+        let (_, body) = get(&app, "/v1/sessions?q=host:AR3%20hots:x").await;
+        assert_eq!(
+            body["warnings"],
+            json!([
+                r#"unknown filter key "hots" in "hots:x"; searched as free text"#,
+                "host:ar3 matches no known machine (known: local, fe-1, t16)",
+            ])
+        );
+        let (_, body) = get(&app, "/v1/sessions?q=host:golden").await;
+        let warning = body["warnings"][0].as_str().unwrap();
+        assert!(warning.contains("host:local"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn the_calendar_offset_is_validated_and_echoed() {
+        let Harness { app, .. } = harness();
+        assert_eq!(get(&app, "/v1/sessions").await.1["tz"], "+00:00");
+        for (tz, echoed) in [
+            ("%2B02:00", "+02:00"),
+            ("+05:30", "+05:30"),
+            ("-03", "-03:00"),
+        ] {
+            let (status, body) = get(&app, &format!("/v1/sessions?tz={tz}")).await;
+            assert_eq!(status, StatusCode::OK, "{tz}");
+            assert_eq!(body["tz"], echoed, "{tz}");
+        }
+        for tz in ["Europe%2FWarsaw", "2", "%2B2:00", "%2B26:00"] {
+            let (status, body) = get(&app, &format!("/v1/sessions?tz={tz}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{tz}");
+            assert!(body["error"].as_str().unwrap().contains("tz"), "{tz}");
+        }
     }
 
     #[tokio::test]

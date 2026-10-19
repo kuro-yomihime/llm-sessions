@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! GET /v1/healthz                       no auth: {"ok", "version", "host"}
-//! GET /v1/sessions?q=<query>&limit=N    {"serverTime", "sessions": [Row]}
+//! GET /v1/hosts                         {"hosts": [{"label", "local", "hostname"?}]}
+//! GET /v1/sessions?q=&limit=N&tz=±HH:MM {"serverTime", "tz", "warnings", "sessions": [Row]}
 //! GET /v1/sessions/{id}                 Row
 //! GET /v1/sessions/{id}/transcript      Transcript, the bytes of `show <id> --json`
 //! GET /v1/federation/capabilities       {"version", "origin_id"}: the handshake
