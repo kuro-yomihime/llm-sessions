@@ -87,18 +87,29 @@ pub struct Query {
     free_terms: Vec<String>,
     body_terms: Vec<String>,
     has_archived_filter: bool,
+    /// Terms that looked like `key:value` but became free text, said in
+    /// words: the degradation is silent in the result set otherwise.
+    warnings: Vec<String>,
 }
 
 impl Query {
-    /// Never fails: an unparseable term degrades to free text.
+    /// Never fails: an unparseable term degrades to free text, and
+    /// [`Query::warnings`] says so. Calendar words (`today`, `yesterday`)
+    /// start at UTC midnight; [`Query::parse_at`] picks another clock.
     pub fn parse(input: &str) -> Self {
+        Self::parse_at(input, OffsetDateTime::now_utc())
+    }
+
+    /// [`Query::parse`] relative to `now`, whose offset decides where a
+    /// calendar day starts.
+    pub fn parse_at(input: &str, now: OffsetDateTime) -> Self {
         let mut query = Self {
             predicates: Vec::new(),
             free_terms: Vec::new(),
             body_terms: Vec::new(),
             has_archived_filter: false,
+            warnings: Vec::new(),
         };
-        let now = OffsetDateTime::now_utc();
 
         for (term, balanced) in tokenize(input) {
             if !balanced {
@@ -132,7 +143,13 @@ impl Query {
                     query.body_terms.push(value.to_owned());
                     continue;
                 }
-                _ => None,
+                _ => {
+                    query.warnings.push(format!(
+                        "unknown filter key {key:?} in {term:?}; searched as free text"
+                    ));
+                    query.add_free(&term);
+                    continue;
+                }
             };
 
             if let Some(predicate) = parsed {
@@ -141,6 +158,9 @@ impl Query {
                 }
                 query.predicates.push(predicate);
             } else {
+                query.warnings.push(format!(
+                    "unreadable value in {term:?}; searched as free text"
+                ));
                 query.add_free(&term);
             }
         }
@@ -247,6 +267,22 @@ impl Query {
     /// callers should apply that toggle only when this returns `false`.
     pub fn has_archived_filter(&self) -> bool {
         self.has_archived_filter
+    }
+
+    /// What parsing degraded to free text, one sentence per term.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// Every `host:` value, folded as matched: a prefix of a display label,
+    /// or of `local`.
+    pub fn hosts(&self) -> impl Iterator<Item = &str> {
+        self.predicates
+            .iter()
+            .filter_map(|predicate| match predicate {
+                Predicate::Host(value) => Some(value.as_str()),
+                _ => None,
+            })
     }
 
     fn add_free(&mut self, term: &str) {
@@ -379,6 +415,31 @@ mod tests {
 
         let colon = Query::parse(":");
         assert!(colon.matches(&session(SourceId::Omp, ":", "/work")));
+    }
+
+    #[test]
+    fn terms_degraded_to_free_text_are_reported() {
+        let query = Query::parse("hots:fe-1 after:yesterdy host:fe source:omp body:x plain");
+        assert_eq!(
+            query.warnings(),
+            [
+                r#"unknown filter key "hots" in "hots:fe-1"; searched as free text"#,
+                r#"unreadable value in "after:yesterdy"; searched as free text"#,
+            ]
+        );
+        assert_eq!(query.hosts().collect::<Vec<_>>(), ["fe"]);
+    }
+
+    #[test]
+    fn today_starts_at_midnight_on_the_given_clock() {
+        // 23:30 UTC on the 21st is already the 22nd at UTC+2, whose day
+        // began at 22:00 UTC: a 21:30 UTC session is today only in UTC.
+        let now = time::macros::datetime!(2026-09-21 23:30 UTC);
+        let mut session = session(SourceId::Omp, "work", "/work");
+        session.updated = time::macros::datetime!(2026-09-21 21:30 UTC);
+        assert!(Query::parse_at("after:today", now).matches(&session));
+        let ahead = now.to_offset(time::UtcOffset::from_hms(2, 0, 0).unwrap());
+        assert!(!Query::parse_at("after:today", ahead).matches(&session));
     }
 
     #[test]
