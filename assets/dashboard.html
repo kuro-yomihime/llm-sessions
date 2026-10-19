@@ -222,8 +222,31 @@ aside.drawer[hidden] { display: flex; visibility: hidden; transform: translateX(
 .turn-h b { font-weight: 600; color: var(--fg-dim); }
 .turn[data-role="user"] .turn-h b { color: var(--waiting); }
 .turn[data-role="assistant"] .turn-h b { color: var(--running); }
-.txt { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 75ch; }
-.think { color: var(--muted); font-style: italic; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 75ch; font-size: 14px; }
+.md { overflow-wrap: anywhere; max-width: 75ch; }
+.md > :first-child { margin-top: 0; } .md > :last-child { margin-bottom: 0; }
+.md + .md { margin-top: 10px; }
+.md p, .md ul, .md ol, .md pre, .md blockquote, .md .tbl { margin: 0 0 10px; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 16px 0 8px; font-weight: 600; line-height: 1.3; letter-spacing: -.01em; }
+.md h1 { font-size: 19px; } .md h2 { font-size: 17px; } .md h3 { font-size: 15.5px; } .md h4, .md h5, .md h6 { font-size: 14px; color: var(--fg-dim); }
+.md ul, .md ol { padding-left: 22px; } .md li > ul, .md li > ol, .md li > p { margin: 2px 0; }
+.md li::marker { color: var(--muted); }
+.md code { font: 12.5px var(--mono); background: var(--raise); padding: 1px 4px; border-radius: 3px; }
+.md pre { padding: 10px 12px; overflow: auto; background: var(--bg); border-radius: 4px; }
+.md pre code { display: block; padding: 0; background: none; font: 12px/1.5 var(--mono); white-space: pre; }
+.md blockquote { padding: 0 0 0 12px; border-left: 2px solid var(--line-strong); color: var(--fg-dim); }
+.md hr { border: 0; border-top: 1px solid var(--line-strong); margin: 14px 0; }
+.md a[href] { color: var(--idle); }
+.md img { max-width: 100%; height: auto; border-radius: 4px; }
+.md details { margin: 0 0 10px; } .md summary { cursor: pointer; }
+.md kbd { font: 12px var(--mono); padding: 1px 5px; border: 1px solid var(--line-strong); border-bottom-width: 2px; border-radius: 3px; }
+.md mark { background: var(--waiting); color: var(--bg); padding: 0 2px; }
+.md .tbl { overflow-x: auto; }
+.md table { width: auto; border-collapse: collapse; font-size: 13px; }
+.md th, .md td { border: 1px solid var(--line-strong); padding: 4px 8px; text-align: left; vertical-align: top; white-space: normal; }
+.md [align="right"] { text-align: right; } .md [align="center"] { text-align: center; }
+.md th { font-weight: 600; font-size: 13px; color: var(--fg); background: var(--raise); }
+.md tbody tr { cursor: auto; } .md tbody tr:hover { background: none; }
+.think { color: var(--muted); font-style: italic; font-size: 14px; }
 .call { font-family: var(--mono); font-size: 12.5px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 1px 0; }
 .call b { color: var(--idle); font-weight: 600; }
 .call.bad b { color: var(--failed); }
@@ -677,10 +700,232 @@ function toolSummary(input) {
   const first = Object.values(input).find((v) => typeof v === "string");
   return first || JSON.stringify(input);
 }
+// ---------- markdown ----------
+// Markdown compiles to an HTML string (raw HTML passes through, as in
+// CommonMark), then `sanitize` rebuilds it against an allowlist inside an
+// inert <template>: transcript text is untrusted.
+const MD = {
+  fence: /^ {0,3}(`{3,}|~{3,})\s*([^`\s]*)/,
+  heading: /^ {0,3}(#{1,6})(?:\s+(.*?))?(?:\s+#+)?\s*$/,
+  hr: /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/,
+  quote: /^ {0,3}> ?/,
+  item: /^( {0,3})([-*+]|\d{1,9}[.)])(\s+|$)/,
+  tableSep: /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/,
+  // CommonMark HTML blocks: a known block tag or comment opens one; any other
+  // known tag only when it fills the line. Either runs to the next blank line.
+  htmlBlock: /^ {0,3}(?:<!--|<\/?(?:address|article|aside|blockquote|center|details|dialog|dd|div|dl|dt|figcaption|figure|footer|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|summary|table|tbody|td|tfoot|th|thead|tr|ul)(?:\s|\/?>|$))/i,
+  htmlTag: /^<\/?([A-Za-z][A-Za-z0-9-]*)(?:\s+[A-Za-z_:][\w.:-]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*\s*\/?>/,
+  htmlComment: /^<!--[\s\S]*?-->/,
+};
+// Only real HTML element names count as markup: `Option<String>` or `<T>` in
+// prose stays visible text instead of vanishing as an unknown element.
+function htmlTagAt(s) {
+  const m = s.match(MD.htmlTag);
+  return m && (MD_TAGS.has(m[1].toUpperCase()) || MD_DROP.has(m[1].toUpperCase())) ? m[0] : null;
+}
+const isHtmlBlock = (line) => MD.htmlBlock.test(line) || (htmlTagAt(line.trim()) || "").length === line.trim().length && line.trim().length > 0;
+const startsBlock = (line, next) => MD.fence.test(line) || MD.heading.test(line) || MD.hr.test(line) ||
+  MD.quote.test(line) || MD.item.test(line) || isHtmlBlock(line) || (line.includes("|") && next != null && MD.tableSep.test(next));
+const indentOf = (s) => s.match(/^ */)[0].length;
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function splitRow(line) {
+  const cells = line.trim().replace(/^\|/, "").replace(/(?<!\\)\|$/, "").split(/(?<!\\)\|/);
+  return cells.map((c) => c.trim().replace(/\\\|/g, "|"));
+}
+// Nesting past this renders as escaped text: transcripts are untrusted, and
+// 5000 nested `>` otherwise overflow the stack and fail the whole drawer.
+const MD_DEPTH = 16;
+function mdBlocks(lines, tight = false, depth = 0) {
+  if (depth > MD_DEPTH) return `<p>${esc(lines.join("\n"))}</p>`;
+  let out = "";
+  for (let i = 0; i < lines.length;) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    let m;
+    if ((m = line.match(MD.fence))) {
+      const close = new RegExp(`^ {0,3}${m[1][0] === "`" ? "`" : "~"}{${m[1].length},}\\s*$`);
+      const code = [];
+      for (i++; i < lines.length && !close.test(lines[i]); i++) code.push(lines[i]);
+      i++;
+      out += `<pre><code${m[2] ? ` data-lang="${esc(m[2])}"` : ""}>${esc(code.join("\n"))}</code></pre>`;
+    } else if ((m = line.match(MD.heading))) {
+      out += `<h${m[1].length}>${mdInline(m[2] || "")}</h${m[1].length}>`; i++;
+    } else if (MD.hr.test(line)) {
+      out += "<hr>"; i++;
+    } else if (isHtmlBlock(line)) {
+      for (; i < lines.length && lines[i].trim(); i++) out += lines[i] + "\n";
+    } else if (MD.quote.test(line)) {
+      const inner = [];
+      for (; i < lines.length && MD.quote.test(lines[i]); i++) inner.push(lines[i].replace(MD.quote, ""));
+      out += `<blockquote>${mdBlocks(inner, false, depth + 1)}</blockquote>`;
+    } else if (line.includes("|") && i + 1 < lines.length && MD.tableSep.test(lines[i + 1])) {
+      const align = splitRow(lines[i + 1]).map((c) => c.endsWith(":") ? (c.startsWith(":") ? "center" : "right") : null);
+      const row = (tag, cells) => `<tr>${align.map((a, k) => `<${tag}${a ? ` align="${a}"` : ""}>${mdInline(cells[k] || "")}</${tag}>`).join("")}</tr>`;
+      let body = "";
+      const head = row("th", splitRow(line));
+      for (i += 2; i < lines.length && lines[i].trim() && lines[i].includes("|"); i++) body += row("td", splitRow(lines[i]));
+      out += `<div class="tbl"><table><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
+    } else if ((m = line.match(MD.item))) {
+      const ordered = /\d/.test(m[2]);
+      const start = ordered ? parseInt(m[2], 10) : 1;
+      const items = [];
+      let loose = false;
+      while (i < lines.length && (m = lines[i].match(MD.item)) && /\d/.test(m[2]) === ordered) {
+        const pad = m[3] ? m[0].length : m[0].length + 1;
+        const body = [lines[i].slice(m[0].length)];
+        for (i++; i < lines.length; i++) {
+          const l = lines[i];
+          if (!l.trim()) {
+            const nx = lines.slice(i + 1).find((x) => x.trim());
+            if (nx == null || indentOf(nx) < pad) break;
+            loose = true; body.push(""); continue;
+          }
+          if (indentOf(l) >= pad) { body.push(l.slice(pad)); continue; }
+          // Lazy continuation: plain text directly under an item belongs to it.
+          if (body[body.length - 1].trim() && !startsBlock(l, lines[i + 1])) { body.push(l.trim()); continue; }
+          break;
+        }
+        items.push(body);
+        if (i < lines.length && !lines[i].trim()) {
+          const nx = lines.slice(i).find((x) => x.trim());
+          if (nx && MD.item.test(nx)) loose = true;
+          while (i < lines.length && !lines[i].trim()) i++;
+        }
+      }
+      const tag = ordered ? "ol" : "ul";
+      out += `<${tag}${start !== 1 ? ` start="${start}"` : ""}>${items.map((b) => `<li>${mdBlocks(b, !loose, depth + 1)}</li>`).join("")}</${tag}>`;
+    } else {
+      const para = [];
+      for (; i < lines.length && lines[i].trim() && (!para.length || !startsBlock(lines[i], lines[i + 1])); i++) para.push(lines[i]);
+      const text = mdInline(para.map((l) => l.replace(/^\s+/, "")).join("\n"));
+      out += tight ? text : `<p>${text}</p>`;
+    }
+  }
+  return out;
+}
+const safeHref = (url) => /^(https?:|mailto:)/i.test(url.trim());
+// Inline images are embedded bytes only. A remote `src` is a request to an
+// address the transcript chose (tracking beacon, GET on an internal host),
+// fired by merely opening the drawer; the page CSP (`img-src data:`) blocks it
+// too, so it becomes a link the reader has to follow deliberately.
+const embeddedImage = (url) => /^data:image\/(png|jpe?g|gif|webp|avif)[;,]/i.test(url.trim());
+// Emphasis delimiters, longest first so `**` wins over `*`.
+const EMPH = [["***", "<strong><em>", "</em></strong>"], ["___", "<strong><em>", "</em></strong>"], ["**", "<strong>", "</strong>"],
+  ["__", "<strong>", "</strong>"], ["~~", "<del>", "</del>"], ["*", "<em>", "</em>"], ["_", "<em>", "</em>"]];
+// Whether delimiter `d` at `j` can close a span. Depends on `j` alone, so a
+// failed search from one position fails from every later one too.
+const closesAt = (src, j, d) => !/\s/.test(src[j - 1]) && !(d[0] === "_" && /\w/.test(src[j + d.length] || "")) &&
+  !(d.length === 1 && (src[j + 1] === d || src[j - 1] === d));
+function mdInline(src, depth = 0) {
+  if (depth > MD_DEPTH) return esc(src);
+  // Closer searches run to the end of `src`; without remembering where one
+  // already failed, 60 KB of unclosed `*a ` takes seconds (quadratic).
+  const dead = new Map();   // closer kind -> earliest start known to find none
+  const live = (kind, from) => !(from >= (dead.get(kind) ?? Infinity));
+  const fail = (kind, from) => { if (!dead.has(kind)) dead.set(kind, from); };
+  let out = "";
+  for (let i = 0; i < src.length;) {
+    const c = src[i], rest = src.slice(i);
+    let m;
+    if (c === "\\" && /[!-\/:-@\[-`{-~]/.test(src[i + 1] || "")) { out += esc(src[i + 1]); i += 2; continue; }
+    if (c === "\\" && src[i + 1] === "\n") { out += "<br>"; i += 2; continue; }
+    if (c === "\n") { out = / {2,}$/.test(out) ? out.replace(/ +$/, "") + "<br>" : out + "\n"; i++; continue; }
+    if (c === "`") {
+      const run = rest.match(/^`+/)[0];
+      if (live(run, i) && (m = rest.match(/^(`+)([\s\S]*?[^`])\1(?!`)/)) && m[1] === run) {
+        const code = m[2].replace(/\n/g, " ");
+        out += `<code>${esc(/^ .* $/.test(code) && code.trim() ? code.slice(1, -1) : code)}</code>`;
+        i += m[0].length; continue;
+      }
+      fail(run, i); out += run; i += run.length; continue;
+    }
+    // Entity references the author wrote (`&nbsp;`, `&#x2014;`) stay entities.
+    if (c === "&" && (m = rest.match(/^&(?:[A-Za-z][A-Za-z0-9]*|#\d+|#x[0-9a-f]+);/i))) { out += m[0]; i += m[0].length; continue; }
+    if (c === "<" && (m = rest.match(/^<((?:https?:\/\/|mailto:)[^\s<>]+)>/i))) {
+      out += `<a href="${esc(m[1])}">${esc(m[1])}</a>`; i += m[0].length; continue;
+    }
+    let raw = null;
+    if (rest.startsWith("<!--") && live("-->", i)) { raw = (rest.match(MD.htmlComment) || [])[0]; if (!raw) fail("-->", i); }
+    else if (c === "<") raw = htmlTagAt(rest);
+    if (raw) { out += raw; i += raw.length; continue; }
+    // Labels nest one bracket level (`[![badge](img)](url)`); unbounded nesting
+    // would rescan to the end from every `[`.
+    if ((c === "[" || (c === "!" && src[i + 1] === "[")) && (m = rest.match(/^!?\[((?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*\])*)\]\(\s*<?((?:[^\s()<>]|\([^\s()<>]*\))*)>?(?:\s+"([^"]*)")?\s*\)/))) {
+      const title = m[3] ? ` title="${esc(m[3])}"` : "";
+      if (c === "!") out += `<img src="${esc(m[2])}" alt="${esc(m[1])}"${title}>`;
+      else out += `<a href="${esc(m[2])}"${title}>${mdInline(m[1], depth + 1)}</a>`;
+      i += m[0].length; continue;
+    }
+    if (c === "h" && !/\w/.test(src[i - 1] || "") && (m = rest.match(/^https?:\/\/[^\s<]+/))) {
+      const url = m[0].replace(/[.,:;!?'")\]*_~]+$/, "");
+      out += `<a href="${esc(url)}">${esc(url)}</a>`; i += url.length; continue;
+    }
+    const emph = EMPH.find(([d]) => rest.startsWith(d));
+    if (emph) {
+      const [d, open, close] = emph;
+      const after = src[i + d.length] || "", before = src[i - 1] || "";
+      // Intraword `_` is literal (snake_case); an opener must precede non-space.
+      if (after && !/\s/.test(after) && !(d[0] === "_" && /\w/.test(before)) && live(d, i + d.length + 1)) {
+        let j = -1;
+        for (let k = src.indexOf(d, i + d.length + 1); k !== -1; k = src.indexOf(d, k + 1)) if (closesAt(src, k, d)) { j = k; break; }
+        if (j !== -1) { out += open + mdInline(src.slice(i + d.length, j), depth + 1) + close; i = j + d.length; continue; }
+        fail(d, i + d.length + 1);
+      }
+      out += d; i += d.length; continue;
+    }
+    out += esc(c); i++;
+  }
+  return out;
+}
+
+const MD_DROP = new Set(["SCRIPT", "STYLE", "IFRAME", "FRAME", "FRAMESET", "OBJECT", "EMBED", "APPLET", "LINK", "META", "BASE",
+  "FORM", "INPUT", "BUTTON", "TEXTAREA", "SELECT", "OPTION", "NOSCRIPT", "TEMPLATE", "SVG", "MATH", "AUDIO", "VIDEO",
+  "SOURCE", "TRACK", "CANVAS", "DIALOG", "TITLE", "HEAD", "PORTAL"]);
+const MD_TAGS = new Set(("A ABBR B BDI BDO BLOCKQUOTE BR CAPTION CENTER CITE CODE COL COLGROUP DD DEL DETAILS DFN DIV DL DT EM " +
+  "FIGCAPTION FIGURE H1 H2 H3 H4 H5 H6 HR I IMG INS KBD LI MARK OL P PRE Q RP RT RUBY S SAMP SMALL SPAN STRONG SUB " +
+  "SUMMARY SUP TABLE TBODY TD TFOOT TH THEAD TIME TR U UL VAR WBR").split(" "));
+const MD_ATTRS = {
+  "*": ["title", "lang", "dir"],
+  A: ["href"], IMG: ["src", "alt", "width", "height"], OL: ["start", "reversed", "type"], LI: ["value"],
+  TD: ["colspan", "rowspan", "align"], TH: ["colspan", "rowspan", "align"], COL: ["span"], COLGROUP: ["span"],
+  DETAILS: ["open"], CODE: ["data-lang"], TIME: ["datetime"], DIV: ["class"],
+};
+function sanitize(node) {
+  for (const el of [...node.childNodes]) {
+    if (el.nodeType === Node.COMMENT_NODE) { el.remove(); continue; }
+    if (el.nodeType !== Node.ELEMENT_NODE) continue;
+    const tag = el.tagName.toUpperCase();
+    if (MD_DROP.has(tag)) { el.remove(); continue; }
+    sanitize(el);
+    if (!MD_TAGS.has(tag)) { el.replaceWith(...el.childNodes); continue; }
+    const keep = [...MD_ATTRS["*"], ...(MD_ATTRS[tag] || [])];
+    for (const { name } of [...el.attributes]) if (!keep.includes(name)) el.removeAttribute(name);
+    if (el.hasAttribute("class") && el.getAttribute("class") !== "tbl") el.removeAttribute("class");
+    if (tag === "A") {
+      if (!el.hasAttribute("href") || !safeHref(el.getAttribute("href"))) el.removeAttribute("href");
+      else { el.target = "_blank"; el.rel = "noopener noreferrer"; }
+    }
+    if (tag === "IMG") {
+      const src = el.getAttribute("src") || "", alt = el.getAttribute("alt") || "";
+      if (embeddedImage(src)) el.decoding = "async";
+      else if (/^https?:/i.test(src.trim())) el.replaceWith(h("a", { href: src, target: "_blank", rel: "noopener noreferrer", title: src }, `[image: ${alt || src}]`));
+      else el.replaceWith(alt);
+    }
+  }
+}
+function renderMarkdown(src, cls = "") {
+  const tpl = document.createElement("template");   // inert: nothing runs or loads while parsing
+  tpl.innerHTML = mdBlocks(src.replace(/\r\n?/g, "\n").replace(/\t/g, "    ").split("\n"));
+  sanitize(tpl.content);
+  const el = h("div", { class: `md ${cls}`.trim() });
+  el.append(document.importNode(tpl.content, true));
+  return el;
+}
+
 function renderBlock(b) {
   switch (b.block) {
-    case "text": return h("div", { class: "txt" }, b.text);
-    case "thinking": return h("div", { class: "think b-thinking" }, b.text);
+    case "text": return renderMarkdown(b.text || "");
+    case "thinking": return renderMarkdown(b.text || "", "think b-thinking");
     case "toolcall": return h("div", { class: "call b-tool", title: JSON.stringify(b.input, null, 1).slice(0, 2000) }, h("b", {}, b.name), "  ", toolSummary(b.input).replace(/\s+/g, " "));
     case "toolresult": {
       const out = typeof b.output === "string" ? b.output : JSON.stringify(b.output, null, 1);
