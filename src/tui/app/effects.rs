@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::model::{ArchiveOutcome, Liveness, SessionKey, SessionSummary};
+use crate::model::{ArchiveOutcome, SessionKey, SessionSummary};
 use crate::output::reader::plural;
 use crate::runtime::{insert, tmux};
 use crate::tui::app::{App, Prompt, fingerprint};
@@ -147,11 +147,7 @@ impl App {
             self.status = Some("empty message; nothing sent".into());
             return;
         }
-        let Some(session) = self
-            .sessions
-            .iter()
-            .find(|s| s.is_local() && s.identity() == *target)
-        else {
+        let Some(session) = self.sessions.iter().find(|s| s.identity() == *target) else {
             self.status = Some("that session is gone; nothing sent".into());
             return;
         };
@@ -162,14 +158,27 @@ impl App {
                 return;
             }
         };
-        // The agent resolves some sessions relative to the project it was
-        // started in, so it runs where the session did, when that still exists.
-        let cwd = [&session.recorded_cwd, &session.workspace]
-            .into_iter()
-            .flatten()
-            .find(|dir| dir.is_dir())
-            .cloned();
-        let label = format!("{} {}", session.source, session.id);
+        // A remote path must never be interpreted on this host.
+        let cwd = session
+            .is_local()
+            .then(|| {
+                [&session.recorded_cwd, &session.workspace]
+                    .into_iter()
+                    .flatten()
+                    .find(|dir| dir.is_dir())
+                    .cloned()
+            })
+            .flatten();
+        let label = if session.is_local() {
+            format!("{} {}", session.source, session.id)
+        } else {
+            format!(
+                "{} {} on {}",
+                session.source,
+                session.id,
+                session.origin_label.as_deref().unwrap_or("remote")
+            )
+        };
         let delivery = insert::send(label, &command, cwd, INSERT_DEADLINE);
         self.status = Some(match delivery.pid {
             Some(pid) => format!("sending to {} (pid {pid})…", delivery.label),
@@ -178,48 +187,18 @@ impl App {
         self.deliveries.push(delivery);
     }
 
-    /// The command that delivers `message` to `session`, or why none may.
-    ///
-    /// One writer per conversation: with any process attached — exact or
-    /// inferred, since an inferred owner may well hold it in memory — the
-    /// message must go through that process or not at all. Resuming is for
-    /// sessions nothing is running.
+    /// Remote delivery rechecks the discovered owner directly over SSH.
     fn insert_route(&self, session: &SessionSummary, message: &str) -> Result<Vec<String>, String> {
         if self.read_only {
             return Err("--read-only: refusing to send messages".into());
         }
         if !session.is_local() {
-            return Err("insert mode sends to local sessions only".into());
+            // Every remote refusal — no origin, no ssh route, an inferred
+            // or mismatched owner, a non-omp pane, control bytes, an
+            // unsupported agent — names itself and is surfaced verbatim.
+            return crate::source::remote::insert_command(session, &self.sources, message);
         }
-        if session.subagent {
-            return Err("a subagent takes messages from its parent, not from here".into());
-        }
-        let source = crate::source::find(&self.sources, session.source);
-        let Some(pid) = session.liveness.pid() else {
-            return source
-                .and_then(|source| source.insert_command(&session.id, message))
-                .ok_or_else(|| format!("insert mode does not support {} yet", session.source));
-        };
-        let held = if matches!(session.liveness, Liveness::Live { .. }) {
-            "is open"
-        } else {
-            "may be open"
-        };
-        let Some(process) = self.fleet.get(pid) else {
-            return Err(format!(
-                "session {held} in pid {pid}, which is gone; Ctrl-R rescans"
-            ));
-        };
-        source
-            .and_then(|source| source.live_insert_command(&session.id, message, &process.servers))
-            .ok_or_else(|| {
-                let jump = if process.pane.is_some() {
-                    "; J jumps to its pane"
-                } else {
-                    ""
-                };
-                format!("session {held} in pid {pid}, which cannot take a message from here{jump}")
-            })
+        insert::local_command(session, &self.sources, &self.fleet, message)
     }
 
     /// Report every message whose agent has exited since the last look.

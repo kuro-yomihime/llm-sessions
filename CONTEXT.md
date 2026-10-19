@@ -77,11 +77,11 @@ line here when a module is named after a concept not yet listed.
 - **Prompt mode** — one of the modal input states (filter, search, bookmark,
   fold, resize, confirm, insert). Key meanings live in `tui::keymap`'s single
   dispatch; state transitions live in App.
-- **Insert mode** (`runtime::insert`) — one typed message handed to the
-  session's agent through its CLI, run off the UI thread. One writer per
-  conversation: a session with a process attached (exact or inferred) goes
-  through `Source::live_insert_command` or is refused; only an unattended one
-  is resumed with `Source::insert_command`. The agent writes the turn;
-  `llm-sessions` only reports the exit.
+- **Insert mode** (`runtime::insert`) — one typed message delivered to the
+  session's agent off the UI thread. Unattended sessions resume through the
+  agent CLI; attached sessions use the live server or, for exactly matched OMP
+  sessions, the owning tmux pane. SSH delivery rechecks the discovered owner
+  directly at the pinned origin, without a remote explorer binary; HTTP
+  remains read-only. The agent writes its own history.
 - **Query** (`catalog::query`) — the filter grammar and visibility policy shared
   by `/`, `s`, and `list -q`, independent of TUI grouping and navigation.

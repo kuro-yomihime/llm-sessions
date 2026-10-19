@@ -113,13 +113,35 @@ bookmarks, sending messages, tmux focus.
 
 Copying needs `wl-copy`, `xclip`, `xsel`, `pbcopy`, or `clip.exe`.
 
-`i` runs the agent's headless CLI in the session's directory (30 min
-timeout). One writer per conversation:
+`i` sends one message without leaving the TUI. Idle sessions run the agent's
+headless CLI in the session's directory (30 min timeout). One writer per
+conversation:
 
-- **OMP, Hermes**: idle sessions only; attached sessions are refused (use `J`).
+- **OMP**: idle sessions use `omp --print --resume`. Running sessions receive
+  a literal paste followed by Enter in their owning tmux pane; no attach or
+  focus change. The session must be matched exactly, not merely inferred from
+  the working directory. Shell/tool foregrounds and panes without bracketed
+  paste support are refused.
+- **Hermes**: idle sessions only; attached sessions are refused (use `J`).
 - **OpenCode**: sends via the live client's loopback server, else `opencode run --session <id>`.
 
-Subagents, remote rows, and `--read-only` are refused.
+SSH sessions work too, including SSH-only multi-hop routes. No remote
+`llm-sessions` binary is required for sending. Discovery retains the exact OMP
+process and tmux pane; sending rechecks their ownership directly over SSH,
+then pastes and submits. Idle sessions invoke the agent's own CLI remotely.
+The target's pinned origin is checked before delivery. SSH uses existing
+noninteractive authentication; it will not prompt for a password. HTTP-only
+routes remain read-only. Subagents and `--read-only` are refused.
+
+Before a remote idle send, both the workspace and recorded working directory
+are checked for a competing agent. Rows with neither a session file nor a
+directory to check are refused. A parent's live badge inherited from a
+subagent does not authorize pane delivery to the parent. Refusal reasons
+appear on the TUI status line.
+
+For tmux delivery, leave OMP at its normal input prompt with an empty composer:
+insertion cannot detect dialogs and does not erase an existing draft. Delivery
+reports submission, not completion of the model's response.
 
 ## Liveness
 

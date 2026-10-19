@@ -69,19 +69,19 @@ pub enum Command {
     /// `llm-sessions hosts` lists every configured host with its pinned
     /// origin and probes it, so one command answers "is my fleet reachable
     /// and which transport will it use".
-    #[command(display_order = 10)]
+    #[command(display_order = 11)]
     Hosts(HostsArgs),
     /// Report orphaned processes, dead paths, and stale caches.
-    #[command(display_order = 11)]
+    #[command(display_order = 12)]
     Doctor(DoctorArgs),
     /// Archive or unarchive sessions by id.
-    #[command(display_order = 12)]
+    #[command(display_order = 13)]
     Archive(ArchiveArgs),
     /// Print a shell completion script.
-    #[command(display_order = 13)]
+    #[command(display_order = 14)]
     Completions(CompletionsArgs),
     /// Print the roff man page.
-    #[command(display_order = 14)]
+    #[command(display_order = 15)]
     Man,
     /// Print this instance's stable federation identity.
     Origin {
