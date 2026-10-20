@@ -26,20 +26,36 @@ const POLL: Duration = Duration::from_millis(50);
 pub struct Delivery {
     /// What the status line calls the target, e.g. `omp 01a0-7b22`.
     pub label: String,
-    /// The agent CLI's pid, so a user can find or kill it; `None` if it never
-    /// started.
+    /// The agent CLI's pid, so a user can find or kill it; `None` for gateway
+    /// delivery or a command that never started.
     pub pid: Option<u32>,
     outcome: Receiver<Result<(), String>>,
 }
 
 impl Delivery {
-    /// `Some` once the agent has exited or been killed: `Ok` on a zero
-    /// status, otherwise the reason in one line.
+    /// `Some` once the harness reports delivery or failure. Gateway admission
+    /// does not imply completion of the model's response.
     pub fn poll(&self) -> Option<Result<(), String>> {
         match self.outcome.try_recv() {
             Ok(outcome) => Some(outcome),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => Some(Err("delivery thread vanished".into())),
+        }
+    }
+
+    /// Run a non-process harness without blocking the terminal event loop.
+    pub(crate) fn background(
+        label: String,
+        work: impl FnOnce() -> crate::Result<()> + Send + 'static,
+    ) -> Self {
+        let (tx, outcome) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work().map_err(|error| error.to_string()));
+        });
+        Self {
+            label,
+            pid: None,
+            outcome,
         }
     }
 }

@@ -113,16 +113,21 @@ bookmarks, sending messages, tmux focus.
 
 Copying needs `wl-copy`, `xclip`, `xsel`, `pbcopy`, or `clip.exe`.
 
-`i` sends one message without leaving the TUI. Idle sessions run the agent's
-headless CLI in the session's directory (30 min timeout). One writer per
-conversation:
+`i` sends one message without leaving the TUI. The selected session binds its
+harness family; that harness selects a working transport for its own instance
+on every write (30 min overall timeout). One writer per conversation:
 
 - **OMP**: idle sessions use `omp --print --resume`. Running sessions receive
   a literal paste followed by Enter in their owning tmux pane; no attach or
   focus change. The session must be matched exactly, not merely inferred from
   the working directory. Shell/tool foregrounds and panes without bracketed
   paste support are refused.
-- **Hermes**: idle sessions only; attached sessions are refused (use `J`).
+- **OpenClaw**: configure the selected instance for gateway WebSocket, HTTP
+  agent turns, or explicitly enabled co-located CLI delivery.
+- **Hermes**: configured API instances prefer Runs admission, then synchronous
+  chat only when Runs is unsupported and session continuity is advertised.
+  Without an API binding, the existing idle-only CLI path remains; attached
+  native sessions are refused (use `J`).
 - **OpenCode**: sends via the live client's loopback server, else `opencode run --session <id>`.
 
 SSH sessions work too, including SSH-only multi-hop routes. No remote
@@ -130,8 +135,9 @@ SSH sessions work too, including SSH-only multi-hop routes. No remote
 process and tmux pane; sending rechecks their ownership directly over SSH,
 then pastes and submits. Idle sessions invoke the agent's own CLI remotely.
 The target's pinned origin is checked before delivery. SSH uses existing
-noninteractive authentication; it will not prompt for a password. HTTP-only
-routes remain read-only. Subagents and `--read-only` are refused.
+noninteractive authentication; it will not prompt for a password. Federation
+HTTP routes remain read-only; a separately configured agent gateway can deliver
+to that remote session. Subagents and `--read-only` are refused.
 
 Before a remote idle send, both the workspace and recorded working directory
 are checked for a competing agent. Rows with neither a session file nor a
@@ -142,6 +148,14 @@ appear on the TUI status line.
 For tmux delivery, leave OMP at its normal input prompt with an empty composer:
 insertion cannot detect dialogs and does not erase an existing draft. Delivery
 reports submission, not completion of the model's response.
+
+Configure exact `(origin_id, source, session_id)` bindings in
+`$XDG_CONFIG_HOME/llm-sessions/harnesses.json`. Credentials stay in named
+environment variables, not session metadata. See
+[remote insert protocols and configuration](docs/REMOTE_INSERT.md) for payloads,
+availability probes, pairing, session-context limitations, and fallback rules.
+Authentication/policy refusals and uncertain submissions never trigger another
+transport or harness.
 
 ## Liveness
 
@@ -182,7 +196,8 @@ Configure in `$XDG_CONFIG_HOME/llm-sessions/hosts.json`, or via
 - Remote sessions appear beside local ones (`--host`, `host:`, view `5`).
 - SSH uses `BatchMode=yes`; passphrase-protected keys fail fast.
 - HTTP peers (`url` + `token_env`) support listing and transcripts, not
-  resume, insert, or `top`. Set `SSL_CERT_FILE` for a private CA.
+  resume, agent delivery, or `top`. Insert requires a separate agent-gateway
+  binding as above. Set `SSL_CERT_FILE` for a private CA.
 - Peers running `llm-sessions` also expose their own hosts (up to 8 hops).
   Older or missing binaries fall back to a shell script that lists local stores.
 

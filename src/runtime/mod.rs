@@ -8,3 +8,4 @@ pub(crate) mod procfs;
 pub mod resume;
 pub mod status;
 pub(crate) mod tmux;
+pub mod writer;

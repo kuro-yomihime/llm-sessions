@@ -36,6 +36,13 @@ pub enum Error {
     #[error("{host}: {message}")]
     Remote { host: String, message: String },
 
+    #[error("{harness}: {kind}: {message}")]
+    Delivery {
+        harness: &'static str,
+        kind: FailureKind,
+        message: String,
+    },
+
     #[error("no home directory")]
     NoHome,
 
@@ -58,6 +65,25 @@ impl Error {
             other => other.to_string(),
         }
     }
+}
+
+/// Delivery failures retain their category across CLI and network harnesses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FailureKind {
+    #[error("unavailable")]
+    Unavailable,
+    #[error("authentication")]
+    Authentication,
+    #[error("timeout")]
+    Timeout,
+    #[error("transport")]
+    Transport,
+    #[error("rejected")]
+    Rejected,
+    #[error("protocol")]
+    Protocol,
+    #[error("process")]
+    Process,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -1,13 +1,12 @@
-//! The parts of [`App`] that reach outside its own state: writing archive
-//! flags through a source or the overlay, building the argv a resume hands
-//! to the shell, handing an insert-mode message to an agent's CLI, moving
-//! tmux focus, and reading a transcript body through its source or host.
+//! Effects outside [`App`] state: writing archive flags, building resume argv,
+//! moving tmux focus, dispatching inserts through the bound harness, and reading
+//! transcript bodies through their source or host.
 
 use std::time::Duration;
 
 use crate::model::{ArchiveOutcome, SessionKey, SessionSummary};
 use crate::output::reader::plural;
-use crate::runtime::{insert, tmux};
+use crate::runtime::{tmux, writer};
 use crate::tui::app::{App, Prompt, fingerprint};
 
 impl App {
@@ -118,9 +117,9 @@ impl App {
     }
 }
 
-/// Longest an agent CLI may take over one inserted turn before it is killed.
-/// Generous: a turn that runs tools can legitimately take many minutes, and
-/// the pid is on the status line for anyone who wants it gone sooner.
+/// Overall deadline for a harness's probes and one inserted turn.
+/// Generous: synchronous agent turns can legitimately take many minutes;
+/// gateway admission may report delivery before the model finishes.
 const INSERT_DEADLINE: Duration = Duration::from_mins(30);
 
 impl App {
@@ -129,7 +128,7 @@ impl App {
             self.status = Some("nothing selected to send to".into());
             return;
         };
-        if let Err(refusal) = self.insert_route(session, "") {
+        if let Err(refusal) = self.insert_harness(session).map(drop) {
             self.status = Some(refusal);
             return;
         }
@@ -139,8 +138,8 @@ impl App {
         };
     }
 
-    /// The route is chosen again on send: the session may have gone live,
-    /// or gone quiet, while the message was being typed.
+    /// The family remains bound to the session. Its harness rechecks instance
+    /// capabilities (including command ownership) when the message is sent.
     pub(super) fn send_insert(&mut self, target: &SessionKey, text: &str) {
         let message = text.trim();
         if message.is_empty() {
@@ -151,35 +150,17 @@ impl App {
             self.status = Some("that session is gone; nothing sent".into());
             return;
         };
-        let command = match self.insert_route(session, message) {
-            Ok(command) => command,
+        let delivery = match self.insert_harness(session).and_then(|harness| {
+            harness
+                .write_message(message, INSERT_DEADLINE)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(delivery) => delivery,
             Err(refusal) => {
                 self.status = Some(refusal);
                 return;
             }
         };
-        // A remote path must never be interpreted on this host.
-        let cwd = session
-            .is_local()
-            .then(|| {
-                [&session.recorded_cwd, &session.workspace]
-                    .into_iter()
-                    .flatten()
-                    .find(|dir| dir.is_dir())
-                    .cloned()
-            })
-            .flatten();
-        let label = if session.is_local() {
-            format!("{} {}", session.source, session.id)
-        } else {
-            format!(
-                "{} {} on {}",
-                session.source,
-                session.id,
-                session.origin_label.as_deref().unwrap_or("remote")
-            )
-        };
-        let delivery = insert::send(label, &command, cwd, INSERT_DEADLINE);
         self.status = Some(match delivery.pid {
             Some(pid) => format!("sending to {} (pid {pid})…", delivery.label),
             None => format!("sending to {}…", delivery.label),
@@ -187,21 +168,19 @@ impl App {
         self.deliveries.push(delivery);
     }
 
-    /// Remote delivery rechecks the discovered owner directly over SSH.
-    fn insert_route(&self, session: &SessionSummary, message: &str) -> Result<Vec<String>, String> {
+    /// Attach only the session's own harness, without probing or dispatching.
+    fn insert_harness<'a>(
+        &'a self,
+        session: &'a SessionSummary,
+    ) -> Result<Box<dyn writer::SessionHarness + 'a>, String> {
         if self.read_only {
             return Err("--read-only: refusing to send messages".into());
         }
-        if !session.is_local() {
-            // Every remote refusal — no origin, no ssh route, an inferred
-            // or mismatched owner, a non-omp pane, control bytes, an
-            // unsupported agent — names itself and is surfaced verbatim.
-            return crate::source::remote::insert_command(session, &self.sources, message);
-        }
-        insert::local_command(session, &self.sources, &self.fleet, message)
+        writer::attach(session, &self.sources, &self.fleet, &self.home)
+            .map_err(|error| error.to_string())
     }
 
-    /// Report every message whose agent has exited since the last look.
+    /// Report every delivery whose harness has settled since the last look.
     pub(super) fn collect_deliveries(&mut self) {
         let mut reports = Vec::new();
         self.deliveries.retain(|delivery| match delivery.poll() {

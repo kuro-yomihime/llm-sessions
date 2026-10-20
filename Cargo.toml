@@ -40,10 +40,8 @@ default = ["serve", "http", "dashboard"]
 # axum; `--no-default-features` builds the TUI and CLI without them, and CI
 # keeps that lean build green.
 serve = ["dep:axum", "dep:tokio", "clap/env"]
-# The HTTP federation client: `url` peers in hosts.json and `serve
-# --federate` gateway reads. Independent of `serve`, so the CLI can reach
-# HTTP peers in builds without the server.
-http = ["dep:reqwest"]
+# Federation and agent gateway clients; independent of the HTTP server.
+http = ["dep:reqwest", "dep:tungstenite", "dep:base64", "dep:sha2", "dep:ed25519-dalek"]
 # `serve --dashboard`: a single self-contained web page (assets/
 # dashboard.html, ~180 KB with its fonts) compiled into the binary. No
 # dependency of its own; leave it out to drop the page from the binary.
@@ -57,6 +55,8 @@ axum = { version = "0.8", optional = true, default-features = false, features = 
     "tokio",
     "ws",
 ] }
+base64 = { version = "0.22", optional = true }
+ed25519-dalek = { version = "2", optional = true }
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"
 clap_mangen = "0.3"
@@ -71,6 +71,7 @@ reqwest = { version = "0.13", optional = true, default-features = false, feature
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = { version = "0.10", optional = true }
 thiserror = "2"
 tempfile = "3"
 tokio = { version = "1", optional = true, features = [
@@ -81,6 +82,7 @@ tokio = { version = "1", optional = true, features = [
     "sync",
     "signal",
 ] }
+tungstenite = { version = "0.29", optional = true, features = ["rustls-tls-native-roots"] }
 # `local-offset` is what lets display convert UTC records to the reader's own
 # clock; it pulls no crate the tree does not already build.
 time = { version = "0.3", features = [

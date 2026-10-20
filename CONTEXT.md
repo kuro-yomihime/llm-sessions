@@ -77,11 +77,14 @@ line here when a module is named after a concept not yet listed.
 - **Prompt mode** — one of the modal input states (filter, search, bookmark,
   fold, resize, confirm, insert). Key meanings live in `tui::keymap`'s single
   dispatch; state transitions live in App.
-- **Insert mode** (`runtime::insert`) — one typed message delivered to the
-  session's agent off the UI thread. Unattended sessions resume through the
-  agent CLI; attached sessions use the live server or, for exactly matched OMP
-  sessions, the owning tmux pane. SSH delivery rechecks the discovered owner
-  directly at the pinned origin, without a remote explorer binary; HTTP
-  remains read-only. The agent writes its own history.
+- **Insert mode** (`runtime::writer`, `runtime::insert`) — one typed message
+  delivered off the UI thread through the selected session's `SessionHarness`.
+  The family is bound at attachment; its instance configuration negotiates
+  transports on each write. OpenClaw uses gateway WS, HTTP, or co-located CLI;
+  Hermes API uses Runs or continuity-capable synchronous chat. Native unattended
+  sessions retain their agent CLI; live-server and exact-owner OMP tmux paths
+  are unchanged. SSH rechecks ownership at the pinned origin. Federation HTTP
+  remains read-only and is separate from agent-gateway delivery. The agent
+  writes its own history; unknown admission outcomes never trigger fallback.
 - **Query** (`catalog::query`) — the filter grammar and visibility policy shared
   by `/`, `s`, and `list -q`, independent of TUI grouping and navigation.
