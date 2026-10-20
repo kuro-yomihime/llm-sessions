@@ -766,6 +766,47 @@ fi
         );
     }
 
+    /// The race the review reproduced: a competing initializer publishes its
+    /// identity after this script's last read, just before it publishes its
+    /// own. Without `force`, publication is no-clobber, so the winner stands
+    /// whether the marker started missing or malformed.
+    #[test]
+    fn init_preserves_an_identity_published_after_its_final_read() {
+        let winner = "00000000-0000-4000-8000-0000000000aa";
+        for initial in [None, Some("not a uuid\n")] {
+            let peer = tempfile::tempdir().unwrap();
+            let host = ssh_host("worker", None);
+            let dir = peer.path().join(".local/state/llm-sessions");
+            if let Some(initial) = initial {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("origin-id"), initial).unwrap();
+            }
+            // Whichever publisher runs, the winner lands immediately before it.
+            let publish_first =
+                format!("printf '%s\\n' '{winner}' > \"$dir/origin-id\"; command \"$@\"");
+            let script = format!(
+                "ln() {{ set -- ln \"$@\"; {publish_first}; }}\nmv() {{ set -- mv \"$@\"; {publish_first}; }}\n{}",
+                host.init_script(false)
+            );
+            let output = Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("HOME", peer.path())
+                .env_remove("XDG_STATE_HOME")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{initial:?}: {output:?}");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("origin-id")).unwrap(),
+                format!("{winner}\n"),
+                "{initial:?}"
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                format!("origin:{winner}")
+            );
+        }
+    }
+
     #[test]
     fn repair_preserves_an_identity_published_after_its_final_read() {
         let peer = tempfile::tempdir().unwrap();
