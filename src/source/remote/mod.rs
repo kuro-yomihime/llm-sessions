@@ -622,6 +622,9 @@ pub fn insert_command(
 /// POSIX prelude every remote delivery script runs first: prove this hop is
 /// still the origin the row was pinned to by reading the peer's existing
 /// marker — never creating or replacing one — before anything is touched.
+/// The whole marker is compared after trimming surrounding whitespace, as
+/// `federation::read_origin` reads it: a final newline is optional, and
+/// any further content is a malformed marker, not a match.
 /// The expected origin arrives as `$1`; whatever follows shifts down into
 /// the wrapped script's own positional contract.
 const ORIGIN_PRELUDE: &str = r#"set -eu
@@ -629,7 +632,7 @@ origin=$1
 shift
 marker="${XDG_STATE_HOME:-$HOME/.local/state}/llm-sessions/origin-id"
 [ -r "$marker" ] || { echo "origin marker $marker is missing" >&2; exit 1; }
-IFS= read -r observed < "$marker" || observed=
+observed=$(cat "$marker") || { echo "origin marker $marker is unreadable" >&2; exit 1; }
 observed=${observed#"${observed%%[![:space:]]*}"}
 observed=${observed%"${observed##*[![:space:]]}"}
 observed=$(printf '%s' "$observed" | tr 'ABCDEF' 'abcdef')
@@ -1833,6 +1836,46 @@ mod tests {
             busy.stdout.is_empty(),
             "busy sessions must not launch the agent CLI"
         );
+    }
+
+    /// Delivery reads the marker exactly as discovery's canonical reader
+    /// does: the whole file, trimmed — so a marker without a final newline
+    /// still matches, and a valid first line followed by anything else is
+    /// malformed rather than a match.
+    #[test]
+    fn delivery_reads_the_whole_origin_marker_like_the_canonical_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(state.join("llm-sessions")).unwrap();
+        let script = format!("{ORIGIN_PRELUDE}echo reached");
+        for (marker, matches) in [
+            (format!("{B}\n"), true),
+            (B.to_owned(), true),
+            (format!(" {}\r\n", B.to_uppercase()), true),
+            (format!("{B}\ntrailing garbage\n"), false),
+            (format!("{B} trailing"), false),
+        ] {
+            let trimmed = marker.trim();
+            assert_eq!(
+                crate::federation::valid_origin(trimmed)
+                    && crate::model::normalize_origin(trimmed) == B,
+                matches,
+                "the canonical verdict on {marker:?}"
+            );
+            std::fs::write(state.join("llm-sessions/origin-id"), &marker).unwrap();
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script, "delivery", B])
+                .env("XDG_STATE_HOME", &state)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                matches,
+                "{marker:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout.starts_with(b"reached"), matches, "{marker:?}");
+        }
     }
 
     /// A shell listing records its path in `recorded_cwd`, never in
