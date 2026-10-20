@@ -2589,6 +2589,60 @@ mod tests {
         assert_eq!(calls(&host).len(), 1, "the inventory joined the listing");
     }
 
+    /// A parent OMP process holds its subagents' transcripts open too, so the
+    /// fd join pins every child to the parent's pane. The listing must know a
+    /// child for what it is before that capability is granted — whether or
+    /// not its artifact directory names the parent — or a message meant for
+    /// the child is typed into the parent's composer.
+    #[test]
+    fn a_shell_listed_omp_child_never_inherits_its_parents_pane() {
+        let parent_id = "01a0a4b2-d30e-77da-923c-c1ec4cbdeb61";
+        let sessions = "/remote/.omp/agent/sessions/w";
+        let parent = format!("{sessions}/2026-01-01T00-00-00-000Z_{parent_id}.jsonl");
+        let child = format!("{sessions}/2026-01-01T00-00-00-000Z_{parent_id}/1-Scout.jsonl");
+        let stray = format!("{sessions}/2026-01-01_parent/1-Scout.jsonl");
+        let mut records: Vec<String> = [
+            (&parent, "eyJ0eXBlIjoic2Vzc2lvbiIsImlkIjoicGFyZW50In0="),
+            (&child, "eyJ0eXBlIjoic2Vzc2lvbiIsImlkIjoiY2hpbGQifQ=="),
+            (&stray, "eyJ0eXBlIjoic2Vzc2lvbiIsImlkIjoic3RyYXkifQ=="),
+        ]
+        .iter()
+        .map(|(path, head)| {
+            format!("F\tomp\t{path}\t1700000000\t30\nH\t{path}\t{head}\nP\t42\t900\t{path}\n")
+        })
+        .collect();
+        records.push("T\twork\t0\t1\t900\tomp\t/w\n".into());
+        let host = scripted_host(A, "a", false, vec![records.concat()]);
+        let sources = source::all(Path::new("/local"));
+        let scan = host
+            .list_with(&sources, &DiscoveryContext::default())
+            .unwrap();
+        let find = |id: &str| {
+            scan.sessions
+                .iter()
+                .find(|session| session.id == id)
+                .unwrap_or_else(|| panic!("{id} is listed"))
+        };
+
+        let parent = find("parent");
+        assert!(!parent.subagent);
+        assert!(insert_command(parent, &sources, "for the parent").is_ok());
+        let child = find("child");
+        assert!(child.subagent);
+        assert_eq!(child.parent.as_deref(), Some(parent_id));
+        let stray = find("stray");
+        assert!(stray.subagent);
+        assert_eq!(stray.parent, None);
+        for session in [child, stray] {
+            assert_eq!(
+                insert_command(session, &sources, "MESSAGE_INTENDED_FOR_CHILD"),
+                Err("a subagent takes messages from its parent, not from here".into()),
+                "{}",
+                session.id
+            );
+        }
+    }
+
     /// An older peer binary predates the owner field, so its payload has no
     /// `live_owner` at all (this fixture serializes exactly that shape) and
     /// still deserializes. The recovery is one bounded inventory per host —

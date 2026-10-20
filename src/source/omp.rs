@@ -203,7 +203,7 @@ fn read_subagents(artifact_dir: &Path) -> Result<Vec<SessionSummary>> {
     Ok(children)
 }
 
-fn artifact_parent_id(artifact_dir: &Path) -> Option<String> {
+pub(crate) fn artifact_parent_id(artifact_dir: &Path) -> Option<String> {
     let name = artifact_dir.file_name()?.to_str()?;
     let (_, id) = name.rsplit_once('_')?;
     (id.len() == 36

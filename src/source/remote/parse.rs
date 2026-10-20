@@ -333,6 +333,20 @@ fn summary_from_head(row: &FileRow, host: &str, path: &str) -> Option<SessionSum
     if records.is_empty() && id.is_none() && title.is_none() && cwd.is_none() {
         return None;
     }
+    // OMP keeps a subagent's transcript in the artifact directory beside its
+    // parent's session file, one level below the bucket. Such a file is a
+    // child even when its directory names no parse-able parent: the process
+    // holding it is the parent's, so it must never inherit a route of its own.
+    let (subagent, parent) = if row.source == SourceId::Omp && omp_artifact_child(path) {
+        (
+            true,
+            Path::new(path)
+                .parent()
+                .and_then(source::omp::artifact_parent_id),
+        )
+    } else {
+        (false, None)
+    };
 
     Some(SessionSummary {
         id: id.unwrap_or_else(|| stem(path)),
@@ -348,8 +362,8 @@ fn summary_from_head(row: &FileRow, host: &str, path: &str) -> Option<SessionSum
         updated: row.updated,
         model: None,
         branch: None,
-        parent: None,
-        subagent: false,
+        parent,
+        subagent,
         archived: false,
         usage: None,
         change: None,
@@ -360,6 +374,14 @@ fn summary_from_head(row: &FileRow, host: &str, path: &str) -> Option<SessionSum
         liveness: Liveness::Stale,
         live_owner: None,
     })
+}
+
+/// Whether `path`, an OMP transcript the listing found, lies deeper than
+/// `sessions/<bucket>/<file>` — `find`'s `*` crosses `/`, so the glob alone
+/// does not say.
+fn omp_artifact_child(path: &str) -> bool {
+    path.rsplit_once("/.omp/agent/sessions/")
+        .is_some_and(|(_, below)| below.split('/').filter(|part| !part.is_empty()).count() > 2)
 }
 
 fn stem(path: &str) -> String {
