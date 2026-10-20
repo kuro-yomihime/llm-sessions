@@ -289,9 +289,13 @@ pub(crate) fn pane_delivery_argv(
 /// The ancestry walk proving that is bounded — 32 hops, the ceiling
 /// `pane_for` uses — and splits each stat line after the last `)`, since a
 /// process name may itself contain one; a missing, malformed, self, or
-/// looping parent stops the walk rather than spinning it. The message
-/// travels as an argument and on through a tmux buffer, never through a
-/// shell or a `send-keys` key name, so no part of it can become
+/// looping parent stops the walk rather than spinning it.
+/// A pane foregrounding `omp` is not yet proof that *this* `omp` reads the
+/// keyboard: a second session may run in the foreground while the owner
+/// sits suspended or backgrounded in the same pane, so the agent's process
+/// group must be the foreground group of the pane shell's terminal. The
+/// message travels as an argument and on through a tmux buffer, never
+/// through a shell or a `send-keys` key name, so no part of it can become
 /// a command, a key, or a flag. Bracketed paste keeps newlines from
 /// submitting mid-message; only the final Enter is a keypress. If any
 /// check fails the script says why and exits nonzero without touching the
@@ -332,6 +336,16 @@ for fd in /proc/$agent_pid/fd/*; do
     if [ "$(readlink "$fd" 2>/dev/null)" = "$session_path" ]; then held=1; break; fi
 done
 [ "$held" = 1 ] || fail "agent pid $agent_pid no longer holds $session_path open"
+pane_stat=$(cat "/proc/$pane_pid/stat" 2>/dev/null) || fail "pane shell $pane_pid is gone"
+agent_stat=$(cat "/proc/$agent_pid/stat" 2>/dev/null) || fail "agent pid $agent_pid is gone"
+read -r _ _ _ _ _ foreground _ <<EOF
+${pane_stat##*) }
+EOF
+read -r _ _ group _ <<EOF
+${agent_stat##*) }
+EOF
+case "$foreground" in ''|*[!0-9]*) fail "pane $addr has no foreground process group" ;; esac
+[ "$group" = "$foreground" ] || fail "agent pid $agent_pid is not the foreground job of pane $addr"
 buffer="llm-sessions-insert-$$"
 trap 'tmux delete-buffer -b "$buffer" 2>/dev/null || :' EXIT
 printf '%s' "$message" | tmux load-buffer -b "$buffer" - \
@@ -531,7 +545,10 @@ mod tests {
     }
 
     /// A stand-in `tmux` on PATH, so the delivery script's behavior can be
-    /// tested against the real `/proc` without a server or a pane.
+    /// tested against the real `/proc` without a server or a pane. A `cat`
+    /// beside it serves `/proc/<pid>/stat` from a `stat-<pid>` file when one
+    /// exists — a test process has no terminal whose foreground could be
+    /// set — and reads the real file otherwise.
     struct FakeTmux {
         bin: PathBuf,
         log: PathBuf,
@@ -563,7 +580,37 @@ esac
             )
             .unwrap();
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cat = dir.join("cat");
+            std::fs::write(
+                &cat,
+                r#"#!/bin/sh
+case "$1" in
+    /proc/*/stat)
+        pid=${1#/proc/}; pid=${pid%/stat}
+        stub="$(dirname "$0")/stat-$pid"
+        [ -f "$stub" ] && exec /bin/cat "$stub"
+        ;;
+esac
+exec /bin/cat "$@"
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&cat, std::fs::Permissions::from_mode(0o755)).unwrap();
             Self { bin, log }
+        }
+
+        /// Make `group` the foreground process group of the terminal the
+        /// pane shell `pane_pid` runs on.
+        fn foreground(&self, pane_pid: &str, group: u32) {
+            std::fs::write(
+                self.bin.with_file_name(format!("stat-{pane_pid}")),
+                format!("{pane_pid} (sh) S 1 {pane_pid} {pane_pid} 34816 {group} 4194560\n"),
+            )
+            .unwrap();
+        }
+
+        fn input(&self) -> Vec<u8> {
+            std::fs::read(format!("{}.input", self.log.display())).unwrap_or_default()
         }
 
         fn log(&self) -> String {
@@ -601,6 +648,18 @@ esac
             .unwrap()
     }
 
+    /// A real agent stand-in that already holds `session` open when spawned
+    /// and leads its own process group, as a shell's job would.
+    fn owner(program: &Path, session: &Path) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        Command::new(program)
+            .arg("60")
+            .stdin(File::open(session).unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
     fn cleanup(mut child: std::process::Child) {
         let _ = child.kill();
         let _ = child.wait();
@@ -612,14 +671,14 @@ esac
         let session = dir.path().join("session.jsonl");
         std::fs::write(&session, "{}").unwrap();
         let program = dir.path().join("omp) S 9999");
-        std::fs::copy("/bin/sleep", &program).unwrap();
-        let agent = Command::new(&program)
-            .arg("60")
-            .stdin(File::open(&session).unwrap())
-            .spawn()
-            .unwrap();
+        // A link, not a copy: a freshly written executable can still be open
+        // for writing in a sibling test's forked child, and exec then fails
+        // with ETXTBSY. The kernel names the process after the link anyway.
+        std::os::unix::fs::symlink("/bin/sleep", &program).unwrap();
+        let agent = owner(&program, &session);
         let tmux = FakeTmux::new(dir.path());
         let parent = std::process::id().to_string();
+        tmux.foreground(&parent, agent.id());
         let message = "-n 'literal' $(not-executed)\nsecond line \t with unicode λ";
         let output = run_delivery(
             &tmux,
@@ -639,7 +698,7 @@ esac
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let received = std::fs::read(format!("{}.input", tmux.log.display())).unwrap();
+        let received = tmux.input();
         let expected = format!("\x1b[200~{}\x1b[201~\r", message.replace('\n', "\r"));
         assert_eq!(
             received,
@@ -648,27 +707,64 @@ esac
         );
     }
 
+    /// Two sessions share one pane: A's owner was backgrounded and B now
+    /// reads the keyboard. Both hold their own transcript and both descend
+    /// from the pane shell, so only the terminal's foreground process group
+    /// tells them apart — and A's message must never reach B's composer.
+    #[test]
+    fn a_backgrounded_owner_is_refused_while_another_session_holds_the_foreground() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_session = dir.path().join("a.jsonl");
+        let b_session = dir.path().join("b.jsonl");
+        std::fs::write(&a_session, "{}").unwrap();
+        std::fs::write(&b_session, "{}").unwrap();
+        let sleep = Path::new("/bin/sleep");
+        let a = owner(sleep, &a_session);
+        let b = owner(sleep, &b_session);
+        let tmux = FakeTmux::new(dir.path());
+        let pane_pid = std::process::id().to_string();
+        tmux.foreground(&pane_pid, b.id());
+        let report = format!("%7 {pane_pid} 1 omp");
+        let deliver = |agent: &std::process::Child, session: &Path, message: &str| {
+            run_delivery(
+                &tmux,
+                &report,
+                &[
+                    "work:0.1",
+                    &pane_pid,
+                    &agent.id().to_string(),
+                    "omp",
+                    session.to_str().unwrap(),
+                    message,
+                ],
+            )
+        };
+        let to_a = deliver(&a, &a_session, "MESSAGE_FOR_SESSION_A");
+        let a_input = tmux.input();
+        let to_b = deliver(&b, &b_session, "MESSAGE_FOR_SESSION_B");
+        cleanup(a);
+        cleanup(b);
+        assert!(!to_a.status.success());
+        let stderr = String::from_utf8_lossy(&to_a.stderr);
+        assert!(stderr.contains("not the foreground job"), "{stderr}");
+        assert!(
+            a_input.is_empty(),
+            "the foreground session heard A's message"
+        );
+        assert!(
+            to_b.status.success(),
+            "{}",
+            String::from_utf8_lossy(&to_b.stderr)
+        );
+        assert_eq!(tmux.input(), b"\x1b[200~MESSAGE_FOR_SESSION_B\x1b[201~\r");
+    }
+
     #[test]
     fn malformed_self_parent_and_cyclic_ancestry_refuse_without_hanging() {
         for kind in ["malformed", "self", "cycle"] {
             let dir = tempfile::tempdir().unwrap();
             let agent = agent_child(None);
             let tmux = FakeTmux::new(dir.path());
-            let cat = dir.path().join("cat");
-            std::fs::write(
-                &cat,
-                r#"#!/bin/sh
-case "$1" in
-    /proc/*/stat)
-        pid=${1#/proc/}; pid=${pid%/stat}
-        exec /bin/cat "$(dirname "$0")/stat-$pid"
-        ;;
-    *) exec /bin/cat "$@" ;;
-esac
-"#,
-            )
-            .unwrap();
-            std::fs::set_permissions(&cat, std::fs::Permissions::from_mode(0o755)).unwrap();
             let pid = agent.id();
             let parent = match kind {
                 "malformed" => "bad".to_owned(),
