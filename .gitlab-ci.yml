@@ -10,14 +10,15 @@ variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   CARGO_TERM_COLOR: always
 
+# Cache downloads only; restored build timestamps can hide stale binaries.
 cache:
   key:
+    prefix: cargo-downloads
     files:
       - Cargo.lock
   paths:
     - .cargo/registry
     - .cargo/git
-    - target
 
 default:
   before_script:
